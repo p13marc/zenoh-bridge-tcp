@@ -6,10 +6,16 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info};
+use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
+use zenoh_ext::{
+    AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
+    MissDetectionConfig, RecoveryConfig,
+};
 
 /// Parse import specification in format 'service_name/listen_addr'
 pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
@@ -109,14 +115,41 @@ async fn handle_import_connection(
         client_id, error_key
     );
 
-    // Subscribe to responses from the service for this specific client
+    // Subscribe to responses from the service for this specific client using AdvancedSubscriber
+    // This allows late publisher detection and recovery of missed samples
     let sub_key = format!("{}/rx/{}", service_name, client_id);
     let subscriber = session
         .declare_subscriber(&sub_key)
+        .history(HistoryConfig::default().detect_late_publishers())
+        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
+        .subscriber_detection()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
 
-    debug!("Client {}: Subscribed to {}", client_id, sub_key);
+    debug!(
+        "Client {}: Subscribed to {} with late publisher detection",
+        client_id, sub_key
+    );
+
+    // Declare AdvancedPublisher with cache and publisher detection
+    // This allows the export bridge to detect when we're ready and recover any missed samples
+    let pub_key_str = format!("{}/tx/{}", service_name, client_id);
+    let pub_key: KeyExpr<'static> = pub_key_str
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+    let publisher = session
+        .declare_publisher(pub_key.clone())
+        .cache(CacheConfig::default().max_samples(10))
+        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
+        .publisher_detection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+    debug!(
+        "Client {}: Declared AdvancedPublisher on {} with cache",
+        client_id, pub_key_str
+    );
 
     // NOW declare liveliness token - export bridge will detect this and try to connect
     let liveliness_key = format!("{}/clients/{}", service_name, client_id);
@@ -130,6 +163,9 @@ async fn handle_import_connection(
         "✓ Client {} declared liveliness: {}",
         client_id, liveliness_key
     );
+
+    // No sleep needed! The AdvancedPublisher/Subscriber with cache and history
+    // handle synchronization automatically through publisher detection and late joiner support
 
     // Task: Zenoh subscriber -> TCP writer
     let client_id_clone = client_id.to_string();
@@ -168,8 +204,7 @@ async fn handle_import_connection(
         }
     });
 
-    // Task: TCP reader -> Zenoh publisher
-    let pub_key = format!("{}/tx/{}", service_name, client_id);
+    // Task: TCP reader -> Zenoh AdvancedPublisher
     let client_id_clone = client_id.to_string();
     let mut tcp_to_zenoh = tokio::spawn(async move {
         let mut buffer = vec![0u8; 65536];
@@ -181,7 +216,7 @@ async fn handle_import_connection(
                 }
                 Ok(n) => {
                     debug!("Client {}: → {} bytes to Zenoh", client_id_clone, n);
-                    if let Err(e) = session.put(&pub_key, &buffer[..n]).await {
+                    if let Err(e) = publisher.put(&buffer[..n]).await {
                         error!(
                             "Client {}: Failed to publish to Zenoh: {:?}",
                             client_id_clone, e
@@ -202,10 +237,12 @@ async fn handle_import_connection(
         _ = &mut zenoh_to_tcp => {
             info!("Client {}: Zenoh to TCP task completed", client_id);
             tcp_to_zenoh.abort();
+            error_monitor.abort();
         },
         _ = &mut tcp_to_zenoh => {
             info!("Client {}: TCP to Zenoh task completed", client_id);
             zenoh_to_tcp.abort();
+            error_monitor.abort();
         },
         error_result = &mut error_monitor => {
             if let Ok(true) = error_result {
@@ -216,10 +253,6 @@ async fn handle_import_connection(
             }
         },
     }
-
-    // Wait for tasks to finish aborting
-    let _ = zenoh_to_tcp.await;
-    let _ = tcp_to_zenoh.await;
 
     // Liveliness token is automatically dropped here, signaling disconnection
 

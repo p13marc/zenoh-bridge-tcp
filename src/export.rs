@@ -7,11 +7,17 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
+use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
+use zenoh_ext::{
+    AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
+    MissDetectionConfig, RecoveryConfig,
+};
 
 /// Type alias for cancellation sender and task handle
 type CancellationSender = (mpsc::Sender<()>, tokio::task::JoinHandle<()>);
@@ -170,22 +176,47 @@ async fn handle_client_bridge(
     mut backend_writer: tokio::net::tcp::OwnedWriteHalf,
     mut cancel_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
-    // Subscribe to messages from this specific client
+    // Subscribe to messages from this specific client using AdvancedSubscriber
+    // This enables late publisher detection and recovery of missed samples
     let sub_key = format!("{}/tx/{}", service_name, client_id);
     let subscriber = session
         .declare_subscriber(&sub_key)
+        .history(HistoryConfig::default().detect_late_publishers())
+        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
+        .subscriber_detection()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
 
-    info!("✓ Client {} subscribed to {}", client_id, sub_key);
+    info!(
+        "✓ Client {} subscribed to {} with late publisher detection",
+        client_id, sub_key
+    );
 
-    let pub_key = format!("{}/rx/{}", service_name, client_id);
-    let session_for_pub = session.clone();
+    // Declare AdvancedPublisher with cache and publisher detection for RX channel
+    // This allows the import bridge to detect when we're ready and recover any missed samples
+    let pub_key_str = format!("{}/rx/{}", service_name, client_id);
+    let pub_key: KeyExpr<'static> = pub_key_str
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+    let publisher = session
+        .declare_publisher(pub_key.clone())
+        .cache(CacheConfig::default().max_samples(10))
+        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
+        .publisher_detection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+    debug!(
+        "Client {}: Declared AdvancedPublisher on {} with cache",
+        client_id, pub_key_str
+    );
+
     let client_id_for_reader = client_id.clone();
     let client_id_for_writer = client_id.clone();
     let client_id_for_final = client_id.clone();
 
-    // Task: read from backend and publish to Zenoh
+    // Task: read from backend and publish to Zenoh using AdvancedPublisher
     let mut backend_to_zenoh_handle = tokio::spawn(async move {
         let mut buffer = vec![0u8; 65536];
         loop {
@@ -202,7 +233,7 @@ async fn handle_client_bridge(
                         "← {} bytes from backend for client {}",
                         n, client_id_for_reader
                     );
-                    if let Err(e) = session_for_pub.put(&pub_key, &buffer[..n]).await {
+                    if let Err(e) = publisher.put(&buffer[..n]).await {
                         error!(
                             "Failed to publish for client {}: {:?}",
                             client_id_for_reader, e
@@ -253,27 +284,27 @@ async fn handle_client_bridge(
 
     // Wait for either task to complete or cancellation signal
     tokio::select! {
-        _ = &mut backend_to_zenoh_handle => {
+        _result = &mut backend_to_zenoh_handle => {
             info!("Backend closed for client: {}", client_id_for_final);
-            // Abort the other task
+            // Abort the other task and wait for it
             zenoh_to_backend_handle.abort();
+            let _ = zenoh_to_backend_handle.await;
         },
-        _ = &mut zenoh_to_backend_handle => {
+        _result = &mut zenoh_to_backend_handle => {
             info!("Zenoh closed for client: {}", client_id_for_final);
-            // Abort the other task
+            // Abort the other task and wait for it
             backend_to_zenoh_handle.abort();
+            let _ = backend_to_zenoh_handle.await;
         },
         _ = cancel_rx.recv() => {
             info!("Cancellation received for client: {}", client_id_for_final);
-            // Abort both tasks to close the backend connection immediately
+            // Abort both tasks and wait for them to finish
             backend_to_zenoh_handle.abort();
             zenoh_to_backend_handle.abort();
+            let _ = backend_to_zenoh_handle.await;
+            let _ = zenoh_to_backend_handle.await;
         },
     }
-
-    // Wait for tasks to finish aborting
-    let _ = backend_to_zenoh_handle.await;
-    let _ = zenoh_to_backend_handle.await;
 
     info!(
         "Connection handler stopped for client: {}",
