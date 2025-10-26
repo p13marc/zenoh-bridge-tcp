@@ -1,0 +1,7 @@
+// Minimal Zenoh configuration file for zenoh-bridge-tcp
+// Usage: zenoh-bridge-tcp --config examples/zenoh-config-minimal.json5 --export 'myservice/127.0.0.1:8003'
+
+{
+  // The node's mode: "peer", "client", or "router"
+  mode: "peer",
+}

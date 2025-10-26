@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package echo;
+
+// Echo service for testing the TCP bridge
+service EchoService {
+  // Simple unary echo
+  rpc Echo(EchoRequest) returns (EchoResponse);
+
+  // Server streaming echo
+  rpc EchoStream(EchoRequest) returns (stream EchoResponse);
+
+  // Bidirectional streaming echo
+  rpc EchoBidi(stream EchoRequest) returns (stream EchoResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+  int32 sequence = 2;
+}
+
+message EchoResponse {
+  string message = 1;
+  int32 sequence = 2;
+  int64 timestamp = 3;
+}

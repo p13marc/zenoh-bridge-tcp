@@ -1,0 +1,69 @@
+// Example Zenoh configuration file for zenoh-bridge-tcp
+// This file demonstrates how to configure a Zenoh session using JSON5 format
+// Usage: zenoh-bridge-tcp --config examples/zenoh-config.json5 --export 'myservice/127.0.0.1:8003'
+
+{
+  // The node's mode: "peer", "client", or "router"
+  mode: "peer",
+
+  // Optional: The node's metadata (name, location, etc.)
+  // This is arbitrary JSON data not interpreted by zenoh
+  metadata: {
+    name: "tcp-bridge",
+    location: "local",
+  },
+
+  // Connect to these endpoints at startup
+  // E.g. tcp/localhost:7447 to connect to a Zenoh router
+  connect: {
+    endpoints: [
+      // "tcp/localhost:7447",
+    ],
+  },
+
+  // Listen on these endpoints for incoming connections
+  // E.g. tcp/0.0.0.0:7447 for a router or peer
+  listen: {
+    endpoints: [
+      // For peer mode, listen on any available port
+      "tcp/[::]:0",
+    ],
+  },
+
+  // Scouting configuration for peer/router discovery
+  scouting: {
+    // Multicast scouting for automatic peer discovery
+    multicast: {
+      enabled: true,
+      address: "224.0.0.224:7446",
+      interface: "auto",
+      // Auto-connect to discovered routers and peers
+      autoconnect: {
+        router: [],
+        peer: ["router", "peer"],
+        client: ["router"],
+      },
+    },
+  },
+
+  // Transport configuration
+  transport: {
+    unicast: {
+      // Enable QoS for priority-based message handling
+      qos: {
+        enabled: true,
+      },
+    },
+    link: {
+      tx: {
+        // Batch size for transmission (max 65535 bytes)
+        batch_size: 65535,
+        // Link lease duration in milliseconds
+        lease: 10000,
+      },
+    },
+  },
+
+  // Default timeout for queries in milliseconds
+  queries_default_timeout: 10000,
+}

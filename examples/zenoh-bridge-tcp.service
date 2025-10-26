@@ -1,0 +1,38 @@
+[Unit]
+Description=Zenoh TCP Bridge
+After=network.target
+Documentation=https://github.com/yourusername/zenoh-bridge-tcp
+
+[Service]
+Type=simple
+User=zenoh
+Group=zenoh
+WorkingDirectory=/opt/zenoh-bridge-tcp
+ExecStart=/opt/zenoh-bridge-tcp/zenoh-bridge-tcp \
+    --tcp-listen 0.0.0.0:7447 \
+    --pub-key tcp/data/tx \
+    --sub-key tcp/data/rx \
+    --mode peer
+
+# Restart on failure
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/zenoh-bridge-tcp
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zenoh-bridge-tcp
+
+# Environment
+Environment="RUST_LOG=info"
+Environment="RUST_BACKTRACE=1"
+
+[Install]
+WantedBy=multi-user.target

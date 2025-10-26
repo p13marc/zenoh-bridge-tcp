@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  # Single bridge instance
+  bridge:
+    build: .
+    container_name: zenoh-bridge-tcp
+    ports:
+      - "7447:7447"
+    environment:
+      - RUST_LOG=info
+    command:
+      - --tcp-listen
+      - 0.0.0.0:7447
+      - --pub-key
+      - tcp/data/tx
+      - --sub-key
+      - tcp/data/rx
+      - --mode
+      - peer
+    networks:
+      - zenoh-net
+    restart: unless-stopped
+
+  # Bridge A for bidirectional communication test
+  bridge-a:
+    build: .
+    container_name: zenoh-bridge-tcp-a
+    ports:
+      - "8001:8001"
+    environment:
+      - RUST_LOG=info
+    command:
+      - --tcp-listen
+      - 0.0.0.0:8001
+      - --pub-key
+      - service/a/tx
+      - --sub-key
+      - service/b/tx
+      - --mode
+      - peer
+    networks:
+      - zenoh-net
+    restart: unless-stopped
+    profiles:
+      - multi-bridge
+
+  # Bridge B for bidirectional communication test
+  bridge-b:
+    build: .
+    container_name: zenoh-bridge-tcp-b
+    ports:
+      - "8002:8002"
+    environment:
+      - RUST_LOG=info
+    command:
+      - --tcp-listen
+      - 0.0.0.0:8002
+      - --pub-key
+      - service/b/tx
+      - --sub-key
+      - service/a/tx
+      - --mode
+      - peer
+    networks:
+      - zenoh-net
+    restart: unless-stopped
+    profiles:
+      - multi-bridge
+
+  # Zenoh router (optional, for client mode)
+  zenoh-router:
+    image: eclipse/zenoh:latest
+    container_name: zenoh-router
+    ports:
+      - "7447:7447"
+    command:
+      - --mode=router
+      - --listen=tcp/0.0.0.0:7447
+    networks:
+      - zenoh-net
+    restart: unless-stopped
+    profiles:
+      - with-router
+
+  # Bridge in client mode (connects to router)
+  bridge-client:
+    build: .
+    container_name: zenoh-bridge-tcp-client
+    ports:
+      - "9000:9000"
+    environment:
+      - RUST_LOG=info
+    command:
+      - --tcp-listen
+      - 0.0.0.0:9000
+      - --pub-key
+      - tcp/client/tx
+      - --sub-key
+      - tcp/client/rx
+      - --mode
+      - client
+      - --connect
+      - tcp/zenoh-router:7447
+    networks:
+      - zenoh-net
+    depends_on:
+      - zenoh-router
+    restart: unless-stopped
+    profiles:
+      - with-router
+
+networks:
+  zenoh-net:
+    driver: bridge
