@@ -1,0 +1,8 @@
+[profile.default]
+# Default configuration for nextest
+
+# Run all tests in the http_edge_cases test binary serially
+# This prevents port conflicts and Zenoh session interference
+[[profile.default.overrides]]
+filter = 'binary(http_edge_cases)'
+threads-required = 'num-cpus'

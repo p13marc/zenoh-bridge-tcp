@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 
+[lib]
+name = "zenoh_bridge_tcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zenoh-bridge-tcp"
+path = "src/main.rs"
+
 [dependencies]
 zenoh = "1.6.2"
 zenoh-ext = { version = "1.6.2", features = ["unstable"] }
@@ -12,6 +20,8 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
+httparse = "1.9"
+tls-parser = "0.12"
 
 [dev-dependencies]
 tonic = "0.10"
@@ -30,6 +40,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 webpki-roots = "0.26"
 rand = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+futures = "0.3"
 
 [build-dependencies]
 tonic-build = "0.10"

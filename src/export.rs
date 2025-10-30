@@ -2,7 +2,10 @@
 //!
 //! This module handles exporting TCP backend services as Zenoh services.
 //! Each export creates lazy connections to the backend - one connection per importing client.
+//!
+//! Supports both regular TCP mode and HTTP-aware mode with DNS-based routing.
 
+use crate::http_parser::normalize_dns;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -39,6 +42,24 @@ pub fn parse_export_spec(export_spec: &str) -> Result<(String, SocketAddr)> {
     Ok((service_name, backend_addr))
 }
 
+/// Parse HTTP export specification in format 'service_name/dns/backend_addr'
+pub fn parse_http_export_spec(export_spec: &str) -> Result<(String, String, SocketAddr)> {
+    let parts: Vec<&str> = export_spec.split('/').collect();
+    if parts.len() != 3 {
+        return Err(anyhow::anyhow!(
+            "Invalid HTTP export format. Expected: 'service_name/dns/backend_addr' (e.g., 'http-service/api.example.com/127.0.0.1:8003')"
+        ));
+    }
+
+    let service_name = parts[0].to_string();
+    let dns = normalize_dns(parts[1]);
+    let backend_addr: SocketAddr = parts[2]
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid backend address: {}", e))?;
+
+    Ok((service_name, dns, backend_addr))
+}
+
 /// Run export mode for a single service
 ///
 /// This function:
@@ -47,17 +68,73 @@ pub fn parse_export_spec(export_spec: &str) -> Result<(String, SocketAddr)> {
 /// 3. Bridges data between the backend and Zenoh
 /// 4. Cleans up when clients disconnect
 pub async fn run_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
+    run_export_mode_internal(session, export_spec, None).await
+}
+
+/// Run HTTP-aware export mode for a single service with DNS-based routing
+///
+/// This function:
+/// 1. Registers a backend for a specific DNS name
+/// 2. Monitors client liveliness tokens for that DNS
+/// 3. Creates backend connections when clients appear
+/// 4. Bridges data between the backend and Zenoh
+/// 5. Cleans up when clients disconnect
+pub async fn run_http_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
+    let (service_name, dns, backend_addr) = parse_http_export_spec(export_spec)?;
+    run_export_mode_internal(
+        session,
+        &format!("{}/{}", service_name, backend_addr),
+        Some(dns),
+    )
+    .await
+}
+
+/// Internal implementation for both regular and HTTP export modes
+async fn run_export_mode_internal(
+    session: Arc<Session>,
+    export_spec: &str,
+    dns_suffix: Option<String>,
+) -> Result<()> {
     let (service_name, backend_addr) = parse_export_spec(export_spec)?;
 
-    info!("🚀 EXPORT MODE");
-    info!("   Service name: {}", service_name);
-    info!("   Backend: {}", backend_addr);
-    info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
-    info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
-    info!("   Liveliness: {}/clients/*", service_name);
+    if let Some(ref dns) = dns_suffix {
+        info!("🚀 HTTP EXPORT MODE");
+        info!("   Service name: {}", service_name);
+        info!("   DNS: {}", dns);
+        info!("   Backend: {}", backend_addr);
+        info!("   Zenoh TX key: {}/{}/tx/<client_id>", service_name, dns);
+        info!("   Zenoh RX key: {}/{}/rx/<client_id>", service_name, dns);
+        info!("   Liveliness: {}/{}/clients/*", service_name, dns);
+    } else {
+        info!("🚀 EXPORT MODE");
+        info!("   Service name: {}", service_name);
+        info!("   Backend: {}", backend_addr);
+        info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
+        info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
+        info!("   Liveliness: {}/clients/*", service_name);
+    }
 
     // Monitor client liveliness to create/destroy connections
-    let liveliness_key = format!("{}/clients/*", service_name);
+    let liveliness_key = if let Some(ref dns) = dns_suffix {
+        format!("{}/{}/clients/*", service_name, dns)
+    } else {
+        format!("{}/clients/*", service_name)
+    };
+
+    // Declare service availability liveliness token for HTTP mode
+    let _service_liveliness = if let Some(ref dns) = dns_suffix {
+        let service_key = format!("{}/{}/available", service_name, dns);
+        let token = session
+            .liveliness()
+            .declare_token(&service_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare service liveliness: {}", e))?;
+        info!("✓ Declared service availability: {}", service_key);
+        Some(token)
+    } else {
+        None
+    };
+
     let liveliness_subscriber = session
         .liveliness()
         .declare_subscriber(&liveliness_key)
@@ -65,7 +142,11 @@ pub async fn run_export_mode(session: Arc<Session>, export_spec: &str) -> Result
         .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
 
     info!("✓ Monitoring client liveliness: {}", liveliness_key);
-    info!("✓ Ready to create connections when clients appear");
+    if dns_suffix.is_some() {
+        info!("✓ Ready to create connections when HTTP clients appear");
+    } else {
+        info!("✓ Ready to create connections when clients appear");
+    }
 
     // Track connection tasks and cancellation senders per client ID
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
@@ -87,6 +168,7 @@ pub async fn run_export_mode(session: Arc<Session>, export_spec: &str) -> Result
                                 backend_addr,
                                 &client_id,
                                 &cancellation_senders,
+                                dns_suffix.as_deref(),
                             )
                             .await;
                         }
@@ -111,6 +193,7 @@ async fn handle_client_connect(
     backend_addr: SocketAddr,
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    dns_suffix: Option<&str>,
 ) {
     info!("✓ Client connected: {}", client_id);
 
@@ -125,6 +208,7 @@ async fn handle_client_connect(
             let service_name = service_name.to_string();
             let client_id_str = client_id.to_string();
             let client_id_for_map = client_id.to_string();
+            let dns_suffix_owned = dns_suffix.map(|s| s.to_string());
 
             // Create cancellation channel for graceful shutdown
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
@@ -138,6 +222,7 @@ async fn handle_client_connect(
                     backend_reader,
                     backend_writer,
                     cancel_rx,
+                    dns_suffix_owned.as_deref(),
                 )
                 .await
                 {
@@ -158,7 +243,8 @@ async fn handle_client_connect(
             );
 
             // Publish error signal to notify import bridge
-            let error_key = format!("{}/error/{}", service_name, client_id);
+            let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
+            let error_key = format!("{}{}/error/{}", service_name, dns_part, client_id);
             if let Err(pub_err) = session.put(&error_key, "backend_unavailable").await {
                 error!("Failed to publish error signal: {:?}", pub_err);
             }
@@ -175,10 +261,12 @@ async fn handle_client_bridge(
     mut backend_reader: tokio::net::tcp::OwnedReadHalf,
     mut backend_writer: tokio::net::tcp::OwnedWriteHalf,
     mut cancel_rx: mpsc::Receiver<()>,
+    dns_suffix: Option<&str>,
 ) -> Result<()> {
+    let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
     // Subscribe to messages from this specific client using AdvancedSubscriber
     // This enables late publisher detection and recovery of missed samples
-    let sub_key = format!("{}/tx/{}", service_name, client_id);
+    let sub_key = format!("{}{}/tx/{}", service_name, dns_part, client_id);
     let subscriber = session
         .declare_subscriber(&sub_key)
         .history(HistoryConfig::default().detect_late_publishers())
@@ -194,7 +282,7 @@ async fn handle_client_bridge(
 
     // Declare AdvancedPublisher with cache and publisher detection for RX channel
     // This allows the import bridge to detect when we're ready and recover any missed samples
-    let pub_key_str = format!("{}/rx/{}", service_name, client_id);
+    let pub_key_str = format!("{}{}/rx/{}", service_name, dns_part, client_id);
     let pub_key: KeyExpr<'static> = pub_key_str
         .clone()
         .try_into()
@@ -226,6 +314,13 @@ async fn handle_client_bridge(
                         "Backend closed connection for client: {}",
                         client_id_for_reader
                     );
+                    // Send empty payload as EOF signal to import side
+                    if let Err(e) = publisher.put(Vec::<u8>::new()).await {
+                        error!(
+                            "Failed to send EOF signal for client {}: {:?}",
+                            client_id_for_reader, e
+                        );
+                    }
                     break;
                 }
                 Ok(n) => {
@@ -373,6 +468,44 @@ mod tests {
     #[test]
     fn test_parse_export_spec_too_many_parts() {
         let result = parse_export_spec("service/addr/extra");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_http_export_spec_valid() {
+        let result = parse_http_export_spec("http-service/api.example.com/127.0.0.1:8080");
+        assert!(result.is_ok());
+        let (service, dns, addr) = result.unwrap();
+        assert_eq!(service, "http-service");
+        assert_eq!(dns, "api.example.com");
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_http_export_spec_dns_normalization() {
+        let result = parse_http_export_spec("http-service/Example.COM:80/127.0.0.1:8080");
+        assert!(result.is_ok());
+        let (service, dns, addr) = result.unwrap();
+        assert_eq!(service, "http-service");
+        assert_eq!(dns, "example.com"); // Normalized: lowercase + port 80 stripped
+        assert_eq!(addr.to_string(), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn test_parse_http_export_spec_invalid_format() {
+        let result = parse_http_export_spec("invalid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_http_export_spec_missing_dns() {
+        let result = parse_http_export_spec("service/127.0.0.1:8080");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_http_export_spec_invalid_addr() {
+        let result = parse_http_export_spec("service/example.com/invalid:addr");
         assert!(result.is_err());
     }
 }

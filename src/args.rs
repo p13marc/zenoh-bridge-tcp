@@ -25,6 +25,20 @@ pub struct Args {
     #[arg(long)]
     pub import: Vec<String>,
 
+    /// Export HTTP backend with DNS-based routing: 'service_name/dns/backend_addr'
+    /// Example: --http-export 'http-service/api.example.com/127.0.0.1:8003'
+    /// Registers backend for specific DNS name extracted from HTTP Host headers
+    /// Can be specified multiple times for multiple DNS-based exports
+    #[arg(long)]
+    pub http_export: Vec<String>,
+
+    /// Import HTTP service with DNS-based routing: 'service_name/listen_addr'
+    /// Example: --http-import 'http-service/0.0.0.0:8080'
+    /// Parses HTTP Host header to route requests to appropriate backends
+    /// Can be specified multiple times for multiple HTTP listeners
+    #[arg(long)]
+    pub http_import: Vec<String>,
+
     /// Zenoh configuration mode
     #[arg(short = 'm', long, default_value = "peer")]
     pub mode: String,
@@ -41,9 +55,13 @@ pub struct Args {
 impl Args {
     /// Validate that at least one export or import is specified
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.export.is_empty() && self.import.is_empty() {
+        if self.export.is_empty()
+            && self.import.is_empty()
+            && self.http_export.is_empty()
+            && self.http_import.is_empty()
+        {
             return Err(anyhow::anyhow!(
-                "Must specify at least one --export or --import. Use --help for usage."
+                "Must specify at least one --export, --import, --http-export, or --http-import. Use --help for usage."
             ));
         }
         Ok(())
