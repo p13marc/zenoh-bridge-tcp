@@ -112,8 +112,6 @@ zenoh-bridge-tcp \
 
 ### Prerequisites
 - Rust 1.70 or later
-- Optional: `protoc` for gRPC integration tests
-
 ### Build
 ```bash
 cargo build --release
@@ -126,10 +124,13 @@ The binary will be at `target/release/zenoh-bridge-tcp`.
 # Run all tests
 cargo test
 
-# Run specific test suite
+# Run specific test suite (recommended: use nextest for better test isolation)
+cargo nextest run
+
+# Or with regular cargo test (use --test-threads=1 for http_edge_cases)
 cargo test --test export_import_integration -- --test-threads=1
 cargo test --test bridge_integration
-cargo test --test grpc_integration
+cargo test --test http_integration
 ```
 
 ## Usage
@@ -332,7 +333,6 @@ The project includes comprehensive integration tests:
 ### Core Bridge Tests
 - **`tests/export_import_integration.rs`** - Core export/import functionality
 - **`tests/bridge_integration.rs`** - Basic bridge operations
-- **`tests/grpc_integration.rs`** - gRPC service bridging (requires protoc)
 - **`tests/http_integration.rs`** - HTTP/HTTPS service bridging
 - **`tests/liveliness_integration.rs`** - Liveliness detection
 - **`tests/multi_service_integration.rs`** - Multiple concurrent services
@@ -390,8 +390,9 @@ cargo test --test http_edge_cases -- --test-threads=1 --nocapture
 # Unit tests
 cargo test --lib
 
-# gRPC tests (requires protoc)
-cargo test --test grpc_integration -- --nocapture
+# HTTP integration tests
+cargo test --test http_integration -- --nocapture
+
 ```
 
 See [tests/README.md](tests/README.md) for detailed testing documentation and [docs/HTTP_ROUTING_GUIDE.md](docs/HTTP_ROUTING_GUIDE.md) for HTTP/HTTPS routing guide.
@@ -440,7 +441,7 @@ RUST_LOG=zenoh_bridge_tcp=debug,zenoh=info zenoh-bridge-tcp --export 'service/12
 - **Buffer Size**: 4KB default per connection
 - **Concurrent Connections**: Limited by system resources (file descriptors, memory)
 - **Latency**: Adds ~1-2ms overhead vs direct TCP (depends on Zenoh setup)
-- **Throughput**: Tested with HTTP, gRPC, and raw TCP; handles typical workloads well
+- **Throughput**: Tested with HTTP, HTTPS, and raw TCP; handles typical workloads well
 
 ## Use Cases
 
@@ -471,7 +472,7 @@ Core dependencies:
 - `httparse` - HTTP/1.x parser (for HTTP routing)
 - `tls-parser` - TLS/SNI parser (for HTTPS routing)
 
-Development/test dependencies include: `tonic`, `axum`, `hyper`, `rustls`, `reqwest`, `futures` for protocol testing.
+Development/test dependencies include: `axum`, `hyper`, `rustls`, `reqwest`, `futures` for protocol testing.
 
 ## Version Information
 

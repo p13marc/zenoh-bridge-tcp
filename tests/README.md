@@ -9,8 +9,7 @@ This directory contains integration tests for the Zenoh TCP Bridge project.
 - ✅ We test: The bridge's ability to tunnel TCP traffic through Zenoh
 - ✅ We test: Bidirectional communication through the bridge
 - ✅ We test: Bridge handles various protocol patterns
-- ❌ We DON'T test: gRPC/Tonic implementation (that's Tonic's job)
-- ❌ We DON'T test: Protocol buffer serialization (that's protobuf's job)
+- ❌ We DON'T test: HTTP/HTTPS implementation (that's axum/hyper's job)
 - ❌ We DON'T test: Zenoh's internal routing (that's Zenoh's job)
 
 ## Test Files
@@ -80,41 +79,21 @@ Basic TCP bridge functionality tests without external protocol dependencies.
 - Fast execution
 - Core bridge functionality validation
 
-### `grpc_integration.rs`
-Tests using gRPC as a **test payload** to validate bridge with complex protocols.
-
-**Architecture:**
-```
-┌──────────────┐         ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
-│  gRPC Client │ ──TCP──>│   Bridge A   │ ─Zenoh─>│   Bridge B   │ ──TCP──>│ gRPC Server  │
-│  (Tonic)     │         │ (Client-side)│         │(Server-side) │         │ (Tonic)      │
-└──────────────┘         └──────────────┘         └──────────────┘         └──────────────┘
-```
+### `http_integration.rs`
+Tests using HTTP/HTTPS as **test protocols** to validate bridge with real-world protocols.
 
 **Tests:**
-- `test_bridge_with_grpc_unary` - Full bridge test with gRPC as payload
-- `test_grpc_direct_connection_works` - Baseline (proves gRPC works without bridge)
-- `test_documentation_what_we_test` - Explains test philosophy
-
-**Why gRPC is a good test case:**
-- Real-world, production protocol
-- Complex (HTTP/2, bidirectional, stateful)
-- Requires persistent connections
-- If bridge works with gRPC, it works with simpler protocols
-- Demonstrates practical use case
+- `test_http_through_bridge` - HTTP bridging test
+- `test_https_through_bridge` - HTTPS bridging with TLS
+- `test_multiple_http_requests` - Multiple sequential requests
+- `test_http_https_documentation` - Explains test philosophy
 
 **What we're actually testing:**
 - Bridge accepts TCP connections ✓
 - Bridge forwards data through Zenoh ✓
 - Two bridge instances can communicate ✓
 - Bridge maintains bidirectional streams ✓
-- Complex protocols can work through the bridge ✓
-
-**What we're NOT testing:**
-- Tonic's gRPC implementation correctness ✗
-- Protobuf serialization/deserialization ✗
-- HTTP/2 protocol compliance ✗
-- Zenoh's data routing algorithms ✗
+- HTTP/HTTPS protocols work through the bridge ✓
 
 ## Running Tests
 
