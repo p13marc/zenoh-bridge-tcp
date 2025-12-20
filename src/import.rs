@@ -3,17 +3,19 @@
 //! This module handles importing Zenoh services as TCP listeners.
 //! Each TCP connection gets its own liveliness token and dedicated Zenoh pub/sub.
 //!
-//! Supports both regular TCP mode and HTTP-aware mode with DNS-based routing.
-//! Also supports HTTPS/TLS with SNI-based routing.
+//! Supports regular TCP mode, HTTP-aware mode with DNS-based routing,
+//! HTTPS/TLS with SNI-based routing, and WebSocket mode.
 
 use crate::http_parser::{http_400_response, http_502_response, parse_http_request};
 use crate::tls_parser::{is_tls_handshake, parse_tls_client_hello};
 use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
@@ -454,6 +456,232 @@ async fn handle_import_connection(
                 zenoh_to_tcp.abort();
                 tcp_to_zenoh.abort();
             }
+        },
+    }
+
+    // Liveliness token is automatically dropped here, signaling disconnection
+
+    Ok(())
+}
+
+/// Run WebSocket import mode for a single service
+///
+/// This function:
+/// 1. Binds a TCP listener on the specified address
+/// 2. Accepts incoming connections and upgrades them to WebSocket
+/// 3. For each connection, spawns a handler that bridges to Zenoh
+pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Result<()> {
+    let (service_name, listen_addr) = parse_import_spec(import_spec)?;
+
+    info!("🚀 WEBSOCKET IMPORT MODE");
+    info!("   Service name: {}", service_name);
+    info!("   TCP Listen: {}", listen_addr);
+    info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
+    info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
+    info!("   Liveliness: {}/clients/<client_id>", service_name);
+
+    // Start TCP listener
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", listen_addr, e))?;
+
+    info!("✓ Listening for WebSocket connections on {}", listen_addr);
+    info!("✓ Ready to forward to service '{}'", service_name);
+
+    let mut connection_id = 0u64;
+
+    // Accept connections
+    loop {
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                connection_id += 1;
+                let client_id = format!("wsclient_{}", connection_id);
+                info!("✓ New WebSocket connection: {} from {}", client_id, addr);
+
+                let session = session.clone();
+                let service_name = service_name.clone();
+
+                tokio::spawn(async move {
+                    // Perform WebSocket upgrade
+                    match tokio_tungstenite::accept_async(stream).await {
+                        Ok(ws_stream) => {
+                            if let Err(e) = handle_ws_import_connection(
+                                session,
+                                ws_stream,
+                                &service_name,
+                                &client_id,
+                            )
+                            .await
+                            {
+                                error!("WebSocket connection {} error: {:?}", client_id, e);
+                            }
+                            info!("✗ WebSocket connection {} closed", client_id);
+                        }
+                        Err(e) => {
+                            error!(
+                                "WebSocket handshake failed for {}: {:?}",
+                                client_id, e
+                            );
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                error!("Failed to accept connection: {:?}", e);
+            }
+        }
+    }
+}
+
+/// Handle a single WebSocket import connection
+async fn handle_ws_import_connection(
+    session: Arc<Session>,
+    ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>,
+    service_name: &str,
+    client_id: &str,
+) -> Result<()> {
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+
+    // Subscribe to responses from the service for this specific client
+    let sub_key = format!("{}/rx/{}", service_name, client_id);
+    let subscriber = session
+        .declare_subscriber(&sub_key)
+        .history(HistoryConfig::default().detect_late_publishers())
+        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
+        .subscriber_detection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
+
+    debug!(
+        "WebSocket client {}: Subscribed to {} with late publisher detection",
+        client_id, sub_key
+    );
+
+    // Declare publisher for TX channel
+    let pub_key_str = format!("{}/tx/{}", service_name, client_id);
+    let pub_key: KeyExpr<'static> = pub_key_str
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+    let publisher = session
+        .declare_publisher(pub_key.clone())
+        .cache(CacheConfig::default().max_samples(10))
+        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
+        .publisher_detection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+    debug!(
+        "WebSocket client {}: Declared AdvancedPublisher on {} with cache",
+        client_id, pub_key_str
+    );
+
+    // Declare liveliness token - export bridge will detect this and connect
+    let liveliness_key = format!("{}/clients/{}", service_name, client_id);
+    let _liveliness_token = session
+        .liveliness()
+        .declare_token(&liveliness_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
+
+    info!(
+        "✓ WebSocket client {} declared liveliness: {}",
+        client_id, liveliness_key
+    );
+
+    let client_id_clone = client_id.to_string();
+    let client_id_for_sender = client_id.to_string();
+
+    // Task: Zenoh subscriber -> WebSocket sender
+    let mut zenoh_to_ws = tokio::spawn(async move {
+        while let Ok(sample) = subscriber.recv_async().await {
+            let payload = sample.payload().to_bytes().to_vec();
+
+            // Empty payload is EOF signal from export side
+            if payload.is_empty() {
+                debug!(
+                    "WebSocket client {}: Received EOF signal from Zenoh",
+                    client_id_clone
+                );
+                // Send close frame
+                let _ = ws_sender.send(Message::Close(None)).await;
+                break;
+            }
+
+            debug!(
+                "WebSocket client {}: ← {} bytes from Zenoh",
+                client_id_clone,
+                payload.len()
+            );
+
+            if let Err(e) = ws_sender.send(Message::Binary(payload.into())).await {
+                error!(
+                    "WebSocket client {}: Failed to send: {:?}",
+                    client_id_clone, e
+                );
+                break;
+            }
+        }
+
+        debug!(
+            "WebSocket client {}: Zenoh to WebSocket task completed",
+            client_id_clone
+        );
+    });
+
+    // Task: WebSocket receiver -> Zenoh publisher
+    let mut ws_to_zenoh = tokio::spawn(async move {
+        while let Some(msg_result) = ws_receiver.next().await {
+            match msg_result {
+                Ok(msg) => {
+                    let data = match msg {
+                        Message::Binary(data) => data.to_vec(),
+                        Message::Text(text) => text.as_bytes().to_vec(),
+                        Message::Close(_) => {
+                            debug!(
+                                "WebSocket client {}: Connection closed by client",
+                                client_id_for_sender
+                            );
+                            break;
+                        }
+                        Message::Ping(_) | Message::Pong(_) => continue,
+                        Message::Frame(_) => continue,
+                    };
+
+                    debug!(
+                        "WebSocket client {}: → {} bytes to Zenoh",
+                        client_id_for_sender,
+                        data.len()
+                    );
+
+                    if let Err(e) = publisher.put(&data).await {
+                        error!(
+                            "WebSocket client {}: Failed to publish to Zenoh: {:?}",
+                            client_id_for_sender, e
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "WebSocket client {}: Receive error: {:?}",
+                        client_id_for_sender, e
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for either task to complete
+    tokio::select! {
+        _ = &mut zenoh_to_ws => {
+            info!("WebSocket client {}: Zenoh to WebSocket task completed", client_id);
+            ws_to_zenoh.abort();
+        },
+        _ = &mut ws_to_zenoh => {
+            info!("WebSocket client {}: WebSocket to Zenoh task completed", client_id);
+            zenoh_to_ws.abort();
         },
     }
 

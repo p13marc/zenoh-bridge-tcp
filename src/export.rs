@@ -3,10 +3,11 @@
 //! This module handles exporting TCP backend services as Zenoh services.
 //! Each export creates lazy connections to the backend - one connection per importing client.
 //!
-//! Supports both regular TCP mode and HTTP-aware mode with DNS-based routing.
+//! Supports regular TCP mode, HTTP-aware mode with DNS-based routing, and WebSocket mode.
 
 use crate::http_parser::normalize_dns;
 use anyhow::Result;
+use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
@@ -440,6 +442,320 @@ async fn handle_client_disconnect(
     }
 }
 
+/// Parse WebSocket export specification in format 'service_name/ws_url'
+///
+/// The ws_url should be a full WebSocket URL like 'ws://127.0.0.1:9000' or 'wss://example.com:443'
+pub fn parse_ws_export_spec(export_spec: &str) -> Result<(String, String)> {
+    // Split on first '/' only to preserve the ws:// or wss:// in the URL
+    let slash_pos = export_spec
+        .find('/')
+        .ok_or_else(|| anyhow::anyhow!(
+            "Invalid WebSocket export format. Expected: 'service_name/ws://host:port' (e.g., 'myws/ws://127.0.0.1:9000')"
+        ))?;
+
+    let service_name = export_spec[..slash_pos].to_string();
+    let ws_url = export_spec[slash_pos + 1..].to_string();
+
+    // Validate that the URL starts with ws:// or wss://
+    if !ws_url.starts_with("ws://") && !ws_url.starts_with("wss://") {
+        return Err(anyhow::anyhow!(
+            "Invalid WebSocket URL: must start with 'ws://' or 'wss://'"
+        ));
+    }
+
+    if service_name.is_empty() {
+        return Err(anyhow::anyhow!("Service name cannot be empty"));
+    }
+
+    Ok((service_name, ws_url))
+}
+
+/// Run WebSocket export mode for a single service
+///
+/// This function:
+/// 1. Monitors client liveliness tokens
+/// 2. Creates a WebSocket connection to the backend when a client appears
+/// 3. Bridges data between the WebSocket backend and Zenoh
+/// 4. Cleans up when clients disconnect
+pub async fn run_ws_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
+    let (service_name, ws_url) = parse_ws_export_spec(export_spec)?;
+
+    info!("🚀 WEBSOCKET EXPORT MODE");
+    info!("   Service name: {}", service_name);
+    info!("   WebSocket URL: {}", ws_url);
+    info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
+    info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
+    info!("   Liveliness: {}/clients/*", service_name);
+
+    // Monitor client liveliness to create/destroy connections
+    let liveliness_key = format!("{}/clients/*", service_name);
+
+    let liveliness_subscriber = session
+        .liveliness()
+        .declare_subscriber(&liveliness_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
+
+    info!("✓ Monitoring client liveliness: {}", liveliness_key);
+    info!("✓ Ready to create WebSocket connections when clients appear");
+
+    // Track connection tasks and cancellation senders per client ID
+    let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Main loop: monitor liveliness and create/destroy connections
+    loop {
+        match liveliness_subscriber.recv_async().await {
+            Ok(sample) => {
+                let key = sample.key_expr().as_str();
+                if let Some(client_id) = key.rsplit('/').next() {
+                    let client_id = client_id.to_string();
+
+                    match sample.kind() {
+                        zenoh::sample::SampleKind::Put => {
+                            handle_ws_client_connect(
+                                &session,
+                                &service_name,
+                                &ws_url,
+                                &client_id,
+                                &cancellation_senders,
+                            )
+                            .await;
+                        }
+                        zenoh::sample::SampleKind::Delete => {
+                            handle_client_disconnect(&client_id, &cancellation_senders).await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Liveliness subscriber error: {:?}", e);
+                break Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
+            }
+        }
+    }
+}
+
+/// Handle a WebSocket client connection event
+async fn handle_ws_client_connect(
+    session: &Arc<Session>,
+    service_name: &str,
+    ws_url: &str,
+    client_id: &str,
+    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+) {
+    info!("✓ Client connected (WebSocket): {}", client_id);
+
+    // Create new WebSocket connection for this client
+    match connect_async(ws_url).await {
+        Ok((ws_stream, _response)) => {
+            info!(
+                "✓ Created WebSocket connection for client: {}",
+                client_id
+            );
+
+            let (ws_sender, ws_receiver) = ws_stream.split();
+
+            let session_clone = session.clone();
+            let service_name = service_name.to_string();
+            let client_id_str = client_id.to_string();
+            let client_id_for_map = client_id.to_string();
+
+            // Create cancellation channel for graceful shutdown
+            let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+
+            // Spawn dedicated task for this client connection
+            let main_handle = tokio::spawn(async move {
+                if let Err(e) = handle_ws_client_bridge(
+                    session_clone,
+                    service_name,
+                    client_id_str,
+                    ws_sender,
+                    ws_receiver,
+                    cancel_rx,
+                )
+                .await
+                {
+                    error!("WebSocket client bridge error: {:?}", e);
+                }
+            });
+
+            // Store the cancellation sender and task handle
+            cancellation_senders
+                .lock()
+                .await
+                .insert(client_id_for_map, (cancel_tx, main_handle));
+        }
+        Err(e) => {
+            error!(
+                "Failed to connect to WebSocket backend for client {}: {:?}",
+                client_id, e
+            );
+        }
+    }
+}
+
+/// Handle the bridge logic for a single WebSocket client connection
+async fn handle_ws_client_bridge(
+    session: Arc<Session>,
+    service_name: String,
+    client_id: String,
+    mut ws_sender: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+        Message,
+    >,
+    mut ws_receiver: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
+    >,
+    mut cancel_rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    // Subscribe to messages from this specific client
+    let sub_key = format!("{}/tx/{}", service_name, client_id);
+    let subscriber = session
+        .declare_subscriber(&sub_key)
+        .history(HistoryConfig::default().detect_late_publishers())
+        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
+        .subscriber_detection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
+
+    info!(
+        "✓ WebSocket client {} subscribed to {} with late publisher detection",
+        client_id, sub_key
+    );
+
+    // Declare publisher for RX channel
+    let pub_key_str = format!("{}/rx/{}", service_name, client_id);
+    let pub_key: KeyExpr<'static> = pub_key_str
+        .clone()
+        .try_into()
+        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+    let publisher = session
+        .declare_publisher(pub_key.clone())
+        .cache(CacheConfig::default().max_samples(10))
+        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
+        .publisher_detection()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+    debug!(
+        "WebSocket client {}: Declared AdvancedPublisher on {} with cache",
+        client_id, pub_key_str
+    );
+
+    let client_id_for_receiver = client_id.clone();
+    let client_id_for_sender = client_id.clone();
+    let client_id_for_final = client_id.clone();
+
+    // Task: read from WebSocket and publish to Zenoh
+    let mut ws_to_zenoh_handle = tokio::spawn(async move {
+        while let Some(msg_result) = ws_receiver.next().await {
+            match msg_result {
+                Ok(msg) => {
+                    let data = match msg {
+                        Message::Binary(data) => data.to_vec(),
+                        Message::Text(text) => text.as_bytes().to_vec(),
+                        Message::Close(_) => {
+                            info!(
+                                "WebSocket backend closed for client: {}",
+                                client_id_for_receiver
+                            );
+                            // Send empty payload as EOF signal
+                            if let Err(e) = publisher.put(Vec::<u8>::new()).await {
+                                error!(
+                                    "Failed to send EOF signal for client {}: {:?}",
+                                    client_id_for_receiver, e
+                                );
+                            }
+                            break;
+                        }
+                        Message::Ping(_) | Message::Pong(_) => continue,
+                        Message::Frame(_) => continue,
+                    };
+
+                    debug!(
+                        "← {} bytes from WebSocket for client {}",
+                        data.len(),
+                        client_id_for_receiver
+                    );
+                    if let Err(e) = publisher.put(&data).await {
+                        error!(
+                            "Failed to publish for client {}: {:?}",
+                            client_id_for_receiver, e
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "WebSocket receive error for client {}: {:?}",
+                        client_id_for_receiver, e
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    // Task: receive from Zenoh and write to WebSocket
+    let mut zenoh_to_ws_handle = tokio::spawn(async move {
+        loop {
+            match subscriber.recv_async().await {
+                Ok(sample) => {
+                    let payload = sample.payload().to_bytes();
+                    debug!(
+                        "→ {} bytes to WebSocket for client {}",
+                        payload.len(),
+                        client_id_for_sender
+                    );
+                    if let Err(e) = ws_sender.send(Message::Binary(payload.to_vec().into())).await {
+                        error!(
+                            "Failed to send to WebSocket for client {}: {:?}",
+                            client_id_for_sender, e
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!(
+                        "Subscriber error for client {}: {:?}",
+                        client_id_for_sender, e
+                    );
+                    break;
+                }
+            }
+        }
+    });
+
+    // Wait for either task to complete or cancellation signal
+    tokio::select! {
+        _result = &mut ws_to_zenoh_handle => {
+            info!("WebSocket closed for client: {}", client_id_for_final);
+            zenoh_to_ws_handle.abort();
+            let _ = zenoh_to_ws_handle.await;
+        },
+        _result = &mut zenoh_to_ws_handle => {
+            info!("Zenoh closed for client: {}", client_id_for_final);
+            ws_to_zenoh_handle.abort();
+            let _ = ws_to_zenoh_handle.await;
+        },
+        _ = cancel_rx.recv() => {
+            info!("Cancellation received for WebSocket client: {}", client_id_for_final);
+            ws_to_zenoh_handle.abort();
+            zenoh_to_ws_handle.abort();
+            let _ = ws_to_zenoh_handle.await;
+            let _ = zenoh_to_ws_handle.await;
+        },
+    }
+
+    info!(
+        "WebSocket connection handler stopped for client: {}",
+        client_id_for_final
+    );
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,6 +822,42 @@ mod tests {
     #[test]
     fn test_parse_http_export_spec_invalid_addr() {
         let result = parse_http_export_spec("service/example.com/invalid:addr");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_export_spec_valid() {
+        let result = parse_ws_export_spec("myws/ws://127.0.0.1:9000");
+        assert!(result.is_ok());
+        let (service, url) = result.unwrap();
+        assert_eq!(service, "myws");
+        assert_eq!(url, "ws://127.0.0.1:9000");
+    }
+
+    #[test]
+    fn test_parse_ws_export_spec_wss() {
+        let result = parse_ws_export_spec("secure-ws/wss://example.com:443/path");
+        assert!(result.is_ok());
+        let (service, url) = result.unwrap();
+        assert_eq!(service, "secure-ws");
+        assert_eq!(url, "wss://example.com:443/path");
+    }
+
+    #[test]
+    fn test_parse_ws_export_spec_invalid_no_slash() {
+        let result = parse_ws_export_spec("invalid");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_export_spec_invalid_not_ws() {
+        let result = parse_ws_export_spec("myws/http://example.com");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_ws_export_spec_empty_service() {
+        let result = parse_ws_export_spec("/ws://example.com");
         assert!(result.is_err());
     }
 }

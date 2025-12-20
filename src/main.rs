@@ -47,6 +47,8 @@ async fn main() -> Result<()> {
     let import_count = args.import.len();
     let http_export_count = args.http_export.len();
     let http_import_count = args.http_import.len();
+    let ws_export_count = args.ws_export.len();
+    let ws_import_count = args.ws_import.len();
 
     for export_spec in args.export {
         let export_spec_clone = export_spec.clone();
@@ -99,11 +101,39 @@ async fn main() -> Result<()> {
         info!("Started HTTP import task for: {}", import_spec);
     }
 
-    info!("✓ All tasks started successfully");
+    // Spawn tasks for each WebSocket export specification
+    for export_spec in args.ws_export {
+        let export_spec_clone = export_spec.clone();
+        let session_clone = session.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = export::run_ws_export_mode(session_clone, &export_spec_clone).await {
+                tracing::error!("WebSocket export '{}' failed: {:?}", export_spec_clone, e);
+            }
+        });
+        tasks.push(task);
+        info!("Started WebSocket export task for: {}", export_spec);
+    }
+
+    // Spawn tasks for each WebSocket import specification
+    for import_spec in args.ws_import {
+        let import_spec_clone = import_spec.clone();
+        let session_clone = session.clone();
+        let task = tokio::spawn(async move {
+            if let Err(e) = import::run_ws_import_mode(session_clone, &import_spec_clone).await {
+                tracing::error!("WebSocket import '{}' failed: {:?}", import_spec_clone, e);
+            }
+        });
+        tasks.push(task);
+        info!("Started WebSocket import task for: {}", import_spec);
+    }
+
+    info!("All tasks started successfully");
     info!("  Total exports: {}", export_count);
     info!("  Total imports: {}", import_count);
     info!("  Total HTTP exports: {}", http_export_count);
     info!("  Total HTTP imports: {}", http_import_count);
+    info!("  Total WebSocket exports: {}", ws_export_count);
+    info!("  Total WebSocket imports: {}", ws_import_count);
 
     // Wait for all tasks (they should run indefinitely)
     for task in tasks {
