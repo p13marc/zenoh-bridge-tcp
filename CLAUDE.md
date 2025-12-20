@@ -10,7 +10,9 @@ Key features:
 - **Export Mode**: Expose TCP backend services over Zenoh
 - **Import Mode**: Make Zenoh services accessible via TCP listeners
 - **HTTP/HTTPS Routing**: DNS-based routing using Host header (HTTP) or SNI (HTTPS)
+- **WebSocket Support**: Bridge WebSocket backends with `--ws-export` and `--ws-import`
 - **Liveliness Detection**: Automatic client presence tracking via Zenoh liveliness tokens
+- **Configurable Logging**: `--log-level` and `--log-format` (pretty/compact/json)
 
 ## Build Commands
 
@@ -23,6 +25,12 @@ cargo run --release -- --export 'service/127.0.0.1:8003' --import 'service/127.0
 
 # Run with HTTP routing
 cargo run --release -- --http-export 'http-svc/api.example.com/127.0.0.1:8000' --http-import 'http-svc/0.0.0.0:8080'
+
+# Run with WebSocket
+cargo run --release -- --ws-export 'ws-svc/ws://127.0.0.1:9000' --ws-import 'ws-svc/0.0.0.0:8080'
+
+# With logging options
+cargo run --release -- --log-level debug --log-format json --export 'service/127.0.0.1:8003'
 ```
 
 ## Testing
@@ -59,9 +67,10 @@ Single crate with library and binary:
 - `src/lib.rs` - Library entry point, re-exports modules
 - `src/main.rs` - CLI entry point, spawns export/import tasks
 - `src/args.rs` - Command-line argument parsing (clap)
-- `src/config.rs` - Zenoh configuration handling
-- `src/export.rs` - Export mode: TCP backend -> Zenoh
-- `src/import.rs` - Import mode: Zenoh -> TCP listener
+- `src/config.rs` - Zenoh and bridge configuration (BridgeConfig)
+- `src/error.rs` - Structured error types (BridgeError)
+- `src/export.rs` - Export mode: TCP/WebSocket backend -> Zenoh
+- `src/import.rs` - Import mode: Zenoh -> TCP/WebSocket listener
 - `src/http_parser.rs` - HTTP request parsing, Host header extraction
 - `src/tls_parser.rs` - TLS ClientHello parsing, SNI extraction
 
@@ -97,5 +106,9 @@ Uses `zenoh-ext` AdvancedPublisher/Subscriber for reliability:
 - `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
 - `clap` - CLI parsing
+- `anyhow` / `thiserror` - Error handling
+- `tracing` / `tracing-subscriber` - Structured logging with JSON support
 - `httparse` - HTTP/1.x header parsing
 - `tls-parser` - TLS ClientHello/SNI parsing
+- `tokio-tungstenite` - WebSocket support
+- `futures-util` - Async stream utilities

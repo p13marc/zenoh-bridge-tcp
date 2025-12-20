@@ -2,7 +2,10 @@
 
 A bidirectional bridge that connects TCP services to the Zenoh distributed data bus. Export TCP backends as Zenoh services or import Zenoh services as TCP listeners.
 
-**New in v0.1.0**: HTTP/HTTPS routing with DNS-based service discovery! Route HTTP requests by Host header and HTTPS requests by SNI to multiple backends through a single listener.
+**New in v0.2.0**: 
+- **WebSocket Support**: Bridge WebSocket backends with `--ws-export` and `--ws-import`
+- **Configurable Logging**: `--log-level` and `--log-format` (pretty/compact/json)
+- **HTTP/HTTPS Routing**: Route by Host header or SNI to multiple backends
 
 ## Overview
 
@@ -19,6 +22,7 @@ This bridge enables:
 - **Per-Client Isolation**: Each client gets dedicated Zenoh pub/sub channels and backend connection
 - **Concurrent Services**: Handle multiple services in one bridge process
 - **Flexible Configuration**: Command-line arguments or Zenoh config files
+- **WebSocket Support**: Bridge WebSocket backends alongside TCP services
 
 ### HTTP/HTTPS Routing (New!)
 - **DNS-Based Routing**: Route HTTP requests by Host header to different backends
@@ -145,23 +149,28 @@ Options:
       --export <SPEC>              Export TCP backend as Zenoh service
                                    Format: 'service_name/backend_addr'
                                    Example: 'myapi/127.0.0.1:3000'
-                                   Can be specified multiple times
       --import <SPEC>              Import Zenoh service as TCP listener
                                    Format: 'service_name/listen_addr'
                                    Example: 'myapi/0.0.0.0:8080'
-                                   Can be specified multiple times
-      --http-export <HTTP_EXPORT>  Export HTTP backend with DNS-based routing
+      --http-export <SPEC>         Export HTTP backend with DNS-based routing
                                    Format: 'service_name/dns/backend_addr'
                                    Example: 'http-service/api.example.com/127.0.0.1:8000'
-                                   Can be specified multiple times
-      --http-import <HTTP_IMPORT>  Import HTTP service with DNS-based routing
+      --http-import <SPEC>         Import HTTP service with DNS-based routing
                                    Format: 'service_name/listen_addr'
                                    Example: 'http-service/0.0.0.0:8080'
-                                   Automatically detects HTTP vs HTTPS (SNI)
-                                   Can be specified multiple times
+      --ws-export <SPEC>           Export WebSocket backend as Zenoh service
+                                   Format: 'service_name/ws_url'
+                                   Example: 'myws/ws://127.0.0.1:9000'
+      --ws-import <SPEC>           Import Zenoh service as WebSocket listener
+                                   Format: 'service_name/listen_addr'
+                                   Example: 'myws/0.0.0.0:8080'
   -m, --mode <MODE>                Zenoh mode: peer, client, or router [default: peer]
   -e, --connect <ENDPOINT>         Zenoh connect endpoint (e.g., tcp/localhost:7447)
   -l, --listen <ENDPOINT>          Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
+      --buffer-size <BYTES>        Buffer size for read operations [default: 65536]
+      --read-timeout <SECS>        Timeout for reading headers [default: 10]
+      --log-level <LEVEL>          Log level: trace, debug, info, warn, error [default: info]
+      --log-format <FORMAT>        Log format: pretty, compact, json [default: pretty]
   -h, --help                       Print help
   -V, --version                    Print version
 ```
@@ -260,6 +269,23 @@ zenoh-bridge-tcp --http-import 'https-service/0.0.0.0:8443'
 # Test - SNI determines routing (no TLS termination!)
 curl https://api.example.com:8443/ --resolve api.example.com:8443:127.0.0.1
 curl https://web.example.com:8443/ --resolve web.example.com:8443:127.0.0.1
+```
+
+### Example 1d: WebSocket Bridge
+
+```bash
+# Terminal 1: Start WebSocket echo server (using websocat or similar)
+websocat -s 127.0.0.1:9000
+
+# Terminal 2: Export WebSocket backend
+zenoh-bridge-tcp --ws-export 'wsecho/ws://127.0.0.1:9000'
+
+# Terminal 3: Import as WebSocket listener
+zenoh-bridge-tcp --ws-import 'wsecho/0.0.0.0:8080'
+
+# Terminal 4: Connect WebSocket client
+websocat ws://127.0.0.1:8080
+# Type messages - they go through Zenoh to the WebSocket backend
 ```
 
 ### Example 2: Netcat Echo Test
@@ -361,12 +387,11 @@ The project includes comprehensive integration tests:
 
 ### Test Statistics
 ```
-Total Test Suites: 9 suites
-Unit Tests: 46 tests ✅ PASSING
-HTTP Integration: 3 tests ✅ PASSING
-HTTPS Integration: 3 tests ✅ PASSING
-Edge Cases: 3 tests ✅ PASSING (3 ignored - timing issues)
-Total: 55 tests passing + 3 ignored
+Total Test Suites: 10 suites
+Unit Tests: 56 tests
+Integration Tests: 56 tests
+WebSocket Tests: 3 tests
+Total: 112+ tests passing
 ```
 
 Run tests:
@@ -420,21 +445,30 @@ Each TCP connection gets a unique `client_id`, ensuring isolation between client
 
 ## Logging
 
-Control log verbosity with `RUST_LOG`:
+Control log verbosity with CLI flags or `RUST_LOG` environment variable:
 
 ```bash
-# Info level (default)
-RUST_LOG=info zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
+# Using CLI flags (recommended)
+zenoh-bridge-tcp --log-level debug --export 'service/127.0.0.1:8003'
 
-# Debug level
+# JSON format for production/log aggregation
+zenoh-bridge-tcp --log-level info --log-format json --export 'service/127.0.0.1:8003'
+
+# Compact format (less verbose)
+zenoh-bridge-tcp --log-format compact --export 'service/127.0.0.1:8003'
+
+# Using RUST_LOG (takes precedence over --log-level)
 RUST_LOG=debug zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
 
-# Trace level (very verbose)
-RUST_LOG=trace zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
-
-# Module-specific
-RUST_LOG=zenoh_bridge_tcp=debug,zenoh=info zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
+# Module-specific with RUST_LOG
+RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
 ```
+
+### Log Formats
+
+- **pretty** (default): Human-readable with colors
+- **compact**: Single-line format, less verbose
+- **json**: Structured JSON, ideal for log aggregation (ELK, Loki, etc.)
 
 ## Performance Considerations
 
@@ -465,12 +499,17 @@ RUST_LOG=zenoh_bridge_tcp=debug,zenoh=info zenoh-bridge-tcp --export 'service/12
 
 Core dependencies:
 - `zenoh` 1.6.2 - Zenoh distributed data bus
+- `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
 - `clap` - Command-line parsing
 - `anyhow` - Error handling
+- `thiserror` - Structured error types
 - `tracing` - Structured logging
+- `tracing-subscriber` - Log formatting (pretty, compact, json)
 - `httparse` - HTTP/1.x parser (for HTTP routing)
 - `tls-parser` - TLS/SNI parser (for HTTPS routing)
+- `tokio-tungstenite` - WebSocket support
+- `futures-util` - Async stream utilities
 
 Development/test dependencies include: `axum`, `hyper`, `rustls`, `reqwest`, `futures` for protocol testing.
 
