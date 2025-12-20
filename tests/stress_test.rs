@@ -64,30 +64,25 @@ async fn stress_test_many_concurrent_connections() -> Result<()> {
 
     // Echo server that handles multiple connections
     let backend_task = tokio::spawn(async move {
-        loop {
-            match backend_listener.accept().await {
-                Ok((mut stream, _addr)) => {
-                    let _conn_num = conn_counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
-                    let msg_counter = msg_counter_clone.clone();
+        while let Ok((mut stream, _addr)) = backend_listener.accept().await {
+            let _conn_num = conn_counter_clone.fetch_add(1, Ordering::SeqCst) + 1;
+            let msg_counter = msg_counter_clone.clone();
 
-                    tokio::spawn(async move {
-                        let mut buffer = vec![0u8; 1024];
-                        loop {
-                            match stream.read(&mut buffer).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    msg_counter.fetch_add(1, Ordering::SeqCst);
-                                    if stream.write_all(&buffer[..n]).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            msg_counter.fetch_add(1, Ordering::SeqCst);
+                            if stream.write_all(&buffer[..n]).await.is_err() {
+                                break;
                             }
                         }
-                    });
+                        Err(_) => break,
+                    }
                 }
-                Err(_) => break,
-            }
+            });
         }
     });
 
@@ -730,7 +725,7 @@ async fn stress_test_aggressive_crash_finder() -> Result<()> {
                             // Send and receive
                             stream.write_all(b"echo\n").await?;
                             let mut buf = vec![0u8; 16];
-                            stream.read(&mut buf).await?;
+                            let _ = stream.read(&mut buf).await?;
                             anyhow::Ok(())
                         }
                         3 => {

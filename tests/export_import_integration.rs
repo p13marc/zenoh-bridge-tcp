@@ -645,7 +645,7 @@ async fn test_bidirectional_data_flow() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Send multiple messages and verify echoes
-    let messages = vec!["Hello\n", "World\n", "Test\n"];
+    let messages = ["Hello\n", "World\n", "Test\n"];
     let mut echoes_received = 0;
 
     for (i, msg) in messages.iter().enumerate() {

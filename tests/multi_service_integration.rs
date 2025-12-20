@@ -415,116 +415,106 @@ async fn simulate_export_mode(
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    loop {
-        match liveliness_subscriber.recv_async().await {
-            Ok(sample) => {
-                let key = sample.key_expr().as_str();
-                if let Some(client_id) = key.rsplit('/').next() {
-                    let client_id = client_id.to_string();
+    while let Ok(sample) = liveliness_subscriber.recv_async().await {
+        let key = sample.key_expr().as_str();
+        if let Some(client_id) = key.rsplit('/').next() {
+            let client_id = client_id.to_string();
 
-                    match sample.kind() {
-                        zenoh::sample::SampleKind::Put => {
-                            info!("Export simulation: client connected: {}", client_id);
+            match sample.kind() {
+                zenoh::sample::SampleKind::Put => {
+                    info!("Export simulation: client connected: {}", client_id);
 
-                            match TcpStream::connect(backend_addr).await {
-                                Ok(backend_stream) => {
-                                    let (mut backend_reader, mut backend_writer) =
-                                        backend_stream.into_split();
-                                    let session_clone = session.clone();
-                                    let service_name = service_name.to_string();
-                                    let client_id_clone = client_id.clone();
+                    match TcpStream::connect(backend_addr).await {
+                        Ok(backend_stream) => {
+                            let (mut backend_reader, mut backend_writer) =
+                                backend_stream.into_split();
+                            let session_clone = session.clone();
+                            let service_name = service_name.to_string();
+                            let client_id_clone = client_id.clone();
 
-                                    let (cancel_tx, mut cancel_rx) =
-                                        tokio::sync::mpsc::channel::<()>(1);
+                            let (cancel_tx, mut cancel_rx) =
+                                tokio::sync::mpsc::channel::<()>(1);
 
-                                    let handle = tokio::spawn(async move {
-                                        let sub_key =
-                                            format!("{}/tx/{}", service_name, client_id_clone);
-                                        let pub_key =
-                                            format!("{}/rx/{}", service_name, client_id_clone);
+                            let handle = tokio::spawn(async move {
+                                let sub_key =
+                                    format!("{}/tx/{}", service_name, client_id_clone);
+                                let pub_key =
+                                    format!("{}/rx/{}", service_name, client_id_clone);
 
-                                        let subscriber = match session_clone
-                                            .declare_subscriber(&sub_key)
-                                            .await
-                                        {
-                                            Ok(s) => s,
-                                            Err(e) => {
-                                                warn!("Failed to subscribe: {:?}", e);
-                                                return;
+                                let subscriber = match session_clone
+                                    .declare_subscriber(&sub_key)
+                                    .await
+                                {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        warn!("Failed to subscribe: {:?}", e);
+                                        return;
+                                    }
+                                };
+
+                                let session_for_pub = session_clone.clone();
+
+                                let mut backend_to_zenoh = tokio::spawn(async move {
+                                    let mut buffer = vec![0u8; 65536];
+                                    loop {
+                                        match backend_reader.read(&mut buffer).await {
+                                            Ok(0) => break,
+                                            Ok(n) => {
+                                                let _ = session_for_pub
+                                                    .put(&pub_key, &buffer[..n])
+                                                    .await;
                                             }
-                                        };
-
-                                        let session_for_pub = session_clone.clone();
-
-                                        let mut backend_to_zenoh = tokio::spawn(async move {
-                                            let mut buffer = vec![0u8; 65536];
-                                            loop {
-                                                match backend_reader.read(&mut buffer).await {
-                                                    Ok(0) => break,
-                                                    Ok(n) => {
-                                                        let _ = session_for_pub
-                                                            .put(&pub_key, &buffer[..n])
-                                                            .await;
-                                                    }
-                                                    Err(_) => break,
-                                                }
-                                            }
-                                        });
-
-                                        let mut zenoh_to_backend = tokio::spawn(async move {
-                                            loop {
-                                                match subscriber.recv_async().await {
-                                                    Ok(sample) => {
-                                                        let payload = sample.payload().to_bytes();
-                                                        if backend_writer
-                                                            .write_all(&payload)
-                                                            .await
-                                                            .is_err()
-                                                        {
-                                                            break;
-                                                        }
-                                                    }
-                                                    Err(_) => break,
-                                                }
-                                            }
-                                        });
-
-                                        tokio::select! {
-                                            _ = &mut backend_to_zenoh => { zenoh_to_backend.abort(); },
-                                            _ = &mut zenoh_to_backend => { backend_to_zenoh.abort(); },
-                                            _ = cancel_rx.recv() => {
-                                                backend_to_zenoh.abort();
-                                                zenoh_to_backend.abort();
-                                            },
+                                            Err(_) => break,
                                         }
-                                    });
+                                    }
+                                });
 
-                                    cancellation_senders
-                                        .lock()
-                                        .await
-                                        .insert(client_id, (cancel_tx, handle));
+                                let mut zenoh_to_backend = tokio::spawn(async move {
+                                    while let Ok(sample) = subscriber.recv_async().await {
+                                        let payload = sample.payload().to_bytes();
+                                        if backend_writer
+                                            .write_all(&payload)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                });
+
+                                tokio::select! {
+                                    _ = &mut backend_to_zenoh => { zenoh_to_backend.abort(); },
+                                    _ = &mut zenoh_to_backend => { backend_to_zenoh.abort(); },
+                                    _ = cancel_rx.recv() => {
+                                        backend_to_zenoh.abort();
+                                        zenoh_to_backend.abort();
+                                    },
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "Export simulation: failed to connect to backend: {:?}",
-                                        e
-                                    );
-                                }
-                            }
+                            });
+
+                            cancellation_senders
+                                .lock()
+                                .await
+                                .insert(client_id, (cancel_tx, handle));
                         }
-                        zenoh::sample::SampleKind::Delete => {
-                            info!("Export simulation: client disconnected: {}", client_id);
-                            if let Some((cancel_tx, handle)) =
-                                cancellation_senders.lock().await.remove(&client_id)
-                            {
-                                let _ = cancel_tx.send(()).await;
-                                let _ = timeout(Duration::from_secs(2), handle).await;
-                            }
+                        Err(e) => {
+                            warn!(
+                                "Export simulation: failed to connect to backend: {:?}",
+                                e
+                            );
                         }
                     }
                 }
+                zenoh::sample::SampleKind::Delete => {
+                    info!("Export simulation: client disconnected: {}", client_id);
+                    if let Some((cancel_tx, handle)) =
+                        cancellation_senders.lock().await.remove(&client_id)
+                    {
+                        let _ = cancel_tx.send(()).await;
+                        let _ = timeout(Duration::from_secs(2), handle).await;
+                    }
+                }
             }
-            Err(_) => break,
         }
     }
 
