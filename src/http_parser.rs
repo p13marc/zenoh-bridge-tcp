@@ -4,17 +4,11 @@
 //! the Host header for routing purposes. It includes DNS normalization to
 //! ensure consistent routing behavior.
 
-use anyhow::{anyhow, Result};
-use std::time::Duration;
+use crate::config::BridgeConfig;
+use crate::error::{BridgeError, Result};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tracing::{debug, warn};
-
-/// Maximum size for HTTP request headers (16KB)
-const MAX_HEADER_SIZE: usize = 16 * 1024;
-
-/// Timeout for reading initial HTTP request
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Parsed HTTP request information
 #[derive(Debug, Clone)]
@@ -35,11 +29,15 @@ pub struct ParsedHttpRequest {
 ///
 /// # Arguments
 /// * `stream` - A mutable reference to the TCP stream reader
+/// * `config` - Bridge configuration with timeout and size limits
 ///
 /// # Returns
 /// * `Ok(ParsedHttpRequest)` - Successfully parsed request with DNS and buffer
 /// * `Err` - If parsing fails, timeout occurs, or Host header is missing
-pub async fn parse_http_request<R>(stream: &mut R) -> Result<ParsedHttpRequest>
+pub async fn parse_http_request_with_config<R>(
+    stream: &mut R,
+    config: &BridgeConfig,
+) -> Result<ParsedHttpRequest>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -47,8 +45,11 @@ where
     let mut buffer = Vec::with_capacity(4096);
     let mut temp_buf = vec![0u8; 4096];
 
+    let max_header_size = config.max_header_size;
+    let read_timeout = config.read_timeout;
+
     // Read with timeout to prevent hanging on slow clients
-    let read_result = timeout(READ_TIMEOUT, async {
+    let read_result = timeout(read_timeout, async {
         loop {
             // Try to parse what we have so far
             if let Some(parsed) = try_parse_request(&buffer)? {
@@ -56,17 +57,19 @@ where
             }
 
             // Check if we've exceeded the maximum header size
-            if buffer.len() >= MAX_HEADER_SIZE {
-                return Err(anyhow!(
+            if buffer.len() >= max_header_size {
+                return Err(BridgeError::HttpParse(format!(
                     "HTTP headers exceed maximum size of {} bytes",
-                    MAX_HEADER_SIZE
-                ));
+                    max_header_size
+                )));
             }
 
             // Read more data
             let n = stream.read(&mut temp_buf).await?;
             if n == 0 {
-                return Err(anyhow!("Connection closed before complete HTTP request"));
+                return Err(BridgeError::HttpParse(
+                    "Connection closed before complete HTTP request".to_string(),
+                ));
             }
 
             buffer.extend_from_slice(&temp_buf[..n]);
@@ -76,8 +79,18 @@ where
 
     match read_result {
         Ok(result) => result,
-        Err(_) => Err(anyhow!("Timeout reading HTTP request")),
+        Err(_) => Err(BridgeError::Timeout("reading HTTP request".to_string())),
     }
+}
+
+/// Parse an HTTP request using default configuration
+///
+/// This is a convenience function that uses default timeout and size limits.
+pub async fn parse_http_request<R>(stream: &mut R) -> Result<ParsedHttpRequest>
+where
+    R: AsyncReadExt + Unpin,
+{
+    parse_http_request_with_config(stream, &BridgeConfig::default()).await
 }
 
 /// Try to parse the buffered data as an HTTP request
@@ -110,7 +123,7 @@ fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
             // Need more data
             Ok(None)
         }
-        Err(e) => Err(anyhow!("Invalid HTTP request: {}", e)),
+        Err(e) => Err(BridgeError::HttpParse(format!("Invalid HTTP request: {}", e))),
     }
 }
 
@@ -126,7 +139,7 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
     if let Some(host) = find_host_header(req) {
         let normalized = normalize_dns(host);
         if normalized.is_empty() {
-            return Err(anyhow!("Host header is empty"));
+            return Err(BridgeError::HttpParse("Host header is empty".to_string()));
         }
         return Ok(normalized);
     }
@@ -136,7 +149,9 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
         if let Some(host) = extract_host_from_absolute_uri(path) {
             let normalized = normalize_dns(host);
             if normalized.is_empty() {
-                return Err(anyhow!("Host is empty in absolute URI"));
+                return Err(BridgeError::HttpParse(
+                    "Host is empty in absolute URI".to_string(),
+                ));
             }
             return Ok(normalized);
         }
@@ -144,7 +159,9 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
 
     // No Host header found
     warn!("HTTP request missing Host header");
-    Err(anyhow!("HTTP request missing Host header"))
+    Err(BridgeError::HttpParse(
+        "HTTP request missing Host header".to_string(),
+    ))
 }
 
 /// Find the Host header in the parsed request

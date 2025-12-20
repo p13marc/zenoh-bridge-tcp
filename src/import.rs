@@ -209,7 +209,7 @@ async fn handle_import_connection(
                         client_id, e
                     );
                     // For TLS, we can't send an HTTP error, just close the connection
-                    return Err(e);
+                    return Err(anyhow::anyhow!("{}", e));
                 }
             }
         } else {
@@ -255,7 +255,7 @@ async fn handle_import_connection(
                     warn!("Client {}: Failed to parse HTTP request: {}", client_id, e);
                     // Send HTTP 400 Bad Request
                     let _ = stream.write_all(&http_400_response()).await;
-                    return Err(e);
+                    return Err(anyhow::anyhow!("{}", e));
                 }
             }
         }
