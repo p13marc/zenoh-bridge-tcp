@@ -153,39 +153,39 @@ fn extract_sni_from_client_hello(buffer: &[u8]) -> Result<String> {
 
     // Get the handshake messages
     for message in &record.msg {
-        if let tls_parser::TlsMessage::Handshake(handshake) = message {
-            if let tls_parser::TlsMessageHandshake::ClientHello(client_hello) = handshake {
-                // Look for SNI extension - ext is Option<&[u8]> containing raw extension data
-                if let Some(ext_data) = client_hello.ext {
-                    // Parse all extensions from the raw bytes
-                    let mut remaining = ext_data;
-                    while !remaining.is_empty() {
-                        match tls_parser::parse_tls_extension(remaining) {
-                            Ok((rest, ext)) => {
-                                if let tls_parser::TlsExtension::SNI(sni_list) = ext {
-                                    // Get the first hostname from SNI
-                                    for sni in sni_list {
-                                        if let (tls_parser::SNIType::HostName, name) = sni {
-                                            let hostname =
-                                                String::from_utf8_lossy(name).to_string();
-                                            debug!("Found SNI hostname: {}", hostname);
-                                            return Ok(hostname);
-                                        }
+        if let tls_parser::TlsMessage::Handshake(tls_parser::TlsMessageHandshake::ClientHello(
+            client_hello,
+        )) = message
+        {
+            // Look for SNI extension - ext is Option<&[u8]> containing raw extension data
+            if let Some(ext_data) = client_hello.ext {
+                // Parse all extensions from the raw bytes
+                let mut remaining = ext_data;
+                while !remaining.is_empty() {
+                    match tls_parser::parse_tls_extension(remaining) {
+                        Ok((rest, ext)) => {
+                            if let tls_parser::TlsExtension::SNI(sni_list) = ext {
+                                // Get the first hostname from SNI
+                                for sni in sni_list {
+                                    if let (tls_parser::SNIType::HostName, name) = sni {
+                                        let hostname = String::from_utf8_lossy(name).to_string();
+                                        debug!("Found SNI hostname: {}", hostname);
+                                        return Ok(hostname);
                                     }
                                 }
-                                remaining = rest;
                             }
-                            Err(_) => break,
+                            remaining = rest;
                         }
+                        Err(_) => break,
                     }
                 }
-
-                // No SNI extension found
-                warn!("TLS ClientHello has no SNI extension");
-                return Err(BridgeError::TlsParse(
-                    "TLS ClientHello missing SNI extension".to_string(),
-                ));
             }
+
+            // No SNI extension found
+            warn!("TLS ClientHello has no SNI extension");
+            return Err(BridgeError::TlsParse(
+                "TLS ClientHello missing SNI extension".to_string(),
+            ));
         }
     }
 
