@@ -16,7 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
 use zenoh_ext::{
@@ -197,17 +197,17 @@ async fn handle_client_connect(
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
     dns_suffix: Option<&str>,
 ) {
-    info!("✓ Client connected: {}", client_id);
+    info!(client_id = %client_id, "Client connected");
 
     // Create new backend connection for this client
     match TcpStream::connect(backend_addr).await {
         Ok(backend_stream) => {
-            info!("✓ Created backend connection for client: {}", client_id);
+            info!(client_id = %client_id, backend = %backend_addr, "Backend connection established");
 
             let (backend_reader, backend_writer) = backend_stream.into_split();
 
             let session_clone = session.clone();
-            let service_name = service_name.to_string();
+            let service_name_clone = service_name.to_string();
             let client_id_str = client_id.to_string();
             let client_id_for_map = client_id.to_string();
             let dns_suffix_owned = dns_suffix.map(|s| s.to_string());
@@ -215,22 +215,33 @@ async fn handle_client_connect(
             // Create cancellation channel for graceful shutdown
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
 
+            let span = info_span!(
+                "client_bridge",
+                client_id = %client_id,
+                service = %service_name,
+                backend = %backend_addr,
+                dns = dns_suffix.unwrap_or("-")
+            );
+
             // Spawn dedicated task for this client connection
-            let main_handle = tokio::spawn(async move {
-                if let Err(e) = handle_client_bridge(
-                    session_clone,
-                    service_name,
-                    client_id_str,
-                    backend_reader,
-                    backend_writer,
-                    cancel_rx,
-                    dns_suffix_owned.as_deref(),
-                )
-                .await
-                {
-                    error!("Client bridge error: {:?}", e);
+            let main_handle = tokio::spawn(
+                async move {
+                    if let Err(e) = handle_client_bridge(
+                        session_clone,
+                        service_name_clone,
+                        client_id_str,
+                        backend_reader,
+                        backend_writer,
+                        cancel_rx,
+                        dns_suffix_owned.as_deref(),
+                    )
+                    .await
+                    {
+                        error!(error = %e, "Client bridge error");
+                    }
                 }
-            });
+                .instrument(span),
+            );
 
             // Store the cancellation sender and task handle
             cancellation_senders
@@ -544,41 +555,48 @@ async fn handle_ws_client_connect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
 ) {
-    info!("✓ Client connected (WebSocket): {}", client_id);
+    info!(client_id = %client_id, "WebSocket client connected");
 
     // Create new WebSocket connection for this client
     match connect_async(ws_url).await {
         Ok((ws_stream, _response)) => {
-            info!(
-                "✓ Created WebSocket connection for client: {}",
-                client_id
-            );
+            info!(client_id = %client_id, ws_url = %ws_url, "WebSocket backend connection established");
 
             let (ws_sender, ws_receiver) = ws_stream.split();
 
             let session_clone = session.clone();
-            let service_name = service_name.to_string();
+            let service_name_clone = service_name.to_string();
             let client_id_str = client_id.to_string();
             let client_id_for_map = client_id.to_string();
 
             // Create cancellation channel for graceful shutdown
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
 
+            let span = info_span!(
+                "ws_client_bridge",
+                client_id = %client_id,
+                service = %service_name,
+                ws_url = %ws_url
+            );
+
             // Spawn dedicated task for this client connection
-            let main_handle = tokio::spawn(async move {
-                if let Err(e) = handle_ws_client_bridge(
-                    session_clone,
-                    service_name,
-                    client_id_str,
-                    ws_sender,
-                    ws_receiver,
-                    cancel_rx,
-                )
-                .await
-                {
-                    error!("WebSocket client bridge error: {:?}", e);
+            let main_handle = tokio::spawn(
+                async move {
+                    if let Err(e) = handle_ws_client_bridge(
+                        session_clone,
+                        service_name_clone,
+                        client_id_str,
+                        ws_sender,
+                        ws_receiver,
+                        cancel_rx,
+                    )
+                    .await
+                    {
+                        error!(error = %e, "WebSocket client bridge error");
+                    }
                 }
-            });
+                .instrument(span),
+            );
 
             // Store the cancellation sender and task handle
             cancellation_senders
@@ -708,7 +726,10 @@ async fn handle_ws_client_bridge(
                         payload.len(),
                         client_id_for_sender
                     );
-                    if let Err(e) = ws_sender.send(Message::Binary(payload.to_vec().into())).await {
+                    if let Err(e) = ws_sender
+                        .send(Message::Binary(payload.to_vec().into()))
+                        .await
+                    {
                         error!(
                             "Failed to send to WebSocket for client {}: {:?}",
                             client_id_for_sender, e
