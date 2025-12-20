@@ -2,7 +2,56 @@
 
 use anyhow::Result;
 use std::path::Path;
+use std::time::Duration;
 use zenoh::config::Config;
+
+/// Configuration for bridge operations.
+///
+/// This struct holds all configurable parameters for the bridge,
+/// including buffer sizes, timeouts, and heartbeat intervals.
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    /// Buffer size for TCP read/write operations (default: 65536 bytes).
+    pub buffer_size: usize,
+
+    /// Maximum size for HTTP headers (default: 16384 bytes).
+    pub max_header_size: usize,
+
+    /// Timeout for reading HTTP/TLS headers (default: 10 seconds).
+    pub read_timeout: Duration,
+
+    /// Heartbeat interval for Zenoh publisher/subscriber (default: 500ms).
+    pub heartbeat_interval: Duration,
+
+    /// Timeout for checking backend availability (default: 1 second).
+    pub availability_timeout: Duration,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            buffer_size: 65536,
+            max_header_size: 16 * 1024,
+            read_timeout: Duration::from_secs(10),
+            heartbeat_interval: Duration::from_millis(500),
+            availability_timeout: Duration::from_millis(1000),
+        }
+    }
+}
+
+impl BridgeConfig {
+    /// Create a new BridgeConfig with custom values.
+    pub fn new(
+        buffer_size: usize,
+        read_timeout_secs: u64,
+    ) -> Self {
+        Self {
+            buffer_size,
+            read_timeout: Duration::from_secs(read_timeout_secs),
+            ..Default::default()
+        }
+    }
+}
 
 /// Create a Zenoh config from a JSON5 configuration file
 pub fn create_zenoh_config_from_file<P: AsRef<Path>>(path: P) -> Result<Config> {
@@ -121,5 +170,24 @@ mod tests {
         let json5 = r#"{ invalid json }"#;
         let config = create_zenoh_config_from_json5(json5);
         assert!(config.is_err());
+    }
+
+    #[test]
+    fn test_bridge_config_default() {
+        let config = BridgeConfig::default();
+        assert_eq!(config.buffer_size, 65536);
+        assert_eq!(config.max_header_size, 16 * 1024);
+        assert_eq!(config.read_timeout, Duration::from_secs(10));
+        assert_eq!(config.heartbeat_interval, Duration::from_millis(500));
+        assert_eq!(config.availability_timeout, Duration::from_millis(1000));
+    }
+
+    #[test]
+    fn test_bridge_config_new() {
+        let config = BridgeConfig::new(32768, 30);
+        assert_eq!(config.buffer_size, 32768);
+        assert_eq!(config.read_timeout, Duration::from_secs(30));
+        // Other values should be defaults
+        assert_eq!(config.max_header_size, 16 * 1024);
     }
 }

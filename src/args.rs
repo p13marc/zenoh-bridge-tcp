@@ -1,5 +1,6 @@
 //! Command-line argument definitions for zenoh-bridge-tcp.
 
+use crate::config::BridgeConfig;
 use clap::Parser;
 
 /// Command-line arguments for the Zenoh TCP Bridge
@@ -39,6 +40,20 @@ pub struct Args {
     #[arg(long)]
     pub http_import: Vec<String>,
 
+    /// Export WebSocket backend as Zenoh service: 'service_name/ws_url'
+    /// Example: --ws-export 'myws/ws://127.0.0.1:9000'
+    /// Connects to WebSocket backend when clients appear
+    /// Can be specified multiple times for multiple WebSocket exports
+    #[arg(long)]
+    pub ws_export: Vec<String>,
+
+    /// Import Zenoh service as WebSocket listener: 'service_name/listen_addr'
+    /// Example: --ws-import 'myws/0.0.0.0:8080'
+    /// Accepts WebSocket connections and bridges them to Zenoh
+    /// Can be specified multiple times for multiple WebSocket imports
+    #[arg(long)]
+    pub ws_import: Vec<String>,
+
     /// Zenoh configuration mode
     #[arg(short = 'm', long, default_value = "peer")]
     pub mode: String,
@@ -50,6 +65,14 @@ pub struct Args {
     /// Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
     #[arg(short = 'l', long)]
     pub listen: Option<String>,
+
+    /// Buffer size for TCP read/write operations in bytes
+    #[arg(long, default_value = "65536")]
+    pub buffer_size: usize,
+
+    /// Timeout for reading HTTP/TLS headers in seconds
+    #[arg(long, default_value = "10")]
+    pub read_timeout: u64,
 }
 
 impl Args {
@@ -59,11 +82,18 @@ impl Args {
             && self.import.is_empty()
             && self.http_export.is_empty()
             && self.http_import.is_empty()
+            && self.ws_export.is_empty()
+            && self.ws_import.is_empty()
         {
             return Err(anyhow::anyhow!(
-                "Must specify at least one --export, --import, --http-export, or --http-import. Use --help for usage."
+                "Must specify at least one --export, --import, --http-export, --http-import, --ws-export, or --ws-import. Use --help for usage."
             ));
         }
         Ok(())
+    }
+
+    /// Build a BridgeConfig from command-line arguments
+    pub fn bridge_config(&self) -> BridgeConfig {
+        BridgeConfig::new(self.buffer_size, self.read_timeout)
     }
 }

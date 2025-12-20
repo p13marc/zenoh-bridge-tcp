@@ -5,6 +5,7 @@
 
 pub mod args;
 pub mod config;
+pub mod error;
 pub mod export;
 pub mod http_parser;
 pub mod import;
