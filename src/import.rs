@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
 use zenoh_ext::{
@@ -123,21 +123,33 @@ async fn run_import_mode_internal(
 
                 let session = session.clone();
                 let service_name = service_name.clone();
+                let client_id_clone = client_id.clone();
 
-                tokio::spawn(async move {
-                    if let Err(e) = handle_import_connection(
-                        session,
-                        stream,
-                        &service_name,
-                        &client_id,
-                        http_mode,
-                    )
-                    .await
-                    {
-                        error!("Connection {} error: {:?}", client_id, e);
+                let span = info_span!(
+                    "connection",
+                    client_id = %client_id,
+                    service = %service_name,
+                    remote_addr = %addr,
+                    mode = if http_mode { "http" } else { "tcp" }
+                );
+
+                tokio::spawn(
+                    async move {
+                        if let Err(e) = handle_import_connection(
+                            session,
+                            stream,
+                            &service_name,
+                            &client_id_clone,
+                            http_mode,
+                        )
+                        .await
+                        {
+                            error!(error = %e, "Connection error");
+                        }
+                        info!("Connection closed");
                     }
-                    info!("✗ Connection {} closed", client_id);
-                });
+                    .instrument(span),
+                );
             }
             Err(e) => {
                 error!("Failed to accept connection: {:?}", e);
@@ -500,31 +512,40 @@ pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Res
 
                 let session = session.clone();
                 let service_name = service_name.clone();
+                let client_id_clone = client_id.clone();
 
-                tokio::spawn(async move {
-                    // Perform WebSocket upgrade
-                    match tokio_tungstenite::accept_async(stream).await {
-                        Ok(ws_stream) => {
-                            if let Err(e) = handle_ws_import_connection(
-                                session,
-                                ws_stream,
-                                &service_name,
-                                &client_id,
-                            )
-                            .await
-                            {
-                                error!("WebSocket connection {} error: {:?}", client_id, e);
+                let span = info_span!(
+                    "ws_connection",
+                    client_id = %client_id,
+                    service = %service_name,
+                    remote_addr = %addr,
+                    mode = "websocket"
+                );
+
+                tokio::spawn(
+                    async move {
+                        // Perform WebSocket upgrade
+                        match tokio_tungstenite::accept_async(stream).await {
+                            Ok(ws_stream) => {
+                                if let Err(e) = handle_ws_import_connection(
+                                    session,
+                                    ws_stream,
+                                    &service_name,
+                                    &client_id_clone,
+                                )
+                                .await
+                                {
+                                    error!(error = %e, "WebSocket connection error");
+                                }
+                                info!("WebSocket connection closed");
                             }
-                            info!("✗ WebSocket connection {} closed", client_id);
-                        }
-                        Err(e) => {
-                            error!(
-                                "WebSocket handshake failed for {}: {:?}",
-                                client_id, e
-                            );
+                            Err(e) => {
+                                error!(error = %e, "WebSocket handshake failed");
+                            }
                         }
                     }
-                });
+                    .instrument(span),
+                );
             }
             Err(e) => {
                 error!("Failed to accept connection: {:?}", e);
