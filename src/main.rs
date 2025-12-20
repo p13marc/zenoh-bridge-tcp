@@ -9,7 +9,7 @@ use anyhow::Result;
 use args::Args;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 /// Initialize the tracing subscriber based on CLI arguments
@@ -50,7 +50,7 @@ async fn main() -> Result<()> {
     // Configure Zenoh session
     let config = if let Some(config_file) = &args.config {
         // Load configuration from file
-        info!("Loading Zenoh configuration from file: {}", config_file);
+        info!(config_file = %config_file, "Loading Zenoh configuration from file");
         config::create_zenoh_config_from_file(config_file)?
     } else {
         // Create configuration from command-line arguments
@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
     };
 
     // Open Zenoh session
-    info!("Opening Zenoh session in {} mode...", args.mode);
+    info!(mode = %args.mode, "Opening Zenoh session");
     let session = Arc::new(
         zenoh::open(config)
             .await
@@ -80,11 +80,11 @@ async fn main() -> Result<()> {
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = export::run_export_mode(session_clone, &export_spec_clone).await {
-                tracing::error!("Export '{}' failed: {:?}", export_spec_clone, e);
+                tracing::error!(spec = %export_spec_clone, error = %e, "Export task failed");
             }
         });
         tasks.push(task);
-        info!("Started export task for: {}", export_spec);
+        debug!(mode = "export", spec = %export_spec, "Spawned task");
     }
 
     // Spawn tasks for each import specification
@@ -93,11 +93,11 @@ async fn main() -> Result<()> {
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = import::run_import_mode(session_clone, &import_spec_clone).await {
-                tracing::error!("Import '{}' failed: {:?}", import_spec_clone, e);
+                tracing::error!(spec = %import_spec_clone, error = %e, "Import task failed");
             }
         });
         tasks.push(task);
-        info!("Started import task for: {}", import_spec);
+        debug!(mode = "import", spec = %import_spec, "Spawned task");
     }
 
     // Spawn tasks for each HTTP export specification
@@ -106,11 +106,11 @@ async fn main() -> Result<()> {
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = export::run_http_export_mode(session_clone, &export_spec_clone).await {
-                tracing::error!("HTTP export '{}' failed: {:?}", export_spec_clone, e);
+                tracing::error!(spec = %export_spec_clone, error = %e, "HTTP export task failed");
             }
         });
         tasks.push(task);
-        info!("Started HTTP export task for: {}", export_spec);
+        debug!(mode = "http_export", spec = %export_spec, "Spawned task");
     }
 
     // Spawn tasks for each HTTP import specification
@@ -119,11 +119,11 @@ async fn main() -> Result<()> {
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = import::run_http_import_mode(session_clone, &import_spec_clone).await {
-                tracing::error!("HTTP import '{}' failed: {:?}", import_spec_clone, e);
+                tracing::error!(spec = %import_spec_clone, error = %e, "HTTP import task failed");
             }
         });
         tasks.push(task);
-        info!("Started HTTP import task for: {}", import_spec);
+        debug!(mode = "http_import", spec = %import_spec, "Spawned task");
     }
 
     // Spawn tasks for each WebSocket export specification
@@ -132,11 +132,11 @@ async fn main() -> Result<()> {
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = export::run_ws_export_mode(session_clone, &export_spec_clone).await {
-                tracing::error!("WebSocket export '{}' failed: {:?}", export_spec_clone, e);
+                tracing::error!(spec = %export_spec_clone, error = %e, "WebSocket export task failed");
             }
         });
         tasks.push(task);
-        info!("Started WebSocket export task for: {}", export_spec);
+        debug!(mode = "ws_export", spec = %export_spec, "Spawned task");
     }
 
     // Spawn tasks for each WebSocket import specification
@@ -145,20 +145,22 @@ async fn main() -> Result<()> {
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
             if let Err(e) = import::run_ws_import_mode(session_clone, &import_spec_clone).await {
-                tracing::error!("WebSocket import '{}' failed: {:?}", import_spec_clone, e);
+                tracing::error!(spec = %import_spec_clone, error = %e, "WebSocket import task failed");
             }
         });
         tasks.push(task);
-        info!("Started WebSocket import task for: {}", import_spec);
+        debug!(mode = "ws_import", spec = %import_spec, "Spawned task");
     }
 
-    info!("All tasks started successfully");
-    info!("  Total exports: {}", export_count);
-    info!("  Total imports: {}", import_count);
-    info!("  Total HTTP exports: {}", http_export_count);
-    info!("  Total HTTP imports: {}", http_import_count);
-    info!("  Total WebSocket exports: {}", ws_export_count);
-    info!("  Total WebSocket imports: {}", ws_import_count);
+    info!(
+        exports = export_count,
+        imports = import_count,
+        http_exports = http_export_count,
+        http_imports = http_import_count,
+        ws_exports = ws_export_count,
+        ws_imports = ws_import_count,
+        "All bridge tasks started"
+    );
 
     // Wait for all tasks (they should run indefinitely)
     for task in tasks {

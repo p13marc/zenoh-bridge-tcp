@@ -70,41 +70,20 @@ async fn run_import_mode_internal(
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
 
-    if http_mode {
-        info!("🚀 HTTP IMPORT MODE");
-        info!("   Service name: {}", service_name);
-        info!("   TCP Listen: {}", listen_addr);
-        info!("   Zenoh TX key: {}/{{dns}}/tx/<client_id>", service_name);
-        info!("   Zenoh RX key: {}/{{dns}}/rx/<client_id>", service_name);
-        info!(
-            "   Liveliness: {}/{{dns}}/clients/<client_id>",
-            service_name
-        );
-        info!("   DNS routing: Extracts Host header from HTTP requests");
-    } else {
-        info!("🚀 IMPORT MODE");
-        info!("   Service name: {}", service_name);
-        info!("   TCP Listen: {}", listen_addr);
-        info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
-        info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
-        info!("   Liveliness: {}/clients/<client_id>", service_name);
-    }
+    let mode = if http_mode { "http_import" } else { "import" };
+    info!(
+        mode = mode,
+        service = %service_name,
+        listen_addr = %listen_addr,
+        "Starting import bridge"
+    );
 
     // Start TCP listener
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", listen_addr, e))?;
 
-    if http_mode {
-        info!("✓ Listening for HTTP connections on {}", listen_addr);
-        info!(
-            "✓ Ready to route to backends under service '{}'",
-            service_name
-        );
-    } else {
-        info!("✓ Listening for TCP connections on {}", listen_addr);
-        info!("✓ Ready to forward to service '{}'", service_name);
-    }
+    info!(listen_addr = %listen_addr, service = %service_name, "Import bridge ready");
 
     let mut connection_id = 0u64;
 
@@ -115,10 +94,9 @@ async fn run_import_mode_internal(
                 connection_id += 1;
                 let client_id = format!("client_{}", connection_id);
                 info!(
-                    "✓ New {} connection: {} from {}",
-                    if http_mode { "HTTP" } else { "TCP" },
-                    client_id,
-                    addr
+                    client_id = %client_id,
+                    remote_addr = %addr,
+                    "New connection"
                 );
 
                 let session = session.clone();
@@ -485,20 +463,19 @@ async fn handle_import_connection(
 pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
 
-    info!("🚀 WEBSOCKET IMPORT MODE");
-    info!("   Service name: {}", service_name);
-    info!("   TCP Listen: {}", listen_addr);
-    info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
-    info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
-    info!("   Liveliness: {}/clients/<client_id>", service_name);
+    info!(
+        mode = "ws_import",
+        service = %service_name,
+        listen_addr = %listen_addr,
+        "Starting WebSocket import bridge"
+    );
 
     // Start TCP listener
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", listen_addr, e))?;
 
-    info!("✓ Listening for WebSocket connections on {}", listen_addr);
-    info!("✓ Ready to forward to service '{}'", service_name);
+    info!(listen_addr = %listen_addr, service = %service_name, "WebSocket import bridge ready");
 
     let mut connection_id = 0u64;
 
@@ -508,7 +485,7 @@ pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Res
             Ok((stream, addr)) => {
                 connection_id += 1;
                 let client_id = format!("wsclient_{}", connection_id);
-                info!("✓ New WebSocket connection: {} from {}", client_id, addr);
+                info!(client_id = %client_id, remote_addr = %addr, "New WebSocket connection");
 
                 let session = session.clone();
                 let service_name = service_name.clone();

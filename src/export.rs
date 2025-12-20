@@ -99,22 +99,18 @@ async fn run_export_mode_internal(
 ) -> Result<()> {
     let (service_name, backend_addr) = parse_export_spec(export_spec)?;
 
-    if let Some(ref dns) = dns_suffix {
-        info!("🚀 HTTP EXPORT MODE");
-        info!("   Service name: {}", service_name);
-        info!("   DNS: {}", dns);
-        info!("   Backend: {}", backend_addr);
-        info!("   Zenoh TX key: {}/{}/tx/<client_id>", service_name, dns);
-        info!("   Zenoh RX key: {}/{}/rx/<client_id>", service_name, dns);
-        info!("   Liveliness: {}/{}/clients/*", service_name, dns);
+    let mode = if dns_suffix.is_some() {
+        "http_export"
     } else {
-        info!("🚀 EXPORT MODE");
-        info!("   Service name: {}", service_name);
-        info!("   Backend: {}", backend_addr);
-        info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
-        info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
-        info!("   Liveliness: {}/clients/*", service_name);
-    }
+        "export"
+    };
+    info!(
+        mode = mode,
+        service = %service_name,
+        backend = %backend_addr,
+        dns = dns_suffix.as_deref().unwrap_or("-"),
+        "Starting export bridge"
+    );
 
     // Monitor client liveliness to create/destroy connections
     let liveliness_key = if let Some(ref dns) = dns_suffix {
@@ -131,7 +127,7 @@ async fn run_export_mode_internal(
             .declare_token(&service_key)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare service liveliness: {}", e))?;
-        info!("✓ Declared service availability: {}", service_key);
+        debug!(service_key = %service_key, "Declared service availability");
         Some(token)
     } else {
         None
@@ -143,12 +139,7 @@ async fn run_export_mode_internal(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
 
-    info!("✓ Monitoring client liveliness: {}", liveliness_key);
-    if dns_suffix.is_some() {
-        info!("✓ Ready to create connections when HTTP clients appear");
-    } else {
-        info!("✓ Ready to create connections when clients appear");
-    }
+    info!(liveliness_key = %liveliness_key, "Export bridge ready");
 
     // Track connection tasks and cancellation senders per client ID
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
@@ -491,12 +482,12 @@ pub fn parse_ws_export_spec(export_spec: &str) -> Result<(String, String)> {
 pub async fn run_ws_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
     let (service_name, ws_url) = parse_ws_export_spec(export_spec)?;
 
-    info!("🚀 WEBSOCKET EXPORT MODE");
-    info!("   Service name: {}", service_name);
-    info!("   WebSocket URL: {}", ws_url);
-    info!("   Zenoh TX key: {}/tx/<client_id>", service_name);
-    info!("   Zenoh RX key: {}/rx/<client_id>", service_name);
-    info!("   Liveliness: {}/clients/*", service_name);
+    info!(
+        mode = "ws_export",
+        service = %service_name,
+        ws_url = %ws_url,
+        "Starting WebSocket export bridge"
+    );
 
     // Monitor client liveliness to create/destroy connections
     let liveliness_key = format!("{}/clients/*", service_name);
@@ -507,8 +498,7 @@ pub async fn run_ws_export_mode(session: Arc<Session>, export_spec: &str) -> Res
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
 
-    info!("✓ Monitoring client liveliness: {}", liveliness_key);
-    info!("✓ Ready to create WebSocket connections when clients appear");
+    info!(liveliness_key = %liveliness_key, "WebSocket export bridge ready");
 
     // Track connection tasks and cancellation senders per client ID
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
