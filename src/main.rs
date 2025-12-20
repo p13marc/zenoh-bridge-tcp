@@ -10,14 +10,39 @@ use args::Args;
 use clap::Parser;
 use std::sync::Arc;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+/// Initialize the tracing subscriber based on CLI arguments
+fn init_tracing(log_level: &str, log_format: &str) {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+
+    match log_format {
+        "json" => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .json()
+                .init();
+        }
+        "compact" => {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .compact()
+                .init();
+        }
+        _ => {
+            // "pretty" or default
+            tracing_subscriber::fmt().with_env_filter(filter).init();
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize tracing
-    tracing_subscriber::fmt::init();
-
-    // Parse command-line arguments
+    // Parse command-line arguments first (before tracing init)
     let args = Args::parse();
+
+    // Initialize tracing with configured level and format
+    init_tracing(&args.log_level, &args.log_format);
 
     // Validate arguments
     args.validate()?;

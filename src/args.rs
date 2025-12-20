@@ -73,6 +73,14 @@ pub struct Args {
     /// Timeout for reading HTTP/TLS headers in seconds
     #[arg(long, default_value = "10")]
     pub read_timeout: u64,
+
+    /// Log level: trace, debug, info, warn, error
+    #[arg(long, default_value = "info")]
+    pub log_level: String,
+
+    /// Log format: pretty, compact, json
+    #[arg(long, default_value = "pretty")]
+    pub log_format: String,
 }
 
 impl Args {
