@@ -3,6 +3,8 @@ name = "zenoh-bridge-tcp"
 version = "0.2.0"
 edition = "2024"
 license = "MIT"
+authors = ["Marc Pardo <p13marc@gmail.com>"]
+repository = "https://github.com/p13marc/zenoh-bridge-tcp"
 
 [lib]
 name = "zenoh_bridge_tcp"
