@@ -188,11 +188,10 @@ fn test_concurrent_connections() {
 
     let mut success_count = 0;
     for handle in handles {
-        if let Ok(response) = handle.join() {
-            if !response.is_empty() {
+        if let Ok(response) = handle.join()
+            && !response.is_empty() {
                 success_count += 1;
             }
-        }
     }
 
     assert!(

@@ -145,8 +145,8 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
     }
 
     // HTTP/1.0 might use absolute URI: GET http://example.com/path HTTP/1.0
-    if let Some(path) = req.path {
-        if let Some(host) = extract_host_from_absolute_uri(path) {
+    if let Some(path) = req.path
+        && let Some(host) = extract_host_from_absolute_uri(path) {
             let normalized = normalize_dns(host);
             if normalized.is_empty() {
                 return Err(BridgeError::HttpParse(
@@ -155,7 +155,6 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
             }
             return Ok(normalized);
         }
-    }
 
     // No Host header found
     warn!("HTTP request missing Host header");

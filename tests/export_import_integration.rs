@@ -497,13 +497,12 @@ async fn test_connection_basic() -> Result<()> {
         println!("2. Backend: Connection accepted");
 
         let mut buffer = vec![0u8; 1024];
-        if let Ok(n) = stream.read(&mut buffer).await {
-            if n > 0 {
+        if let Ok(n) = stream.read(&mut buffer).await
+            && n > 0 {
                 println!("3. Backend: Received {} bytes", n);
                 let _ = stream.write_all(b"Response\n").await;
                 println!("4. Backend: Sent response");
             }
-        }
         // Don't wait for close - just exit
     });
 
@@ -1361,12 +1360,11 @@ async fn test_backend_restart_recovery() -> Result<()> {
         if let Ok((mut stream, _)) = backend_listener.accept().await {
             println!("   Backend: Connection accepted");
             let mut buf = vec![0u8; 1024];
-            if let Ok(n) = stream.read(&mut buf).await {
-                if n > 0 {
+            if let Ok(n) = stream.read(&mut buf).await
+                && n > 0 {
                     let _ = stream.write_all(b"backend_ok\n").await;
                     return true;
                 }
-            }
         }
         false
     });

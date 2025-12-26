@@ -90,16 +90,14 @@ mod liveliness_tests {
                 let pub_key = pub_key.clone();
 
                 tokio::spawn(async move {
-                    if let Ok(mut stream) = TcpStream::connect(backend_addr).await {
-                        if stream.write_all(&payload).await.is_ok() {
+                    if let Ok(mut stream) = TcpStream::connect(backend_addr).await
+                        && stream.write_all(&payload).await.is_ok() {
                             let mut buffer = vec![0u8; 1024];
-                            if let Ok(n) = stream.read(&mut buffer).await {
-                                if n > 0 {
+                            if let Ok(n) = stream.read(&mut buffer).await
+                                && n > 0 {
                                     let _ = session_clone.put(&pub_key, &buffer[..n]).await;
                                 }
-                            }
                         }
-                    }
                 });
             }
         });
@@ -148,13 +146,12 @@ mod liveliness_tests {
         if let Ok(replies) = session.liveliness().get(&liveliness_key).await {
             sleep(Duration::from_millis(300)).await;
             while let Ok(Some(reply)) = replies.try_recv() {
-                if let Ok(sample) = reply.result() {
-                    if sample.kind() == SampleKind::Put {
+                if let Ok(sample) = reply.result()
+                    && sample.kind() == SampleKind::Put {
                         println!("Client bridge: Found backend on startup");
                         *backend_available.write().await = true;
                         break;
                     }
-                }
             }
         }
 
