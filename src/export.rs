@@ -155,6 +155,33 @@ async fn run_export_mode_internal(
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Query existing clients that connected before this export started
+    let existing_clients = session
+        .liveliness()
+        .get(&liveliness_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query existing clients: {}", e))?;
+
+    while let Ok(reply) = existing_clients.recv_async().await {
+        if let Ok(sample) = reply.into_result() {
+            let key = sample.key_expr().as_str();
+            if let Some(client_id) = key.rsplit('/').next() {
+                let client_id = client_id.to_string();
+                info!(client_id = %client_id, "Found existing client, connecting");
+                handle_client_connect(
+                    &session,
+                    &service_name,
+                    backend_addr,
+                    &client_id,
+                    &cancellation_senders,
+                    dns_suffix.as_deref(),
+                    buffer_size,
+                )
+                .await;
+            }
+        }
+    }
+
     // Main loop: monitor liveliness and create/destroy connections
     loop {
         match liveliness_subscriber.recv_async().await {
@@ -517,6 +544,31 @@ pub async fn run_ws_export_mode(session: Arc<Session>, export_spec: &str) -> Res
     // Track connection tasks and cancellation senders per client ID
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
         Arc::new(Mutex::new(HashMap::new()));
+
+    // Query existing clients that connected before this export started
+    let existing_clients = session
+        .liveliness()
+        .get(&liveliness_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query existing clients: {}", e))?;
+
+    while let Ok(reply) = existing_clients.recv_async().await {
+        if let Ok(sample) = reply.into_result() {
+            let key = sample.key_expr().as_str();
+            if let Some(client_id) = key.rsplit('/').next() {
+                let client_id = client_id.to_string();
+                info!(client_id = %client_id, "Found existing WebSocket client, connecting");
+                handle_ws_client_connect(
+                    &session,
+                    &service_name,
+                    &ws_url,
+                    &client_id,
+                    &cancellation_senders,
+                )
+                .await;
+            }
+        }
+    }
 
     // Main loop: monitor liveliness and create/destroy connections
     loop {
