@@ -228,13 +228,18 @@ pub fn normalize_dns(host: &str) -> String {
 
 /// Generate an HTTP 400 Bad Request response
 pub fn http_400_response() -> Vec<u8> {
-    b"HTTP/1.1 400 Bad Request\r\n\
-      Content-Type: text/plain\r\n\
-      Content-Length: 37\r\n\
-      Connection: close\r\n\
-      \r\n\
-      400 Bad Request: Missing Host header"
-        .to_vec()
+    let body = "400 Bad Request: Missing Host header";
+    format!(
+        "HTTP/1.1 400 Bad Request\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    )
+    .into_bytes()
 }
 
 /// Generate an HTTP 502 Bad Gateway response
@@ -482,6 +487,31 @@ mod tests {
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("400 Bad Request"));
         assert!(response_str.contains("Missing Host header"));
+
+        // Verify proper HTTP formatting: no leading spaces in headers
+        let parts: Vec<&str> = response_str.split("\r\n").collect();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 0 {
+                assert!(part.starts_with("HTTP/1.1"), "Status line should start with HTTP/1.1");
+            } else if !part.is_empty() {
+                assert!(
+                    !part.starts_with(' '),
+                    "HTTP header/body should not start with space: {:?}",
+                    part
+                );
+            }
+        }
+
+        // Verify Content-Length matches actual body
+        let header_end = response_str.find("\r\n\r\n").expect("should have header terminator");
+        let body = &response_str[header_end + 4..];
+        let expected_cl = format!("Content-Length: {}\r\n", body.len());
+        assert!(
+            response_str.contains(&expected_cl),
+            "Content-Length should match body size. Body len: {}, response: {:?}",
+            body.len(),
+            response_str
+        );
     }
 
     #[test]
@@ -490,5 +520,30 @@ mod tests {
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("502 Bad Gateway"));
         assert!(response_str.contains("example.com"));
+
+        // Verify proper HTTP formatting: no leading spaces in headers
+        let parts: Vec<&str> = response_str.split("\r\n").collect();
+        for (i, part) in parts.iter().enumerate() {
+            if i == 0 {
+                assert!(part.starts_with("HTTP/1.1"), "Status line should start with HTTP/1.1");
+            } else if !part.is_empty() {
+                assert!(
+                    !part.starts_with(' '),
+                    "HTTP header/body should not start with space: {:?}",
+                    part
+                );
+            }
+        }
+
+        // Verify Content-Length matches actual body
+        let header_end = response_str.find("\r\n\r\n").expect("should have header terminator");
+        let body = &response_str[header_end + 4..];
+        let expected_cl = format!("Content-Length: {}\r\n", body.len());
+        assert!(
+            response_str.contains(&expected_cl),
+            "Content-Length should match body size. Body len: {}, response: {:?}",
+            body.len(),
+            response_str
+        );
     }
 }
