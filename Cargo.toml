@@ -30,6 +30,12 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 backon = "1"
+tokio-rustls = { version = "0.26", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+tls-termination = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 tokio-stream = "0.1"
