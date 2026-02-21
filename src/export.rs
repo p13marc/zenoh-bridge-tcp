@@ -7,6 +7,7 @@
 
 use crate::http_parser::normalize_dns;
 use anyhow::Result;
+use backon::{ExponentialBuilder, Retryable};
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -248,10 +249,29 @@ async fn handle_client_connect(
     dns_suffix: Option<&str>,
     buffer_size: usize,
 ) {
-    info!(client_id = %client_id, "Client connected");
+    info!(client_id = %client_id, "Client connected, connecting to backend");
 
-    // Create new backend connection for this client
-    match TcpStream::connect(backend_addr).await {
+    // Retry backend connection with exponential backoff
+    let client_id_for_log = client_id.to_string();
+    let connect_result = (|| async { TcpStream::connect(backend_addr).await })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(100))
+                .with_max_delay(Duration::from_secs(5))
+                .with_max_times(5),
+        )
+        .notify(move |err, dur| {
+            warn!(
+                client_id = %client_id_for_log,
+                backend = %backend_addr,
+                error = %err,
+                retry_in = ?dur,
+                "Backend connection failed, retrying"
+            );
+        })
+        .await;
+
+    match connect_result {
         Ok(backend_stream) => {
             info!(client_id = %client_id, backend = %backend_addr, "Backend connection established");
 
@@ -303,7 +323,7 @@ async fn handle_client_connect(
         }
         Err(e) => {
             error!(
-                "Failed to connect to backend for client {}: {:?}",
+                "Failed to connect to backend after retries for client {}: {:?}",
                 client_id, e
             );
 
@@ -653,10 +673,34 @@ async fn handle_ws_client_connect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
 ) {
-    info!(client_id = %client_id, "WebSocket client connected");
+    info!(client_id = %client_id, "WebSocket client connected, connecting to backend");
 
-    // Create new WebSocket connection for this client
-    match connect_async(ws_url).await {
+    // Retry WebSocket backend connection with exponential backoff
+    let ws_url_owned = ws_url.to_string();
+    let client_id_for_log = client_id.to_string();
+    let ws_url_for_log = ws_url.to_string();
+    let connect_result = (|| {
+        let url = ws_url_owned.clone();
+        async move { connect_async(&url).await }
+    })
+        .retry(
+            ExponentialBuilder::default()
+                .with_min_delay(Duration::from_millis(100))
+                .with_max_delay(Duration::from_secs(5))
+                .with_max_times(5),
+        )
+        .notify(move |err, dur| {
+            warn!(
+                client_id = %client_id_for_log,
+                ws_url = %ws_url_for_log,
+                error = %err,
+                retry_in = ?dur,
+                "WebSocket backend connection failed, retrying"
+            );
+        })
+        .await;
+
+    match connect_result {
         Ok((ws_stream, _response)) => {
             info!(client_id = %client_id, ws_url = %ws_url, "WebSocket backend connection established");
 
@@ -704,7 +748,7 @@ async fn handle_ws_client_connect(
         }
         Err(e) => {
             error!(
-                "Failed to connect to WebSocket backend for client {}: {:?}",
+                "Failed to connect to WebSocket backend after retries for client {}: {:?}",
                 client_id, e
             );
 
