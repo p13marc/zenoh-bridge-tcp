@@ -68,7 +68,8 @@ async fn test_export_import_basic_communication() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Step 2: Start export bridge (using debug binary built by cargo test)
-    let export_spec = format!("testservice/{}", backend_addr);
+    let service = common::unique_service_name("testservice");
+    let export_spec = format!("{}/{}", service, backend_addr);
     println!("7. Starting export bridge: --export '{}'", export_spec);
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
@@ -85,7 +86,7 @@ async fn test_export_import_basic_communication() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener); // Release the port
 
-    let import_spec = format!("testservice/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     println!("9. Starting import bridge: --import '{}'", import_spec);
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
@@ -236,7 +237,8 @@ async fn test_multiple_clients_separate_connections() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start export bridge (using debug binary)
-    let export_spec = format!("multitest/{}", backend_addr);
+    let service = common::unique_service_name("multitest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     println!("6. Starting export bridge: --export '{}'", export_spec);
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
@@ -252,7 +254,7 @@ async fn test_multiple_clients_separate_connections() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("multitest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     println!("7. Starting import bridge: --import '{}'", import_spec);
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
@@ -402,7 +404,8 @@ async fn test_connection_close_propagation() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start bridges (assume bridge is already built)
-    let export_spec = format!("closetest/{}", backend_addr);
+    let service = common::unique_service_name("closetest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     println!("7. Starting export bridge...");
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
@@ -417,7 +420,7 @@ async fn test_connection_close_propagation() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("closetest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     println!("8. Starting import bridge...");
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
@@ -519,7 +522,8 @@ async fn test_connection_basic() -> Result<()> {
 
     // Start bridges (using debug binary)
     println!("5. Starting export bridge...");
-    let export_spec = format!("basictest/{}", backend_addr);
+    let service = common::unique_service_name("basictest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -532,7 +536,7 @@ async fn test_connection_basic() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("basictest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     println!("6. Starting import bridge...");
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
@@ -624,7 +628,8 @@ async fn test_bidirectional_data_flow() -> Result<()> {
 
     // Start bridges (using debug binary)
     println!("5. Starting export bridge...");
-    let export_spec = format!("echotest/{}", backend_addr);
+    let service = common::unique_service_name("echotest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -637,7 +642,7 @@ async fn test_bidirectional_data_flow() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("echotest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     println!("6. Starting import bridge...");
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
@@ -726,7 +731,8 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
 
     // Start export bridge (using debug binary)
     println!("2. Starting export bridge...");
-    let export_spec = format!("nobackend/{}", backend_addr);
+    let service = common::unique_service_name("nobackend");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -739,7 +745,7 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("nobackend/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     println!("3. Starting import bridge...");
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
@@ -855,7 +861,8 @@ async fn test_rapid_connect_disconnect() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start bridges
-    let export_spec = format!("rapidtest/{}", backend_addr);
+    let service = common::unique_service_name("rapidtest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -868,7 +875,7 @@ async fn test_rapid_connect_disconnect() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("rapidtest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
         .stdout(Stdio::piped())
@@ -1000,7 +1007,8 @@ async fn test_concurrent_connections() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start bridges
-    let export_spec = format!("concurrenttest/{}", backend_addr);
+    let service = common::unique_service_name("concurrenttest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -1013,7 +1021,7 @@ async fn test_concurrent_connections() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("concurrenttest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
         .stdout(Stdio::piped())
@@ -1122,7 +1130,8 @@ async fn test_large_message_transfer() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start bridges
-    let export_spec = format!("largetest/{}", backend_addr);
+    let service = common::unique_service_name("largetest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -1135,7 +1144,7 @@ async fn test_large_message_transfer() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("largetest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
         .stdout(Stdio::piped())
@@ -1257,7 +1266,8 @@ async fn test_rapid_data_send() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start bridges
-    let export_spec = format!("rapiddata/{}", backend_addr);
+    let service = common::unique_service_name("rapiddata");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -1270,7 +1280,7 @@ async fn test_rapid_data_send() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("rapiddata/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
         .stdout(Stdio::piped())
@@ -1339,7 +1349,8 @@ async fn test_backend_restart_recovery() -> Result<()> {
     println!("1. Using backend address {}", backend_addr);
 
     // Start bridges WITHOUT backend initially
-    let export_spec = format!("restarttest/{}", backend_addr);
+    let service = common::unique_service_name("restarttest");
+    let export_spec = format!("{}/{}", service, backend_addr);
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .stdout(Stdio::piped())
@@ -1352,7 +1363,7 @@ async fn test_backend_restart_recovery() -> Result<()> {
     let import_addr = import_listener.local_addr()?;
     drop(import_listener);
 
-    let import_spec = format!("restarttest/{}", import_addr);
+    let import_spec = format!("{}/{}", service, import_addr);
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
         .stdout(Stdio::piped())
