@@ -3,6 +3,8 @@
 //! These tests are designed to find race conditions, crashes, and reliability issues
 //! by hammering the bridge with many concurrent connections and edge cases.
 
+mod common;
+
 use anyhow::Result;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -18,7 +20,7 @@ async fn start_export_bridge(
     service_name: &str,
 ) -> Result<tokio::process::Child> {
     let export_spec = format!("{}/{}", service_name, backend_addr);
-    let child = Command::new("./target/debug/zenoh-bridge-tcp")
+    let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--export", &export_spec])
         .kill_on_drop(true)
         .spawn()?;
@@ -33,7 +35,7 @@ async fn start_import_bridge(
     service_name: &str,
 ) -> Result<tokio::process::Child> {
     let import_spec = format!("{}/{}", service_name, listen_addr);
-    let child = Command::new("./target/debug/zenoh-bridge-tcp")
+    let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--import", &import_spec])
         .kill_on_drop(true)
         .spawn()?;
@@ -452,10 +454,12 @@ async fn stress_test_slow_backend() -> Result<()> {
 async fn stress_test_backend_crash_recovery() -> Result<()> {
     println!("\n=== Stress Test: Backend Crash and Recovery ===\n");
 
-    let backend_addr = "127.0.0.1:19999";
+    // Allocate a port for the backend that will start later
+    let backend_port = common::PortGuard::new();
+    let backend_addr = backend_port.release();
 
     // Start bridges first (backend not running yet)
-    let _export_bridge = start_export_bridge(backend_addr, "crash_test").await?;
+    let _export_bridge = start_export_bridge(&backend_addr.to_string(), "crash_test").await?;
     println!("1. Export bridge started (backend not running)");
 
     let import_listener = TcpListener::bind("127.0.0.1:0").await?;

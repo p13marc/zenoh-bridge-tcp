@@ -6,6 +6,8 @@
 //! - Retry-based synchronization (no more sleep)
 //! - Backend server helpers
 
+#![allow(dead_code)]
+
 use std::net::{SocketAddr, TcpListener};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -133,8 +135,7 @@ pub struct BridgeProcess {
 
 impl BridgeProcess {
     pub async fn new(args: &[&str]) -> Self {
-        let bin_path = assert_cmd::cargo::cargo_bin("zenoh-bridge-tcp");
-        let child = tokio::process::Command::new(bin_path)
+        let child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
             .args(args)
             .kill_on_drop(true)
             .spawn()

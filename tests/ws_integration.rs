@@ -105,7 +105,7 @@ async fn test_ws_export_import_basic() -> Result<()> {
         ws_export_spec
     );
 
-    let mut export_bridge = Command::new("./target/debug/zenoh-bridge-tcp")
+    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--ws-export", &ws_export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -125,7 +125,7 @@ async fn test_ws_export_import_basic() -> Result<()> {
         ws_import_spec
     );
 
-    let mut import_bridge = Command::new("./target/debug/zenoh-bridge-tcp")
+    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--ws-import", &ws_import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -203,7 +203,7 @@ async fn test_ws_multiple_messages() -> Result<()> {
 
     // Start bridges
     let ws_export_spec = format!("wsmulti/{}", ws_server_url);
-    let mut export_bridge = Command::new("./target/debug/zenoh-bridge-tcp")
+    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--ws-export", &ws_export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -216,7 +216,7 @@ async fn test_ws_multiple_messages() -> Result<()> {
     drop(import_listener);
 
     let ws_import_spec = format!("wsmulti/{}", import_addr);
-    let mut import_bridge = Command::new("./target/debug/zenoh-bridge-tcp")
+    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--ws-import", &ws_import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -320,7 +320,7 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
 
     // Start bridges
     let ws_export_spec = format!("wslifecycle/{}", ws_server_url);
-    let mut export_bridge = Command::new("./target/debug/zenoh-bridge-tcp")
+    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--ws-export", &ws_export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -333,7 +333,7 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     drop(import_listener);
 
     let ws_import_spec = format!("wslifecycle/{}", import_addr);
-    let mut import_bridge = Command::new("./target/debug/zenoh-bridge-tcp")
+    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--ws-import", &ws_import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
