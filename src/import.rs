@@ -777,6 +777,37 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_import_spec_empty_service_name() {
+        let result = parse_import_spec("/127.0.0.1:8080");
+        assert!(result.is_ok());
+        let (service, _) = result.unwrap();
+        assert_eq!(service, "");
+    }
+
+    #[test]
+    fn test_parse_import_spec_empty_string() {
+        let result = parse_import_spec("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_import_spec_nested_service_name() {
+        let result = parse_import_spec("my/nested/service/127.0.0.1:8080");
+        assert!(
+            result.is_err(),
+            "Nested service names should be rejected by spec parser"
+        );
+    }
+
+    #[test]
+    fn test_parse_import_spec_ipv4_all_interfaces() {
+        let result = parse_import_spec("myservice/0.0.0.0:8080");
+        assert!(result.is_ok());
+        let (_, addr) = result.unwrap();
+        assert_eq!(addr.to_string(), "0.0.0.0:8080");
+    }
+
+    #[test]
     fn test_client_ids_are_unique() {
         let id1 = format!("client_{}", uuid::Uuid::new_v4().as_simple());
         let id2 = format!("client_{}", uuid::Uuid::new_v4().as_simple());

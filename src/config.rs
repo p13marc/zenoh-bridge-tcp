@@ -190,4 +190,22 @@ mod tests {
         // Other values should be defaults
         assert_eq!(config.max_header_size, 16 * 1024);
     }
+
+    #[test]
+    fn test_config_file_loading() {
+        let config_content = r#"{ "mode": "peer" }"#;
+        let config_path = std::env::temp_dir().join("test_zenoh_bridge_config.json5");
+        std::fs::write(&config_path, config_content).unwrap();
+
+        let config = create_zenoh_config_from_file(&config_path);
+        assert!(config.is_ok(), "Config file loading should succeed");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    #[test]
+    fn test_config_file_not_found() {
+        let config = create_zenoh_config_from_file("/nonexistent/path.json5");
+        assert!(config.is_err(), "Missing config file should fail");
+    }
 }
