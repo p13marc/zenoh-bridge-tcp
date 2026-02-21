@@ -62,6 +62,13 @@ pub struct Args {
     #[arg(long)]
     pub auto_import: Vec<String>,
 
+    /// Import HTTP service with per-request routing: 'service_name/listen_addr'
+    /// Example: --http-multiroute-import 'http-service/0.0.0.0:8080'
+    /// Each request's Host header is evaluated independently for routing,
+    /// allowing persistent HTTP/1.1 connections to reach multiple backends
+    #[arg(long)]
+    pub http_multiroute_import: Vec<String>,
+
     /// Import HTTPS service with TLS termination: 'service_name/listen_addr'
     /// Example: --https-terminate 'https-service/0.0.0.0:8443'
     /// Terminates TLS at the bridge; backends receive plaintext HTTP
@@ -122,7 +129,8 @@ impl Args {
             || !self.http_import.is_empty()
             || !self.ws_export.is_empty()
             || !self.ws_import.is_empty()
-            || !self.auto_import.is_empty();
+            || !self.auto_import.is_empty()
+            || !self.http_multiroute_import.is_empty();
 
         #[cfg(feature = "tls-termination")]
         let has_spec = has_spec || !self.https_terminate.is_empty();

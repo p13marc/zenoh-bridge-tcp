@@ -273,6 +273,17 @@ pub fn http_502_response(dns: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Generate an HTTP 504 Gateway Timeout response
+pub fn http_504_response() -> Vec<u8> {
+    let body = "504 Gateway Timeout";
+    format!(
+        "HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -602,5 +613,20 @@ mod tests {
             body.len(),
             response_str
         );
+    }
+
+    #[test]
+    fn test_http_504_response() {
+        let response = http_504_response();
+        let s = String::from_utf8_lossy(&response);
+        assert!(s.contains("504 Gateway Timeout"));
+
+        // Verify Content-Length matches actual body
+        let body_start = s.find("\r\n\r\n").unwrap() + 4;
+        let body = &s[body_start..];
+        let cl_start = s.find("Content-Length: ").unwrap() + 16;
+        let cl_end = s[cl_start..].find("\r\n").unwrap() + cl_start;
+        let content_length: usize = s[cl_start..cl_end].parse().unwrap();
+        assert_eq!(content_length, body.len());
     }
 }
