@@ -17,6 +17,8 @@ pub struct ParsedHttpRequest {
     pub dns: String,
     /// The complete buffered request that should be forwarded
     pub buffer: Vec<u8>,
+    /// Whether this is a WebSocket upgrade request
+    pub is_websocket_upgrade: bool,
 }
 
 /// Parse an HTTP request from a TCP stream and extract the Host header
@@ -107,16 +109,26 @@ fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
             // Successfully parsed headers
             let dns = extract_and_normalize_host(&req, buffer)?;
 
+            // Check for WebSocket upgrade
+            let is_websocket_upgrade = req.headers.iter().any(|h| {
+                h.name.eq_ignore_ascii_case("upgrade")
+                    && std::str::from_utf8(h.value)
+                        .map(|v| v.eq_ignore_ascii_case("websocket"))
+                        .unwrap_or(false)
+            });
+
             debug!(
-                "Parsed HTTP request: {} {} (Host: {})",
+                "Parsed HTTP request: {} {} (Host: {}, WS: {})",
                 req.method.unwrap_or("?"),
                 req.path.unwrap_or("?"),
-                dns
+                dns,
+                is_websocket_upgrade,
             );
 
             Ok(Some(ParsedHttpRequest {
                 dns,
                 buffer: buffer.to_vec(),
+                is_websocket_upgrade,
             }))
         }
         Ok(httparse::Status::Partial) => {
@@ -496,6 +508,34 @@ mod tests {
         let parsed = result.unwrap();
         // GET request buffer should end at headers since there's no body
         assert!(parsed.buffer.ends_with(b"\r\n\r\n"));
+    }
+
+    #[test]
+    fn test_websocket_upgrade_header_detection() {
+        let buffer = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let result = try_parse_request(buffer);
+        assert!(result.is_ok());
+        let parsed = result.unwrap().unwrap();
+        assert!(parsed.is_websocket_upgrade);
+        assert_eq!(parsed.dns, "example.com");
+    }
+
+    #[test]
+    fn test_non_websocket_request() {
+        let buffer = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = try_parse_request(buffer);
+        assert!(result.is_ok());
+        let parsed = result.unwrap().unwrap();
+        assert!(!parsed.is_websocket_upgrade);
+    }
+
+    #[test]
+    fn test_websocket_upgrade_case_insensitive() {
+        let buffer = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nupgrade: WebSocket\r\n\r\n";
+        let result = try_parse_request(buffer);
+        assert!(result.is_ok());
+        let parsed = result.unwrap().unwrap();
+        assert!(parsed.is_websocket_upgrade);
     }
 
     #[test]
