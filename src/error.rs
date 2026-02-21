@@ -2,6 +2,17 @@
 //!
 //! This module provides structured error types for all bridge operations,
 //! enabling better error handling and more informative error messages.
+//!
+//! ## Error Type Convention
+//!
+//! - **Public API** (`run_export_mode`, `run_import_mode`, spec parsers, config):
+//!   Returns `anyhow::Result<T>` for ergonomic error propagation and context.
+//!
+//! - **Internal parsing** (`http_parser`, `tls_parser`):
+//!   Uses `BridgeError` / `error::Result<T>` for structured, matchable errors.
+//!
+//! `BridgeError` implements `std::error::Error` via `thiserror`, so it converts
+//! into `anyhow::Error` automatically through the `?` operator at module boundaries.
 
 use std::net::SocketAddr;
 use thiserror::Error;
