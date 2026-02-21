@@ -232,6 +232,41 @@ async fn main() -> Result<()> {
         );
     }
 
+    // HTTPS termination import tasks (feature-gated)
+    #[cfg(feature = "tls-termination")]
+    let https_terminate_count = args.https_terminate.len();
+    #[cfg(not(feature = "tls-termination"))]
+    let https_terminate_count = 0;
+
+    #[cfg(feature = "tls-termination")]
+    if !args.https_terminate.is_empty() {
+        let tls_config = zenoh_bridge_tcp::tls_config::load_tls_config(
+            args.tls_cert.as_ref().unwrap(),
+            args.tls_key.as_ref().unwrap(),
+        )?;
+
+        for spec in &args.https_terminate {
+            let session = session.clone();
+            let spec_clone = spec.clone();
+            let tls_config = tls_config.clone();
+            let token = shutdown_token.child_token();
+            tasks.push(tokio::spawn(async move {
+                if let Err(e) = import::run_https_terminate_import_mode(
+                    session,
+                    &spec_clone,
+                    tls_config,
+                    buffer_size,
+                    token,
+                )
+                .await
+                {
+                    tracing::error!(mode = "https_terminate", spec = %spec_clone, error = %e, "Task failed");
+                }
+            }));
+            debug!(mode = "https_terminate", spec = %spec, "Spawned task");
+        }
+    }
+
     info!(
         exports = export_count,
         imports = import_count,
@@ -239,6 +274,7 @@ async fn main() -> Result<()> {
         http_imports = http_import_count,
         ws_exports = ws_export_count,
         ws_imports = ws_import_count,
+        https_terminates = https_terminate_count,
         "All bridge tasks started"
     );
 
