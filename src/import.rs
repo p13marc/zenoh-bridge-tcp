@@ -331,14 +331,14 @@ async fn handle_import_connection(
 
     // NOW declare liveliness token - export bridge will detect this and try to connect
     let liveliness_key = format!("{}{}/clients/{}", service_name, dns_suffix, client_id);
-    let _liveliness_token = session
+    let liveliness_token = session
         .liveliness()
         .declare_token(&liveliness_key)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
 
     info!(
-        "✓ Client {} declared liveliness: {}",
+        "Client {} declared liveliness: {}",
         client_id, liveliness_key
     );
 
@@ -420,6 +420,10 @@ async fn handle_import_connection(
         }
 
         debug!("Client {}: Zenoh to TCP task completed", client_id_clone);
+        // Explicitly undeclare subscriber before task exits
+        if let Err(e) = subscriber.undeclare().await {
+            debug!("Client {}: Error undeclaring subscriber: {:?}", client_id_clone, e);
+        }
     });
 
     // Task: TCP reader -> Zenoh AdvancedPublisher
@@ -448,6 +452,10 @@ async fn handle_import_connection(
                 }
             }
         }
+        // Explicitly undeclare publisher before task exits
+        if let Err(e) = publisher.undeclare().await {
+            debug!("Client {}: Error undeclaring publisher: {:?}", client_id_clone, e);
+        }
     });
 
     // Wait for either task to complete or error signal
@@ -472,7 +480,10 @@ async fn handle_import_connection(
         },
     }
 
-    // Liveliness token is automatically dropped here, signaling disconnection
+    // Explicitly undeclare liveliness token
+    if let Err(e) = liveliness_token.undeclare().await {
+        debug!("Client {}: Error undeclaring liveliness: {:?}", client_id, e);
+    }
 
     Ok(())
 }
@@ -611,14 +622,14 @@ async fn handle_ws_import_connection(
 
     // Declare liveliness token - export bridge will detect this and connect
     let liveliness_key = format!("{}/clients/{}", service_name, client_id);
-    let _liveliness_token = session
+    let liveliness_token = session
         .liveliness()
         .declare_token(&liveliness_key)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
 
     info!(
-        "✓ WebSocket client {} declared liveliness: {}",
+        "WebSocket client {} declared liveliness: {}",
         client_id, liveliness_key
     );
 
@@ -660,6 +671,10 @@ async fn handle_ws_import_connection(
             "WebSocket client {}: Zenoh to WebSocket task completed",
             client_id_clone
         );
+        // Explicitly undeclare subscriber before task exits
+        if let Err(e) = subscriber.undeclare().await {
+            debug!("WebSocket client {}: Error undeclaring subscriber: {:?}", client_id_clone, e);
+        }
     });
 
     // Task: WebSocket receiver -> Zenoh publisher
@@ -704,6 +719,10 @@ async fn handle_ws_import_connection(
                 }
             }
         }
+        // Explicitly undeclare publisher before task exits
+        if let Err(e) = publisher.undeclare().await {
+            debug!("WebSocket client {}: Error undeclaring publisher: {:?}", client_id_for_sender, e);
+        }
     });
 
     // Wait for either task to complete
@@ -718,7 +737,10 @@ async fn handle_ws_import_connection(
         },
     }
 
-    // Liveliness token is automatically dropped here, signaling disconnection
+    // Explicitly undeclare liveliness token
+    if let Err(e) = liveliness_token.undeclare().await {
+        debug!("WebSocket client {}: Error undeclaring liveliness: {:?}", client_id, e);
+    }
 
     Ok(())
 }

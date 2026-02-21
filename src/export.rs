@@ -432,6 +432,10 @@ async fn handle_client_bridge(
                 }
             }
         }
+        // Explicitly undeclare publisher before task exits
+        if let Err(e) = publisher.undeclare().await {
+            debug!("Error undeclaring publisher for {}: {:?}", client_id_for_reader, e);
+        }
     });
 
     // Task: receive from Zenoh and write to backend
@@ -461,6 +465,10 @@ async fn handle_client_bridge(
                     break;
                 }
             }
+        }
+        // Explicitly undeclare subscriber before task exits
+        if let Err(e) = subscriber.undeclare().await {
+            debug!("Error undeclaring subscriber for {}: {:?}", client_id_for_writer, e);
         }
     });
 
@@ -862,6 +870,10 @@ async fn handle_ws_client_bridge(
                 }
             }
         }
+        // Explicitly undeclare publisher before task exits
+        if let Err(e) = publisher.undeclare().await {
+            debug!("Error undeclaring WS publisher for {}: {:?}", client_id_for_receiver, e);
+        }
     });
 
     // Task: receive from Zenoh and write to WebSocket
@@ -894,6 +906,10 @@ async fn handle_ws_client_bridge(
                     break;
                 }
             }
+        }
+        // Explicitly undeclare subscriber before task exits
+        if let Err(e) = subscriber.undeclare().await {
+            debug!("Error undeclaring WS subscriber for {}: {:?}", client_id_for_sender, e);
         }
     });
 
