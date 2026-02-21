@@ -9,6 +9,7 @@ pub mod error;
 pub mod export;
 pub mod http_parser;
 pub mod import;
+pub mod protocol_detect;
 pub mod tls_parser;
 #[cfg(feature = "tls-termination")]
 pub mod tls_config;
