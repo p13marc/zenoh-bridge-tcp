@@ -216,14 +216,16 @@ fn extract_host_from_absolute_uri(path: &str) -> Option<&str> {
 pub fn normalize_dns(host: &str) -> String {
     let host = host.to_lowercase();
 
-    // Strip default ports
-    if host.ends_with(":80") {
-        host[..host.len() - 3].to_string()
-    } else if host.ends_with(":443") {
-        host[..host.len() - 4].to_string()
-    } else {
-        host
+    // Strip default ports using proper port parsing
+    if let Some(colon_pos) = host.rfind(':') {
+        let port_str = &host[colon_pos + 1..];
+        if let Ok(port) = port_str.parse::<u16>() {
+            if port == 80 || port == 443 {
+                return host[..colon_pos].to_string();
+            }
+        }
     }
+    host
 }
 
 /// Generate an HTTP 400 Bad Request response
@@ -295,6 +297,21 @@ mod tests {
             normalize_dns("Dev.Example.COM:8080"),
             "dev.example.com:8080"
         );
+    }
+
+    #[test]
+    fn test_normalize_dns_numeric_port_parsing() {
+        // Ensure only actual port 80/443 are stripped
+        assert_eq!(normalize_dns("host:80"), "host");
+        assert_eq!(normalize_dns("host:443"), "host");
+        assert_eq!(normalize_dns("host:8080"), "host:8080");
+        assert_eq!(normalize_dns("host:180"), "host:180");
+        assert_eq!(normalize_dns("host:4430"), "host:4430");
+        // No port at all
+        assert_eq!(normalize_dns("example.com"), "example.com");
+        // IPv6 with port (bracket notation)
+        assert_eq!(normalize_dns("[::1]:80"), "[::1]");
+        assert_eq!(normalize_dns("[::1]:8080"), "[::1]:8080");
     }
 
     #[test]
