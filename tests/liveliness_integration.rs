@@ -566,38 +566,4 @@ mod liveliness_tests {
         println!("\n✅ SUCCESS: Backend came back, new connections work!");
     }
 
-    /// TEST 5: Documentation test explaining liveliness feature
-    #[test]
-    fn test_liveliness_documentation() {
-        println!("\n╔════════════════════════════════════════════════════════╗");
-        println!("║  Liveliness Feature - What We're Testing              ║");
-        println!("╚════════════════════════════════════════════════════════╝\n");
-
-        println!("🎯 PURPOSE:");
-        println!("   Handle cases where backend server is unavailable\n");
-
-        println!("🏗️  ARCHITECTURE:");
-        println!("   Client -> Bridge A (monitors) -> Zenoh -> Bridge B (declares) -> Backend");
-        println!("                      |                            |");
-        println!("                      |<---- liveliness token -----|");
-        println!("                      (checks: is backend alive?)\n");
-
-        println!("✅ WHAT WE TEST:");
-        println!("   • Backend available → accept connections");
-        println!("   • Backend unavailable → reject connections");
-        println!("   • Backend goes down → close active connections");
-        println!("   • Backend comes back → accept new connections\n");
-
-        println!("🔧 HOW IT WORKS:");
-        println!("   1. Server bridge declares liveliness token");
-        println!("   2. Client bridge subscribes to liveliness");
-        println!("   3. Client bridge checks backend status before accepting");
-        println!("   4. Active connections monitor backend availability\n");
-
-        println!("💡 WHY IT MATTERS:");
-        println!("   • Production-ready: Don't accept connections to dead backends");
-        println!("   • Fail fast: Reject immediately rather than timeout");
-        println!("   • Resource management: Close connections when backend dies");
-        println!("   • Automatic recovery: Resume when backend returns\n");
-    }
 }

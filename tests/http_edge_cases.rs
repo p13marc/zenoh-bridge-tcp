@@ -223,12 +223,16 @@ async fn test_malformed_http_requests() {
         .await
         .unwrap();
 
-    // Don't send final \r\n - should timeout
+    // Don't send final \r\n - should timeout or close connection
     let mut response = Vec::new();
-    let _result =
+    let result =
         tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await;
 
-    // Should timeout waiting for complete request
+    // Either timeout or connection close/error is acceptable
+    assert!(
+        result.is_err() || matches!(result, Ok(Ok(0)) | Ok(Err(_))),
+        "Incomplete HTTP request should timeout or close connection"
+    );
     println!("   ✓ Incomplete request handled");
 
     println!("\n✅ Malformed request test passed!");

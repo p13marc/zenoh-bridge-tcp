@@ -550,42 +550,4 @@ mod http_tests {
         println!("\n✅ SUCCESS: Multiple HTTP requests work through bridge!");
     }
 
-    /// TEST 4: Documentation test
-    #[test]
-    fn test_http_https_documentation() {
-        println!("\n╔════════════════════════════════════════════════════════╗");
-        println!("║  HTTP/HTTPS Bridge Testing - What We're Testing       ║");
-        println!("╚════════════════════════════════════════════════════════╝\n");
-
-        println!("🎯 PURPOSE:");
-        println!("   Test that the bridge works with real HTTP/HTTPS servers\n");
-
-        println!("🏗️  ARCHITECTURE:");
-        println!("   HTTP Client -> Bridge A -> Zenoh -> Bridge B -> Axum HTTP Server");
-        println!("   HTTPS Client -> Bridge A -> Zenoh -> Bridge B -> Axum HTTPS Server\n");
-
-        println!("✅ WHAT WE TEST:");
-        println!("   • Bridge forwards HTTP traffic correctly");
-        println!("   • Bridge forwards HTTPS traffic (TLS passthrough)");
-        println!("   • Multiple HTTP requests work concurrently");
-        println!("   • Real web framework (Axum) works through bridge");
-        println!("   • JSON APIs work through bridge\n");
-
-        println!("❌ WHAT WE DON'T TEST:");
-        println!("   • HTTP protocol correctness (that's Axum/hyper's job)");
-        println!("   • TLS implementation (that's rustls's job)");
-        println!("   • We're testing the BRIDGE, not the web framework!\n");
-
-        println!("💡 WHY THIS MATTERS:");
-        println!("   • Proves bridge works with real-world HTTP servers");
-        println!("   • Demonstrates TLS passthrough (end-to-end encryption)");
-        println!("   • Shows bridge is truly protocol-agnostic");
-        println!("   • Validates production use case (web APIs through bridge)\n");
-
-        println!("🔐 TLS PASSTHROUGH:");
-        println!("   • Client establishes TLS with backend server");
-        println!("   • Bridge forwards encrypted bytes without decrypting");
-        println!("   • Zero-trust architecture (bridge cannot decrypt)");
-        println!("   • End-to-end encryption maintained\n");
-    }
 }

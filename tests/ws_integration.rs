@@ -368,6 +368,11 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     // Check disconnect was detected
     let disconnects = *disconnection_count.lock().await;
     println!("5. Disconnections recorded: {}", disconnects);
+    assert!(
+        disconnects >= 1,
+        "Expected at least 1 disconnect, got {}",
+        disconnects
+    );
 
     // Cleanup
     let _ = export_bridge.kill().await;
