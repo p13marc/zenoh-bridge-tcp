@@ -100,6 +100,10 @@ pub struct Args {
     #[arg(long, default_value = "10")]
     pub read_timeout: u64,
 
+    /// Timeout in seconds for draining buffered data when a connection closes
+    #[arg(long, default_value = "5")]
+    pub drain_timeout: u64,
+
     /// Log level: trace, debug, info, warn, error
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -143,6 +147,6 @@ impl Args {
 
     /// Build a BridgeConfig from command-line arguments
     pub fn bridge_config(&self) -> BridgeConfig {
-        BridgeConfig::new(self.buffer_size, self.read_timeout)
+        BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout)
     }
 }

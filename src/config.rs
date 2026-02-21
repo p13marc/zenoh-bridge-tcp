@@ -25,6 +25,9 @@ pub struct BridgeConfig {
 
     /// Timeout for checking backend availability (default: 1 second).
     pub availability_timeout: Duration,
+
+    /// Timeout for draining buffered data during connection close (default: 5 seconds).
+    pub drain_timeout: Duration,
 }
 
 impl Default for BridgeConfig {
@@ -35,6 +38,7 @@ impl Default for BridgeConfig {
             read_timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_millis(500),
             availability_timeout: Duration::from_millis(1000),
+            drain_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -44,10 +48,12 @@ impl BridgeConfig {
     pub fn new(
         buffer_size: usize,
         read_timeout_secs: u64,
+        drain_timeout_secs: u64,
     ) -> Self {
         Self {
             buffer_size,
             read_timeout: Duration::from_secs(read_timeout_secs),
+            drain_timeout: Duration::from_secs(drain_timeout_secs),
             ..Default::default()
         }
     }
@@ -180,13 +186,15 @@ mod tests {
         assert_eq!(config.read_timeout, Duration::from_secs(10));
         assert_eq!(config.heartbeat_interval, Duration::from_millis(500));
         assert_eq!(config.availability_timeout, Duration::from_millis(1000));
+        assert_eq!(config.drain_timeout, Duration::from_secs(5));
     }
 
     #[test]
     fn test_bridge_config_new() {
-        let config = BridgeConfig::new(32768, 30);
+        let config = BridgeConfig::new(32768, 30, 10);
         assert_eq!(config.buffer_size, 32768);
         assert_eq!(config.read_timeout, Duration::from_secs(30));
+        assert_eq!(config.drain_timeout, Duration::from_secs(10));
         // Other values should be defaults
         assert_eq!(config.max_header_size, 16 * 1024);
     }
