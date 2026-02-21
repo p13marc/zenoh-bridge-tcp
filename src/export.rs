@@ -363,7 +363,7 @@ async fn handle_client_bridge(
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
 
     info!(
-        "✓ Client {} subscribed to {} with late publisher detection",
+        "Client {} subscribed to {} with late publisher detection",
         client_id, sub_key
     );
 
@@ -509,7 +509,7 @@ async fn handle_client_disconnect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
 ) {
-    info!("✗ Client disconnected: {}", client_id);
+    info!("Client disconnected: {}", client_id);
 
     // Send cancellation signal and wait for task to complete
     if let Some((cancel_tx, task_handle)) = cancellation_senders.lock().await.remove(client_id) {
@@ -795,7 +795,7 @@ async fn handle_ws_client_bridge(
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
 
     info!(
-        "✓ WebSocket client {} subscribed to {} with late publisher detection",
+        "WebSocket client {} subscribed to {} with late publisher detection",
         client_id, sub_key
     );
 
