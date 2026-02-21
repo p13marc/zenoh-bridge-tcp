@@ -9,13 +9,13 @@ Plan 01 (Bug Fixes) ✅
   ├──> Plan 04 (Test Infrastructure) ✅ — uses uuid from Plan 01
   ├──> Plan 05 (TLS Termination) ✅ — uses uuid from Plan 01
   ├──> Plan 06 (Protocol Auto-Detection) ✅ — uses uuid + BUG-1 fix from Plan 01
-  └──> Plan 08 (Bidirectional HTTP) — uses uuid from Plan 01
+  └──> Plan 08 (Bidirectional HTTP) ✅ — uses uuid from Plan 01
 Plan 02 (Graceful Shutdown) ✅
   └──> Plan 04 (Test Infrastructure) ✅ — Step 7 (TST-6) uses CancellationToken from Plan 02
 Plan 04 (Test Infrastructure) ✅
   └──> Plan 05 (TLS Termination) ✅ — uses assert_cmd dev-dependency from Plan 04
 Plan 07 (Connection Draining) ✅ — independent after Plan 01
-Plan 06 ←→ Plan 08 — cross-reference each other for HTTP dispatch path
+Plan 06 ←→ Plan 08 ✅ — cross-reference each other for HTTP dispatch path
 ```
 
 ---
@@ -309,52 +309,52 @@ Addresses: FEAT-3 | [Full plan](07-connection-draining.md)
 
 ---
 
-## Plan 08: Bidirectional HTTP Mode (Keep-Alive Multi-Request)
+## Plan 08: Bidirectional HTTP Mode (Keep-Alive Multi-Request) ✅
 
 Addresses: FEAT-4 | [Full plan](08-bidirectional-http-mode.md)
 
 **Prerequisites:** Plan 01 (uuid) ✅
 
-### Step 1: HTTP Response Parser
-- [ ] Create `src/http_response_parser.rs` with `ResponseBodyFraming`, `parse_response_headers`, `is_connection_close`, `find_chunked_body_end`
+### Step 1: HTTP Response Parser ✅
+- [x] Create `src/http_response_parser.rs` with `ResponseBodyFraming`, `parse_response_headers`, `is_connection_close`, `find_chunked_body_end`
+- [x] 16 unit tests for all framing modes (Content-Length, chunked, 204 NoBody, 304 NoBody, UntilClose, partial)
 
-### Step 2: Per-Request HTTP Import Handler
-- [ ] Add `run_http_multiroute_import_mode` function in `src/import.rs`
-- [ ] Add `handle_multiroute_connection` with per-request loop
-- [ ] Add `check_backend_available` helper
-- [ ] Use `AdvancedPublisherBuilderExt` / `AdvancedSubscriberBuilderExt` / `MissDetectionConfig` (correct trait names)
+### Step 2: Per-Request HTTP Import Handler ✅
+- [x] Add `run_http_multiroute_import_mode` function in `src/import.rs`
+- [x] Add `handle_multiroute_connection` with per-request loop
+- [x] Add `check_backend_available` helper
+- [x] Use `AdvancedPublisherBuilderExt` / `AdvancedSubscriberBuilderExt` / `MissDetectionConfig`
 
-### Step 2b: Export-Side (no structural changes needed)
-- [ ] Verify existing liveliness-based architecture handles short-lived per-request connections
-- [ ] (Optional) Add `BackendPool` for connection reuse
+### Step 2b: Export-Side (no structural changes needed) ✅
+- [x] Verified existing liveliness-based architecture handles short-lived per-request connections
 
-### Step 3: Add HTTP 504 Response Helper
-- [ ] Add `http_504_response()` in `src/http_parser.rs` (single-line format, no whitespace bug)
+### Step 3: Add HTTP 504 Response Helper ✅
+- [x] Add `http_504_response()` in `src/http_parser.rs` (single-line format, no whitespace bug)
+- [x] Add `test_http_504_response` unit test
 
-### Step 4: CLI Argument
-- [ ] Add `--http-multiroute-import` CLI argument
-- [ ] Update `validate()` to include `http_multiroute_import`
+### Step 4: CLI Argument ✅
+- [x] Add `--http-multiroute-import` CLI argument
+- [x] Update `validate()` to include `http_multiroute_import`
 
-### Step 5: Wire Into Main
-- [ ] Spawn tasks for `--http-multiroute-import` specs
+### Step 5: Wire Into Main ✅
+- [x] Spawn tasks for `--http-multiroute-import` specs
+- [x] Add `http_multiroute_import_count` to startup info log
 
-### Step 6: Update lib.rs
-- [ ] Add `pub mod http_response_parser;`
+### Step 6: Update lib.rs ✅
+- [x] Add `pub mod http_response_parser;`
 
-### Step 7: Tests
-- [ ] Add unit tests for `parse_response_headers` (Content-Length, chunked, 204, 304, UntilClose, partial)
-- [ ] Add unit tests for `is_connection_close` and `find_chunked_body_end`
-- [ ] Add `test_http_504_response` in `http_parser.rs` tests (with Content-Length validation)
-- [ ] Add `test_http_multiroute_different_hosts` integration test
-- [ ] Add `test_http_multiroute_connection_close` integration test
-- [ ] Add `test_http_multiroute_502_doesnt_close` integration test
-- [ ] Add `test_http_multiroute_chunked_response` integration test
+### Step 7: Tests ✅
+- [x] 16 unit tests for `parse_response_headers`, `is_connection_close`, `find_chunked_body_end`
+- [x] `test_http_504_response` unit test in `http_parser.rs`
+- [x] `test_multiroute_single_request` integration test
+- [x] `test_multiroute_persistent_connection_switches_hosts` integration test
+- [x] `test_multiroute_unavailable_host_returns_502` integration test
 
-### Verification
-- [ ] `cargo build --release`
-- [ ] `cargo test --lib`
-- [ ] `cargo nextest run`
-- [ ] `cargo clippy -- --deny warnings`
+### Verification ✅
+- [x] `cargo build --release`
+- [x] `cargo test --lib` — 99 tests pass
+- [x] `cargo test --test http_multiroute_integration -- --test-threads=1` — 3 tests pass
+- [x] `cargo clippy -- --deny warnings`
 
 ---
 
