@@ -8,7 +8,7 @@ Plan 01 (Bug Fixes) ✅
   ├──> Plan 02 (Graceful Shutdown) ✅ — uses Plan 01's buffer_size signature changes
   ├──> Plan 04 (Test Infrastructure) ✅ — uses uuid from Plan 01
   ├──> Plan 05 (TLS Termination) ✅ — uses uuid from Plan 01
-  ├──> Plan 06 (Protocol Auto-Detection) — uses uuid + BUG-1 fix from Plan 01
+  ├──> Plan 06 (Protocol Auto-Detection) ✅ — uses uuid + BUG-1 fix from Plan 01
   └──> Plan 08 (Bidirectional HTTP) — uses uuid from Plan 01
 Plan 02 (Graceful Shutdown) ✅
   └──> Plan 04 (Test Infrastructure) ✅ — Step 7 (TST-6) uses CancellationToken from Plan 02
@@ -219,48 +219,49 @@ Addresses: FEAT-1 | [Full plan](05-tls-termination.md)
 
 ---
 
-## Plan 06: Protocol Auto-Detection on Import Side
+## Plan 06: Protocol Auto-Detection on Import Side ✅
 
 Addresses: FEAT-2 | [Full plan](06-protocol-auto-detection.md)
 
 **Prerequisites:** Plan 01 (uuid + BUG-1 fix) ✅
 
-### Step 1: Protocol Detection Module
-- [ ] Create `src/protocol_detect.rs` with `DetectedProtocol` enum and `detect_protocol` function
-- [ ] Reuse `tls_parser::is_tls_handshake()` for TLS detection (6-byte check)
+### Step 1: Protocol Detection Module ✅
+- [x] Create `src/protocol_detect.rs` with `DetectedProtocol` enum and `detect_protocol` function
+- [x] Reuse `tls_parser::is_tls_handshake()` for TLS detection (6-byte check)
 
-### Step 2: WebSocket Detection During HTTP Parsing
-- [ ] Add `is_websocket_upgrade: bool` field to `ParsedHttpRequest` (breaking change)
-- [ ] Detect `Upgrade: websocket` header in `try_parse_request`
-- [ ] Update all `ParsedHttpRequest` construction sites
+### Step 2: WebSocket Detection During HTTP Parsing ✅
+- [x] Add `is_websocket_upgrade: bool` field to `ParsedHttpRequest` (breaking change)
+- [x] Detect `Upgrade: websocket` header in `try_parse_request`
+- [x] Update all `ParsedHttpRequest` construction sites
 
-### Step 3: Auto-Import Mode
-- [ ] Add `run_auto_import_mode` function in `src/import.rs`
-- [ ] Add `handle_auto_import_connection` (peek → detect → dispatch)
-- [ ] Add `handle_auto_http_connection` (HTTP vs WebSocket upgrade)
+### Step 3: Auto-Import Mode ✅
+- [x] Add `run_auto_import_mode` function in `src/import.rs`
+- [x] Add `handle_auto_import_connection` (peek → detect → dispatch)
+- [x] Add `handle_auto_http_connection` (HTTP vs WebSocket upgrade)
 
-### Step 4: CLI Argument
-- [ ] Add `--auto-import` CLI argument
-- [ ] Update `validate()` to include `auto_import`
+### Step 4: CLI Argument ✅
+- [x] Add `--auto-import` CLI argument
+- [x] Update `validate()` to include `auto_import`
 
-### Step 5: Wire Into Main
-- [ ] Spawn tasks for `--auto-import` specs
+### Step 5: Wire Into Main ✅
+- [x] Spawn tasks for `--auto-import` specs
 
-### Step 6: Update lib.rs
-- [ ] Add `pub mod protocol_detect;`
+### Step 6: Update lib.rs ✅
+- [x] Add `pub mod protocol_detect;`
 
-### Step 7: Tests
-- [ ] Add unit tests: `test_detect_tls`, `test_detect_http_methods`, `test_detect_raw_tcp`
-- [ ] Add unit tests: `test_detect_empty_buffer`, `test_detect_short_buffer`, `test_detect_almost_http`
-- [ ] Add `test_websocket_upgrade_header_detection` in `http_parser.rs` tests
-- [ ] Add `test_non_websocket_request` in `http_parser.rs` tests
-- [ ] Add integration tests: `test_auto_import_detects_http`, `test_auto_import_detects_raw_tcp`, `test_auto_import_detects_websocket`
+### Step 7: Tests ✅
+- [x] Add unit tests: `test_detect_tls`, `test_detect_http_methods`, `test_detect_raw_tcp`
+- [x] Add unit tests: `test_detect_empty_buffer`, `test_detect_short_buffer`, `test_detect_almost_http`
+- [x] Add `test_websocket_upgrade_header_detection` in `http_parser.rs` tests
+- [x] Add `test_non_websocket_request` in `http_parser.rs` tests
+- [x] Add `test_websocket_upgrade_case_insensitive` in `http_parser.rs` tests
+- [x] Add integration tests: `test_auto_import_raw_tcp`, `test_auto_import_http_detection`, `test_auto_import_cli_starts`
 
-### Verification
-- [ ] `cargo build --release`
-- [ ] `cargo test --lib`
-- [ ] `cargo nextest run`
-- [ ] `cargo clippy -- --deny warnings`
+### Verification ✅
+- [x] `cargo build` — clean
+- [x] `cargo test --lib` — 82 tests pass
+- [x] `cargo test --test auto_import_integration -- --test-threads=1` — 3 tests pass
+- [x] `cargo clippy --tests` — zero warnings
 
 ---
 
