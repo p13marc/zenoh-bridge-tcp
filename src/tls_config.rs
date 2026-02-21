@@ -21,6 +21,8 @@ pub fn load_tls_config<P1: AsRef<Path>, P2: AsRef<Path>>(
     cert_path: P1,
     key_path: P2,
 ) -> Result<Arc<ServerConfig>> {
+    // Ensure the ring crypto provider is installed (idempotent if already set)
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cert_file = File::open(cert_path.as_ref()).map_err(|e| {
         anyhow::anyhow!(
             "Failed to open certificate file '{}': {}",
