@@ -613,6 +613,13 @@ async fn handle_ws_client_connect(
                 "Failed to connect to WebSocket backend for client {}: {:?}",
                 client_id, e
             );
+
+            // Publish error signal to notify import bridge
+            let error_key = format!("{}/error/{}", service_name, client_id);
+            if let Err(pub_err) = session.put(&error_key, "backend_unavailable").await {
+                error!("Failed to publish error signal: {:?}", pub_err);
+            }
+            info!("Sent backend unavailable signal for client: {}", client_id);
         }
     }
 }
