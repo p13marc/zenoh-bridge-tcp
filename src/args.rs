@@ -54,6 +54,24 @@ pub struct Args {
     #[arg(long)]
     pub ws_import: Vec<String>,
 
+    /// Import HTTPS service with TLS termination: 'service_name/listen_addr'
+    /// Example: --https-terminate 'https-service/0.0.0.0:8443'
+    /// Terminates TLS at the bridge; backends receive plaintext HTTP
+    /// Requires --tls-cert and --tls-key
+    #[arg(long)]
+    #[cfg(feature = "tls-termination")]
+    pub https_terminate: Vec<String>,
+
+    /// Path to PEM-encoded TLS certificate chain (required for --https-terminate)
+    #[arg(long)]
+    #[cfg(feature = "tls-termination")]
+    pub tls_cert: Option<String>,
+
+    /// Path to PEM-encoded TLS private key (required for --https-terminate)
+    #[arg(long)]
+    #[cfg(feature = "tls-termination")]
+    pub tls_key: Option<String>,
+
     /// Zenoh configuration mode
     #[arg(short = 'm', long, default_value = "peer")]
     pub mode: String,
@@ -86,17 +104,31 @@ pub struct Args {
 impl Args {
     /// Validate that at least one export or import is specified
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.export.is_empty()
-            && self.import.is_empty()
-            && self.http_export.is_empty()
-            && self.http_import.is_empty()
-            && self.ws_export.is_empty()
-            && self.ws_import.is_empty()
-        {
+        let has_spec = !self.export.is_empty()
+            || !self.import.is_empty()
+            || !self.http_export.is_empty()
+            || !self.http_import.is_empty()
+            || !self.ws_export.is_empty()
+            || !self.ws_import.is_empty();
+
+        #[cfg(feature = "tls-termination")]
+        let has_spec = has_spec || !self.https_terminate.is_empty();
+
+        if !has_spec {
             return Err(anyhow::anyhow!(
                 "Must specify at least one --export, --import, --http-export, --http-import, --ws-export, or --ws-import. Use --help for usage."
             ));
         }
+
+        #[cfg(feature = "tls-termination")]
+        if !self.https_terminate.is_empty()
+            && (self.tls_cert.is_none() || self.tls_key.is_none())
+        {
+            return Err(anyhow::anyhow!(
+                "--https-terminate requires both --tls-cert and --tls-key"
+            ));
+        }
+
         Ok(())
     }
 
