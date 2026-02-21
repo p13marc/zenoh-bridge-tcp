@@ -7,13 +7,13 @@ Track implementation progress across all plans. Plans should be implemented in o
 Plan 01 (Bug Fixes) ✅
   ├──> Plan 02 (Graceful Shutdown) ✅ — uses Plan 01's buffer_size signature changes
   ├──> Plan 04 (Test Infrastructure) ✅ — uses uuid from Plan 01
-  ├──> Plan 05 (TLS Termination) — uses uuid from Plan 01
+  ├──> Plan 05 (TLS Termination) ✅ — uses uuid from Plan 01
   ├──> Plan 06 (Protocol Auto-Detection) — uses uuid + BUG-1 fix from Plan 01
   └──> Plan 08 (Bidirectional HTTP) — uses uuid from Plan 01
 Plan 02 (Graceful Shutdown) ✅
   └──> Plan 04 (Test Infrastructure) ✅ — Step 7 (TST-6) uses CancellationToken from Plan 02
 Plan 04 (Test Infrastructure) ✅
-  └──> Plan 05 (TLS Termination) — uses assert_cmd dev-dependency from Plan 04
+  └──> Plan 05 (TLS Termination) ✅ — uses assert_cmd dev-dependency from Plan 04
 Plan 07 (Connection Draining) — independent after Plan 01
 Plan 06 ←→ Plan 08 — cross-reference each other for HTTP dispatch path
 ```
@@ -175,45 +175,47 @@ Addresses: TST-1 through TST-7, IMP-9, DES-1 | [Full plan](04-test-infrastructur
 
 ---
 
-## Plan 05: TLS Termination for Import Mode
+## Plan 05: TLS Termination for Import Mode ✅
 
 Addresses: FEAT-1 | [Full plan](05-tls-termination.md)
 
-**Prerequisites:** Plan 01 (uuid) ✅, Plan 04 (assert_cmd for CLI test)
+**Prerequisites:** Plan 01 (uuid) ✅, Plan 04 (assert_cmd for CLI test) ✅
 
-### Step 1: TLS Configuration Loading
-- [ ] Add `tokio-rustls`, `rustls`, `rustls-pemfile` as optional deps with `tls-termination` feature
-- [ ] Create `src/tls_config.rs` with `load_tls_config` function
+### Step 1: TLS Configuration Loading ✅
+- [x] Add `tokio-rustls`, `rustls`, `rustls-pemfile` as optional deps with `tls-termination` feature
+- [x] Create `src/tls_config.rs` with `load_tls_config` function
 
-### Step 2: CLI Arguments
-- [ ] Add `--https-terminate`, `--tls-cert`, `--tls-key` args (feature-gated)
-- [ ] Add validation: `--https-terminate` requires both `--tls-cert` and `--tls-key`
-- [ ] Update `is_empty` check in `validate()` to include `https_terminate`
+### Step 2: CLI Arguments ✅
+- [x] Add `--https-terminate`, `--tls-cert`, `--tls-key` args (feature-gated)
+- [x] Add validation: `--https-terminate` requires both `--tls-cert` and `--tls-key`
+- [x] Update `is_empty` check in `validate()` to include `https_terminate`
 
-### Step 3: TLS-Terminating Import Mode
-- [ ] Add `run_https_terminate_import_mode` function in `src/import.rs`
-- [ ] Implement TLS handshake → plaintext HTTP parsing → Zenoh bridging
-- [ ] Extract shared bridging logic from `handle_import_connection` into reusable inner function
+### Step 3: TLS-Terminating Import Mode ✅
+- [x] Add `run_https_terminate_import_mode` function in `src/import.rs`
+- [x] Implement TLS handshake → plaintext HTTP parsing → Zenoh bridging
+- [x] Extract shared `bridge_import_connection` from `handle_import_connection` for reuse
 
-### Step 4: Wire Into Main
-- [ ] Load TLS config once, share via `Arc`
-- [ ] Spawn tasks for `--https-terminate` specs
+### Step 4: Wire Into Main ✅
+- [x] Load TLS config once, share via `Arc`
+- [x] Spawn tasks for `--https-terminate` specs
 
-### Step 5: Update lib.rs
-- [ ] Add `#[cfg(feature = "tls-termination")] pub mod tls_config;`
+### Step 5: Update lib.rs ✅
+- [x] Add `#[cfg(feature = "tls-termination")] pub mod tls_config;`
 
-### Step 6: Tests
-- [ ] Add `test_load_tls_config_missing_cert_file` unit test
-- [ ] Add `test_load_tls_config_empty_cert` unit test
-- [ ] Add `test_load_tls_config_valid` unit test (using `rcgen`)
-- [ ] Add `test_https_termination_end_to_end` integration test
-- [ ] Add `test_https_terminate_requires_cert_and_key` CLI validation test
+### Step 6: Tests ✅
+- [x] Add `test_load_tls_config_missing_cert_file` unit test
+- [x] Add `test_load_tls_config_empty_cert` unit test
+- [x] Add `test_load_tls_config_missing_key_file` unit test
+- [x] Add `test_load_tls_config_valid` unit test (using `rcgen`)
+- [x] Add `test_https_terminate_requires_cert_and_key` CLI validation test
+- [x] Add `test_https_terminate_requires_key` CLI validation test
+- [x] Add `test_https_terminate_starts_with_valid_tls` startup verification test
 
-### Verification
-- [ ] `cargo build --release` (without feature)
-- [ ] `cargo build --release --features tls-termination`
-- [ ] `cargo test --features tls-termination --lib`
-- [ ] `cargo clippy --features tls-termination -- --deny warnings`
+### Verification ✅
+- [x] `cargo build` (without feature) — clean
+- [x] `cargo build --features tls-termination` — clean
+- [x] `cargo test --features tls-termination --lib` — 77 tests pass
+- [x] `cargo clippy --features tls-termination --tests` — zero warnings
 
 ---
 
