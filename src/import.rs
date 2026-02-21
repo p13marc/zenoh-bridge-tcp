@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
@@ -51,8 +52,9 @@ pub async fn run_import_mode(
     session: Arc<Session>,
     import_spec: &str,
     buffer_size: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(session, import_spec, false, buffer_size).await
+    run_import_mode_internal(session, import_spec, false, buffer_size, shutdown_token).await
 }
 
 /// Run HTTP-aware import mode for a single service
@@ -66,8 +68,9 @@ pub async fn run_http_import_mode(
     session: Arc<Session>,
     import_spec: &str,
     buffer_size: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(session, import_spec, true, buffer_size).await
+    run_import_mode_internal(session, import_spec, true, buffer_size, shutdown_token).await
 }
 
 /// Internal implementation for both regular and HTTP import modes
@@ -76,6 +79,7 @@ async fn run_import_mode_internal(
     import_spec: &str,
     http_mode: bool,
     buffer_size: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
 
@@ -96,51 +100,62 @@ async fn run_import_mode_internal(
 
     // Accept connections
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
-                info!(
-                    client_id = %client_id,
-                    remote_addr = %addr,
-                    "New connection"
-                );
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
+                        info!(
+                            client_id = %client_id,
+                            remote_addr = %addr,
+                            "New connection"
+                        );
 
-                let session = session.clone();
-                let service_name = service_name.clone();
-                let client_id_clone = client_id.clone();
+                        let session = session.clone();
+                        let service_name = service_name.clone();
+                        let client_id_clone = client_id.clone();
 
-                let span = info_span!(
-                    "connection",
-                    client_id = %client_id,
-                    service = %service_name,
-                    remote_addr = %addr,
-                    mode = if http_mode { "http" } else { "tcp" }
-                );
+                        let span = info_span!(
+                            "connection",
+                            client_id = %client_id,
+                            service = %service_name,
+                            remote_addr = %addr,
+                            mode = if http_mode { "http" } else { "tcp" }
+                        );
 
-                tokio::spawn(
-                    async move {
-                        if let Err(e) = handle_import_connection(
-                            session,
-                            stream,
-                            &service_name,
-                            &client_id_clone,
-                            http_mode,
-                            buffer_size,
-                        )
-                        .await
-                        {
-                            error!(error = %e, "Connection error");
-                        }
-                        info!("Connection closed");
+                        tokio::spawn(
+                            async move {
+                                if let Err(e) = handle_import_connection(
+                                    session,
+                                    stream,
+                                    &service_name,
+                                    &client_id_clone,
+                                    http_mode,
+                                    buffer_size,
+                                )
+                                .await
+                                {
+                                    error!(error = %e, "Connection error");
+                                }
+                                info!("Connection closed");
+                            }
+                            .instrument(span),
+                        );
                     }
-                    .instrument(span),
-                );
+                    Err(e) => {
+                        error!("Failed to accept connection: {:?}", e);
+                    }
+                }
             }
-            Err(e) => {
-                error!("Failed to accept connection: {:?}", e);
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "Import bridge shutting down, no new connections");
+                break;
             }
         }
     }
+
+    info!(service = %service_name, "Import bridge stopped");
+    Ok(())
 }
 
 /// Handle a single import connection
@@ -468,7 +483,11 @@ async fn handle_import_connection(
 /// 1. Binds a TCP listener on the specified address
 /// 2. Accepts incoming connections and upgrades them to WebSocket
 /// 3. For each connection, spawns a handler that bridges to Zenoh
-pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Result<()> {
+pub async fn run_ws_import_mode(
+    session: Arc<Session>,
+    import_spec: &str,
+    shutdown_token: CancellationToken,
+) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
 
     info!(
@@ -487,53 +506,64 @@ pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Res
 
     // Accept connections
     loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                let client_id = format!("wsclient_{}", uuid::Uuid::new_v4().as_simple());
-                info!(client_id = %client_id, remote_addr = %addr, "New WebSocket connection");
+        tokio::select! {
+            result = listener.accept() => {
+                match result {
+                    Ok((stream, addr)) => {
+                        let client_id = format!("wsclient_{}", uuid::Uuid::new_v4().as_simple());
+                        info!(client_id = %client_id, remote_addr = %addr, "New WebSocket connection");
 
-                let session = session.clone();
-                let service_name = service_name.clone();
-                let client_id_clone = client_id.clone();
+                        let session = session.clone();
+                        let service_name = service_name.clone();
+                        let client_id_clone = client_id.clone();
 
-                let span = info_span!(
-                    "ws_connection",
-                    client_id = %client_id,
-                    service = %service_name,
-                    remote_addr = %addr,
-                    mode = "websocket"
-                );
+                        let span = info_span!(
+                            "ws_connection",
+                            client_id = %client_id,
+                            service = %service_name,
+                            remote_addr = %addr,
+                            mode = "websocket"
+                        );
 
-                tokio::spawn(
-                    async move {
-                        // Perform WebSocket upgrade
-                        match tokio_tungstenite::accept_async(stream).await {
-                            Ok(ws_stream) => {
-                                if let Err(e) = handle_ws_import_connection(
-                                    session,
-                                    ws_stream,
-                                    &service_name,
-                                    &client_id_clone,
-                                )
-                                .await
-                                {
-                                    error!(error = %e, "WebSocket connection error");
+                        tokio::spawn(
+                            async move {
+                                // Perform WebSocket upgrade
+                                match tokio_tungstenite::accept_async(stream).await {
+                                    Ok(ws_stream) => {
+                                        if let Err(e) = handle_ws_import_connection(
+                                            session,
+                                            ws_stream,
+                                            &service_name,
+                                            &client_id_clone,
+                                        )
+                                        .await
+                                        {
+                                            error!(error = %e, "WebSocket connection error");
+                                        }
+                                        info!("WebSocket connection closed");
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "WebSocket handshake failed");
+                                    }
                                 }
-                                info!("WebSocket connection closed");
                             }
-                            Err(e) => {
-                                error!(error = %e, "WebSocket handshake failed");
-                            }
-                        }
+                            .instrument(span),
+                        );
                     }
-                    .instrument(span),
-                );
+                    Err(e) => {
+                        error!("Failed to accept connection: {:?}", e);
+                    }
+                }
             }
-            Err(e) => {
-                error!("Failed to accept connection: {:?}", e);
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "WebSocket import bridge shutting down, no new connections");
+                break;
             }
         }
     }
+
+    info!(service = %service_name, "WebSocket import bridge stopped");
+    Ok(())
 }
 
 /// Handle a single WebSocket import connection

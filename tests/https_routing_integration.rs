@@ -11,6 +11,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -103,6 +104,7 @@ async fn start_https_backend(addr: SocketAddr, domain: &str, backend_id: &str) {
 async fn test_https_routing_multiple_backends() {
     // Initialize tracing for debugging
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: HTTPS Routing with SNI and Multiple Backends");
     println!("====================================================");
@@ -127,22 +129,26 @@ async fn test_https_routing_multiple_backends() {
 
     // Start HTTP export bridges (one per DNS)
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_api_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/api.secure.test/127.0.0.1:29001",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
     });
 
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_web_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/web.secure.test/127.0.0.1:29002",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -154,11 +160,13 @@ async fn test_https_routing_multiple_backends() {
     // Start HTTP import bridge (single listener for all DNS via SNI)
     let import_addr: SocketAddr = "127.0.0.1:28443".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("https-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -303,6 +311,7 @@ async fn test_https_routing_multiple_backends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_https_routing_concurrent_clients() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Concurrent HTTPS Clients with SNI");
     println!("==========================================");
@@ -319,11 +328,13 @@ async fn test_https_routing_concurrent_clients() {
 
     // Start export
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/concurrent.secure.test/127.0.0.1:29003",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -334,11 +345,13 @@ async fn test_https_routing_concurrent_clients() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:28444".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("https-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -399,6 +412,7 @@ async fn test_https_routing_concurrent_clients() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_https_backend_becomes_available() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: HTTPS Backend Becomes Available After Import");
     println!("=====================================================");
@@ -411,11 +425,13 @@ async fn test_https_backend_becomes_available() {
     // Start import FIRST (backend doesn't exist yet)
     let import_addr: SocketAddr = "127.0.0.1:28445".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("https-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -445,11 +461,13 @@ async fn test_https_backend_becomes_available() {
     start_https_backend(backend_addr, "delayed.secure.test", "delayed-backend").await;
 
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/delayed.secure.test/127.0.0.1:29004",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();

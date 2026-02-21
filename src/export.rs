@@ -16,6 +16,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use zenoh::key_expr::KeyExpr;
 use zenoh::Session;
@@ -73,8 +74,9 @@ pub async fn run_export_mode(
     session: Arc<Session>,
     export_spec: &str,
     buffer_size: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_export_mode_internal(session, export_spec, None, buffer_size).await
+    run_export_mode_internal(session, export_spec, None, buffer_size, shutdown_token).await
 }
 
 /// Run HTTP-aware export mode for a single service with DNS-based routing
@@ -89,6 +91,7 @@ pub async fn run_http_export_mode(
     session: Arc<Session>,
     export_spec: &str,
     buffer_size: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, dns, backend_addr) = parse_http_export_spec(export_spec)?;
     run_export_mode_internal(
@@ -96,6 +99,7 @@ pub async fn run_http_export_mode(
         &format!("{}/{}", service_name, backend_addr),
         Some(dns),
         buffer_size,
+        shutdown_token,
     )
     .await
 }
@@ -106,6 +110,7 @@ async fn run_export_mode_internal(
     export_spec: &str,
     dns_suffix: Option<String>,
     buffer_size: usize,
+    shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, backend_addr) = parse_export_spec(export_spec)?;
 
@@ -184,37 +189,53 @@ async fn run_export_mode_internal(
 
     // Main loop: monitor liveliness and create/destroy connections
     loop {
-        match liveliness_subscriber.recv_async().await {
-            Ok(sample) => {
-                let key = sample.key_expr().as_str();
-                if let Some(client_id) = key.rsplit('/').next() {
-                    let client_id = client_id.to_string();
+        tokio::select! {
+            result = liveliness_subscriber.recv_async() => {
+                match result {
+                    Ok(sample) => {
+                        let key = sample.key_expr().as_str();
+                        if let Some(client_id) = key.rsplit('/').next() {
+                            let client_id = client_id.to_string();
 
-                    match sample.kind() {
-                        zenoh::sample::SampleKind::Put => {
-                            handle_client_connect(
-                                &session,
-                                &service_name,
-                                backend_addr,
-                                &client_id,
-                                &cancellation_senders,
-                                dns_suffix.as_deref(),
-                                buffer_size,
-                            )
-                            .await;
+                            match sample.kind() {
+                                zenoh::sample::SampleKind::Put => {
+                                    handle_client_connect(
+                                        &session,
+                                        &service_name,
+                                        backend_addr,
+                                        &client_id,
+                                        &cancellation_senders,
+                                        dns_suffix.as_deref(),
+                                        buffer_size,
+                                    )
+                                    .await;
+                                }
+                                zenoh::sample::SampleKind::Delete => {
+                                    handle_client_disconnect(&client_id, &cancellation_senders).await;
+                                }
+                            }
                         }
-                        zenoh::sample::SampleKind::Delete => {
-                            handle_client_disconnect(&client_id, &cancellation_senders).await;
-                        }
+                    }
+                    Err(e) => {
+                        error!("Liveliness subscriber error: {:?}", e);
+                        return Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
                     }
                 }
             }
-            Err(e) => {
-                error!("Liveliness subscriber error: {:?}", e);
-                break Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "Export bridge shutting down");
+                let senders = cancellation_senders.lock().await;
+                for (client_id, (tx, _)) in senders.iter() {
+                    let _ = tx.send(()).await;
+                    debug!(client_id = %client_id, "Sent shutdown to client bridge");
+                }
+                break;
             }
         }
     }
+
+    info!(service = %service_name, "Export bridge stopped");
+    Ok(())
 }
 
 /// Handle a client connection event
@@ -521,7 +542,11 @@ pub fn parse_ws_export_spec(export_spec: &str) -> Result<(String, String)> {
 /// 2. Creates a WebSocket connection to the backend when a client appears
 /// 3. Bridges data between the WebSocket backend and Zenoh
 /// 4. Cleans up when clients disconnect
-pub async fn run_ws_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
+pub async fn run_ws_export_mode(
+    session: Arc<Session>,
+    export_spec: &str,
+    shutdown_token: CancellationToken,
+) -> Result<()> {
     let (service_name, ws_url) = parse_ws_export_spec(export_spec)?;
 
     info!(
@@ -573,35 +598,51 @@ pub async fn run_ws_export_mode(session: Arc<Session>, export_spec: &str) -> Res
 
     // Main loop: monitor liveliness and create/destroy connections
     loop {
-        match liveliness_subscriber.recv_async().await {
-            Ok(sample) => {
-                let key = sample.key_expr().as_str();
-                if let Some(client_id) = key.rsplit('/').next() {
-                    let client_id = client_id.to_string();
+        tokio::select! {
+            result = liveliness_subscriber.recv_async() => {
+                match result {
+                    Ok(sample) => {
+                        let key = sample.key_expr().as_str();
+                        if let Some(client_id) = key.rsplit('/').next() {
+                            let client_id = client_id.to_string();
 
-                    match sample.kind() {
-                        zenoh::sample::SampleKind::Put => {
-                            handle_ws_client_connect(
-                                &session,
-                                &service_name,
-                                &ws_url,
-                                &client_id,
-                                &cancellation_senders,
-                            )
-                            .await;
+                            match sample.kind() {
+                                zenoh::sample::SampleKind::Put => {
+                                    handle_ws_client_connect(
+                                        &session,
+                                        &service_name,
+                                        &ws_url,
+                                        &client_id,
+                                        &cancellation_senders,
+                                    )
+                                    .await;
+                                }
+                                zenoh::sample::SampleKind::Delete => {
+                                    handle_client_disconnect(&client_id, &cancellation_senders).await;
+                                }
+                            }
                         }
-                        zenoh::sample::SampleKind::Delete => {
-                            handle_client_disconnect(&client_id, &cancellation_senders).await;
-                        }
+                    }
+                    Err(e) => {
+                        error!("Liveliness subscriber error: {:?}", e);
+                        return Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
                     }
                 }
             }
-            Err(e) => {
-                error!("Liveliness subscriber error: {:?}", e);
-                break Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "WebSocket export bridge shutting down");
+                let senders = cancellation_senders.lock().await;
+                for (client_id, (tx, _)) in senders.iter() {
+                    let _ = tx.send(()).await;
+                    debug!(client_id = %client_id, "Sent shutdown to WS client bridge");
+                }
+                break;
             }
         }
     }
+
+    info!(service = %service_name, "WebSocket export bridge stopped");
+    Ok(())
 }
 
 /// Handle a WebSocket client connection event

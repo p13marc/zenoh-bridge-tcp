@@ -9,7 +9,8 @@ use anyhow::Result;
 use args::Args;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::{debug, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 /// Initialize the tracing subscriber based on CLI arguments
@@ -33,6 +34,55 @@ fn init_tracing(log_level: &str, log_format: &str) {
             // "pretty" or default
             tracing_subscriber::fmt().with_env_filter(filter).init();
         }
+    }
+}
+
+/// Wait for SIGINT or SIGTERM
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// Spawn bridge tasks from a list of specs using a factory closure
+fn spawn_bridge_tasks<F, Fut>(
+    tasks: &mut Vec<tokio::task::JoinHandle<()>>,
+    specs: &[String],
+    mode: &'static str,
+    shutdown_token: &CancellationToken,
+    factory: F,
+) where
+    F: Fn(String, CancellationToken) -> Fut + Send + 'static + Clone,
+    Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+{
+    for spec in specs {
+        let token = shutdown_token.child_token();
+        let spec_clone = spec.clone();
+        let factory = factory.clone();
+        tasks.push(tokio::spawn(async move {
+            if let Err(e) = factory(spec_clone.clone(), token).await {
+                tracing::error!(mode = %mode, spec = %spec_clone, error = %e, "Task failed");
+            }
+        }));
+        debug!(mode = mode, spec = %spec, "Spawned task");
     }
 }
 
@@ -66,7 +116,18 @@ async fn main() -> Result<()> {
     );
     info!("Zenoh session established");
 
-    // Spawn tasks for each export specification
+    // Create a global cancellation token
+    let shutdown_token = CancellationToken::new();
+
+    // Spawn signal handler
+    let signal_token = shutdown_token.clone();
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        info!("Shutdown signal received, initiating graceful shutdown...");
+        signal_token.cancel();
+    });
+
+    // Spawn tasks for each specification
     let mut tasks = Vec::new();
     let export_count = args.export.len();
     let import_count = args.import.len();
@@ -77,89 +138,98 @@ async fn main() -> Result<()> {
 
     let buffer_size = args.buffer_size;
 
-    for export_spec in args.export {
-        let export_spec_clone = export_spec.clone();
-        let session_clone = session.clone();
-        let task = tokio::spawn(async move {
-            if let Err(e) =
-                export::run_export_mode(session_clone, &export_spec_clone, buffer_size).await
+    // TCP export tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(&mut tasks, &args.export, "export", &shutdown_token, {
+            move |spec, token| {
+                let session = session.clone();
+                async move { export::run_export_mode(session, &spec, buffer_size, token).await }
+            }
+        });
+    }
+
+    // TCP import tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(&mut tasks, &args.import, "import", &shutdown_token, {
+            move |spec, token| {
+                let session = session.clone();
+                async move { import::run_import_mode(session, &spec, buffer_size, token).await }
+            }
+        });
+    }
+
+    // HTTP export tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(
+            &mut tasks,
+            &args.http_export,
+            "http_export",
+            &shutdown_token,
             {
-                tracing::error!(spec = %export_spec_clone, error = %e, "Export task failed");
-            }
-        });
-        tasks.push(task);
-        debug!(mode = "export", spec = %export_spec, "Spawned task");
+                move |spec, token| {
+                    let session = session.clone();
+                    async move {
+                        export::run_http_export_mode(session, &spec, buffer_size, token).await
+                    }
+                }
+            },
+        );
     }
 
-    // Spawn tasks for each import specification
-    for import_spec in args.import {
-        let import_spec_clone = import_spec.clone();
-        let session_clone = session.clone();
-        let task = tokio::spawn(async move {
-            if let Err(e) =
-                import::run_import_mode(session_clone, &import_spec_clone, buffer_size).await
+    // HTTP import tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(
+            &mut tasks,
+            &args.http_import,
+            "http_import",
+            &shutdown_token,
             {
-                tracing::error!(spec = %import_spec_clone, error = %e, "Import task failed");
-            }
-        });
-        tasks.push(task);
-        debug!(mode = "import", spec = %import_spec, "Spawned task");
+                move |spec, token| {
+                    let session = session.clone();
+                    async move {
+                        import::run_http_import_mode(session, &spec, buffer_size, token).await
+                    }
+                }
+            },
+        );
     }
 
-    // Spawn tasks for each HTTP export specification
-    for export_spec in args.http_export {
-        let export_spec_clone = export_spec.clone();
-        let session_clone = session.clone();
-        let task = tokio::spawn(async move {
-            if let Err(e) =
-                export::run_http_export_mode(session_clone, &export_spec_clone, buffer_size).await
+    // WebSocket export tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(
+            &mut tasks,
+            &args.ws_export,
+            "ws_export",
+            &shutdown_token,
             {
-                tracing::error!(spec = %export_spec_clone, error = %e, "HTTP export task failed");
-            }
-        });
-        tasks.push(task);
-        debug!(mode = "http_export", spec = %export_spec, "Spawned task");
+                move |spec, token| {
+                    let session = session.clone();
+                    async move { export::run_ws_export_mode(session, &spec, token).await }
+                }
+            },
+        );
     }
 
-    // Spawn tasks for each HTTP import specification
-    for import_spec in args.http_import {
-        let import_spec_clone = import_spec.clone();
-        let session_clone = session.clone();
-        let task = tokio::spawn(async move {
-            if let Err(e) =
-                import::run_http_import_mode(session_clone, &import_spec_clone, buffer_size).await
+    // WebSocket import tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(
+            &mut tasks,
+            &args.ws_import,
+            "ws_import",
+            &shutdown_token,
             {
-                tracing::error!(spec = %import_spec_clone, error = %e, "HTTP import task failed");
-            }
-        });
-        tasks.push(task);
-        debug!(mode = "http_import", spec = %import_spec, "Spawned task");
-    }
-
-    // Spawn tasks for each WebSocket export specification
-    for export_spec in args.ws_export {
-        let export_spec_clone = export_spec.clone();
-        let session_clone = session.clone();
-        let task = tokio::spawn(async move {
-            if let Err(e) = export::run_ws_export_mode(session_clone, &export_spec_clone).await {
-                tracing::error!(spec = %export_spec_clone, error = %e, "WebSocket export task failed");
-            }
-        });
-        tasks.push(task);
-        debug!(mode = "ws_export", spec = %export_spec, "Spawned task");
-    }
-
-    // Spawn tasks for each WebSocket import specification
-    for import_spec in args.ws_import {
-        let import_spec_clone = import_spec.clone();
-        let session_clone = session.clone();
-        let task = tokio::spawn(async move {
-            if let Err(e) = import::run_ws_import_mode(session_clone, &import_spec_clone).await {
-                tracing::error!(spec = %import_spec_clone, error = %e, "WebSocket import task failed");
-            }
-        });
-        tasks.push(task);
-        debug!(mode = "ws_import", spec = %import_spec, "Spawned task");
+                move |spec, token| {
+                    let session = session.clone();
+                    async move { import::run_ws_import_mode(session, &spec, token).await }
+                }
+            },
+        );
     }
 
     info!(
@@ -172,10 +242,25 @@ async fn main() -> Result<()> {
         "All bridge tasks started"
     );
 
-    // Wait for all tasks (they should run indefinitely)
-    for task in tasks {
-        let _ = task.await;
+    // Wait for shutdown signal
+    shutdown_token.cancelled().await;
+
+    info!("Waiting for tasks to drain (max 10 seconds)...");
+    let drain_timeout = tokio::time::Duration::from_secs(10);
+
+    // Wait for all tasks to finish with timeout
+    let _ = tokio::time::timeout(drain_timeout, async {
+        for task in tasks {
+            let _ = task.await;
+        }
+    })
+    .await;
+
+    // Close Zenoh session explicitly
+    if let Err(e) = session.close().await {
+        warn!("Error closing Zenoh session: {}", e);
     }
 
+    info!("Shutdown complete");
     Ok(())
 }

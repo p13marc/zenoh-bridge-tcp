@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -51,6 +52,7 @@ async fn start_test_backend(addr: SocketAddr, backend_id: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_missing_host_header() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Missing Host Header");
     println!("============================");
@@ -69,11 +71,13 @@ async fn test_missing_host_header() {
 
     // Start export
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19101",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -84,11 +88,13 @@ async fn test_missing_host_header() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:18101".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -140,6 +146,7 @@ async fn test_missing_host_header() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_malformed_http_requests() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Malformed HTTP Requests");
     println!("================================");
@@ -158,11 +165,13 @@ async fn test_malformed_http_requests() {
 
     // Start export
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19102",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -173,11 +182,13 @@ async fn test_malformed_http_requests() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:18102".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -232,6 +243,7 @@ async fn test_malformed_http_requests() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_very_long_headers() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Very Long HTTP Headers");
     println!("================================");
@@ -250,11 +262,13 @@ async fn test_very_long_headers() {
 
     // Start export
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19103",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -265,11 +279,13 @@ async fn test_very_long_headers() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:18103".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -339,6 +355,7 @@ async fn test_very_long_headers() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_special_characters_in_hostname() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Special Characters in Hostname");
     println!("========================================");
@@ -357,11 +374,13 @@ async fn test_special_characters_in_hostname() {
 
     // Start export with hyphen in domain
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/my-api.example.com/127.0.0.1:19104",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -372,11 +391,13 @@ async fn test_special_characters_in_hostname() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:18104".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -449,6 +470,7 @@ async fn test_special_characters_in_hostname() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_http_methods() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Various HTTP Methods");
     println!("==============================");
@@ -477,11 +499,13 @@ async fn test_http_methods() {
 
     // Start export
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19105",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -492,11 +516,13 @@ async fn test_http_methods() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:18105".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -588,6 +614,7 @@ async fn test_http_methods() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_connection_lifecycle() {
     let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
 
     println!("\n🧪 TEST: Connection Lifecycle");
     println!("==============================");
@@ -606,11 +633,13 @@ async fn test_connection_lifecycle() {
 
     // Start export
     let session1_clone = session1.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19106",
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
@@ -621,11 +650,13 @@ async fn test_connection_lifecycle() {
     // Start import
     let import_addr: SocketAddr = "127.0.0.1:18106".parse().unwrap();
     let session2_clone = session2.clone();
+    let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            shutdown_token_clone,
         )
         .await
         .unwrap();
