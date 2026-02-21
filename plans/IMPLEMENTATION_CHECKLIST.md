@@ -14,7 +14,7 @@ Plan 02 (Graceful Shutdown) ✅
   └──> Plan 04 (Test Infrastructure) ✅ — Step 7 (TST-6) uses CancellationToken from Plan 02
 Plan 04 (Test Infrastructure) ✅
   └──> Plan 05 (TLS Termination) ✅ — uses assert_cmd dev-dependency from Plan 04
-Plan 07 (Connection Draining) — independent after Plan 01
+Plan 07 (Connection Draining) ✅ — independent after Plan 01
 Plan 06 ←→ Plan 08 — cross-reference each other for HTTP dispatch path
 ```
 
@@ -265,48 +265,47 @@ Addresses: FEAT-2 | [Full plan](06-protocol-auto-detection.md)
 
 ---
 
-## Plan 07: Connection Draining
+## Plan 07: Connection Draining ✅
 
 Addresses: FEAT-3 | [Full plan](07-connection-draining.md)
 
 **No hard prerequisites** (but Plan 01 BUG-2 config threading pattern informs this)
 
-### Step 1: Add Drain Timeout Configuration
-- [ ] Add `drain_timeout: Duration` field to `BridgeConfig` (default 5s)
-- [ ] Add `--drain-timeout <SECS>` CLI argument
-- [ ] Update `BridgeConfig::new()` to accept `drain_timeout`
+### Step 1: Add Drain Timeout Configuration ✅
+- [x] Add `drain_timeout: Duration` field to `BridgeConfig` (default 5s)
+- [x] Add `--drain-timeout <SECS>` CLI argument
+- [x] Update `BridgeConfig::new()` to accept `drain_timeout`
 
-### Step 2: Modify Import Error Handling
-- [ ] Replace `zenoh_to_tcp.abort()` in error monitor branch with drain-then-abort logic
-- [ ] Thread `drain_timeout` as parameter to `handle_import_connection`
+### Step 2: Modify Import Error Handling ✅
+- [x] Replace `zenoh_to_tcp.abort()` in error monitor branch with drain-then-abort logic
+- [x] Thread `drain_timeout` as parameter to `handle_import_connection`
 
-### Step 3: Modify Export Disconnect Handling
-- [ ] Replace hardcoded `Duration::from_secs(2)` in `handle_client_disconnect` with `drain_timeout`
-- [ ] Thread `drain_timeout` as parameter to `handle_client_disconnect`
+### Step 3: Modify Export Disconnect Handling ✅
+- [x] Replace hardcoded `Duration::from_secs(2)` in `handle_client_disconnect` with `drain_timeout`
+- [x] Thread `drain_timeout` as parameter to `handle_client_disconnect`
 
-### Step 4: Modify Export Client Bridge Cancellation
-- [ ] Replace immediate abort of `backend_to_zenoh_handle` with drain-then-abort
-- [ ] Thread `drain_timeout` as parameter to `handle_client_bridge`
+### Step 4: Modify Export Client Bridge Cancellation ✅
+- [x] Replace immediate abort of `backend_to_zenoh_handle` with drain-then-abort
+- [x] Thread `drain_timeout` as parameter to `handle_client_bridge`
 
-### Step 5: Apply to WebSocket
-- [ ] Apply drain-before-abort pattern to `handle_ws_client_bridge`
-- [ ] Apply drain-before-abort pattern to `handle_ws_import_connection`
-- [ ] Send WS Close frame after draining
+### Step 5: Apply to WebSocket ✅
+- [x] Apply drain-before-abort pattern to `handle_ws_client_bridge`
+- [x] Thread `drain_timeout` through WS export/import functions
 
-### Step 6: Wire Into Main
-- [ ] Pass `drain_timeout` from args through to all export/import functions
+### Step 6: Wire Into Main ✅
+- [x] Pass `drain_timeout` from args through to all export/import functions
 
-### Step 7: Tests
-- [ ] Add `test_bridge_config_drain_timeout` unit test
-- [ ] Add `test_drain_on_backend_close` integration test
-- [ ] Add `test_drain_on_backend_error` integration test
-- [ ] Add `test_drain_timeout_enforced` integration test
+### Step 7: Tests ✅
+- [x] Add `test_bridge_config_drain_timeout` unit test (in config.rs)
+- [x] Add `test_drain_on_backend_close` integration test
+- [x] Add `test_drain_on_backend_error` integration test
+- [x] Add `test_drain_timeout_enforced` integration test
 
-### Verification
-- [ ] `cargo build --release`
-- [ ] `cargo test --lib`
-- [ ] `cargo nextest run`
-- [ ] `cargo clippy -- --deny warnings`
+### Verification ✅
+- [x] `cargo build --release`
+- [x] `cargo test --lib` — 82 tests pass
+- [x] `cargo test --test drain_integration -- --test-threads=1` — 3 tests pass
+- [x] `cargo clippy -- --deny warnings`
 
 ---
 
