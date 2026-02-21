@@ -131,6 +131,7 @@ async fn test_https_routing_multiple_backends() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/api.secure.test/127.0.0.1:29001",
+            65536,
         )
         .await
         .unwrap();
@@ -141,6 +142,7 @@ async fn test_https_routing_multiple_backends() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/web.secure.test/127.0.0.1:29002",
+            65536,
         )
         .await
         .unwrap();
@@ -156,6 +158,7 @@ async fn test_https_routing_multiple_backends() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("https-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -320,6 +323,7 @@ async fn test_https_routing_concurrent_clients() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/concurrent.secure.test/127.0.0.1:29003",
+            65536,
         )
         .await
         .unwrap();
@@ -334,6 +338,7 @@ async fn test_https_routing_concurrent_clients() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("https-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -410,6 +415,7 @@ async fn test_https_backend_becomes_available() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("https-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -443,6 +449,7 @@ async fn test_https_backend_becomes_available() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "https-service/delayed.secure.test/127.0.0.1:29004",
+            65536,
         )
         .await
         .unwrap();

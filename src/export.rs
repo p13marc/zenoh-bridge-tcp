@@ -69,8 +69,12 @@ pub fn parse_http_export_spec(export_spec: &str) -> Result<(String, String, Sock
 /// 2. Creates a backend connection when a client appears
 /// 3. Bridges data between the backend and Zenoh
 /// 4. Cleans up when clients disconnect
-pub async fn run_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
-    run_export_mode_internal(session, export_spec, None).await
+pub async fn run_export_mode(
+    session: Arc<Session>,
+    export_spec: &str,
+    buffer_size: usize,
+) -> Result<()> {
+    run_export_mode_internal(session, export_spec, None, buffer_size).await
 }
 
 /// Run HTTP-aware export mode for a single service with DNS-based routing
@@ -81,12 +85,17 @@ pub async fn run_export_mode(session: Arc<Session>, export_spec: &str) -> Result
 /// 3. Creates backend connections when clients appear
 /// 4. Bridges data between the backend and Zenoh
 /// 5. Cleans up when clients disconnect
-pub async fn run_http_export_mode(session: Arc<Session>, export_spec: &str) -> Result<()> {
+pub async fn run_http_export_mode(
+    session: Arc<Session>,
+    export_spec: &str,
+    buffer_size: usize,
+) -> Result<()> {
     let (service_name, dns, backend_addr) = parse_http_export_spec(export_spec)?;
     run_export_mode_internal(
         session,
         &format!("{}/{}", service_name, backend_addr),
         Some(dns),
+        buffer_size,
     )
     .await
 }
@@ -96,6 +105,7 @@ async fn run_export_mode_internal(
     session: Arc<Session>,
     export_spec: &str,
     dns_suffix: Option<String>,
+    buffer_size: usize,
 ) -> Result<()> {
     let (service_name, backend_addr) = parse_export_spec(export_spec)?;
 
@@ -162,6 +172,7 @@ async fn run_export_mode_internal(
                                 &client_id,
                                 &cancellation_senders,
                                 dns_suffix.as_deref(),
+                                buffer_size,
                             )
                             .await;
                         }
@@ -187,6 +198,7 @@ async fn handle_client_connect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
     dns_suffix: Option<&str>,
+    buffer_size: usize,
 ) {
     info!(client_id = %client_id, "Client connected");
 
@@ -225,6 +237,7 @@ async fn handle_client_connect(
                         backend_writer,
                         cancel_rx,
                         dns_suffix_owned.as_deref(),
+                        buffer_size,
                     )
                     .await
                     {
@@ -266,6 +279,7 @@ async fn handle_client_bridge(
     mut backend_writer: tokio::net::tcp::OwnedWriteHalf,
     mut cancel_rx: mpsc::Receiver<()>,
     dns_suffix: Option<&str>,
+    buffer_size: usize,
 ) -> Result<()> {
     let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
     // Subscribe to messages from this specific client using AdvancedSubscriber
@@ -310,7 +324,7 @@ async fn handle_client_bridge(
 
     // Task: read from backend and publish to Zenoh using AdvancedPublisher
     let mut backend_to_zenoh_handle = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 65536];
+        let mut buffer = vec![0u8; buffer_size];
         loop {
             match backend_reader.read(&mut buffer).await {
                 Ok(0) => {

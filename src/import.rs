@@ -47,8 +47,12 @@ pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
 /// 1. Binds a TCP listener on the specified address
 /// 2. Accepts incoming TCP connections
 /// 3. For each connection, spawns a handler that bridges to Zenoh
-pub async fn run_import_mode(session: Arc<Session>, import_spec: &str) -> Result<()> {
-    run_import_mode_internal(session, import_spec, false).await
+pub async fn run_import_mode(
+    session: Arc<Session>,
+    import_spec: &str,
+    buffer_size: usize,
+) -> Result<()> {
+    run_import_mode_internal(session, import_spec, false, buffer_size).await
 }
 
 /// Run HTTP-aware import mode for a single service
@@ -58,8 +62,12 @@ pub async fn run_import_mode(session: Arc<Session>, import_spec: &str) -> Result
 /// 2. Accepts incoming HTTP connections
 /// 3. Parses the Host header to determine DNS-based routing
 /// 4. For each connection, spawns a handler that bridges to Zenoh with DNS keys
-pub async fn run_http_import_mode(session: Arc<Session>, import_spec: &str) -> Result<()> {
-    run_import_mode_internal(session, import_spec, true).await
+pub async fn run_http_import_mode(
+    session: Arc<Session>,
+    import_spec: &str,
+    buffer_size: usize,
+) -> Result<()> {
+    run_import_mode_internal(session, import_spec, true, buffer_size).await
 }
 
 /// Internal implementation for both regular and HTTP import modes
@@ -67,6 +75,7 @@ async fn run_import_mode_internal(
     session: Arc<Session>,
     import_spec: &str,
     http_mode: bool,
+    buffer_size: usize,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
 
@@ -116,6 +125,7 @@ async fn run_import_mode_internal(
                             &service_name,
                             &client_id_clone,
                             http_mode,
+                            buffer_size,
                         )
                         .await
                         {
@@ -147,6 +157,7 @@ async fn handle_import_connection(
     service_name: &str,
     client_id: &str,
     http_mode: bool,
+    buffer_size: usize,
 ) -> Result<()> {
     // Parse HTTP/HTTPS request if in HTTP mode to extract DNS
     let (dns_suffix, initial_buffer) = if http_mode {
@@ -399,7 +410,7 @@ async fn handle_import_connection(
     // Task: TCP reader -> Zenoh AdvancedPublisher
     let client_id_clone = client_id.to_string();
     let mut tcp_to_zenoh = tokio::spawn(async move {
-        let mut buffer = vec![0u8; 65536];
+        let mut buffer = vec![0u8; buffer_size];
         loop {
             match tcp_reader.read(&mut buffer).await {
                 Ok(0) => {

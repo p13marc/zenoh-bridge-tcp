@@ -75,11 +75,15 @@ async fn main() -> Result<()> {
     let ws_export_count = args.ws_export.len();
     let ws_import_count = args.ws_import.len();
 
+    let buffer_size = args.buffer_size;
+
     for export_spec in args.export {
         let export_spec_clone = export_spec.clone();
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = export::run_export_mode(session_clone, &export_spec_clone).await {
+            if let Err(e) =
+                export::run_export_mode(session_clone, &export_spec_clone, buffer_size).await
+            {
                 tracing::error!(spec = %export_spec_clone, error = %e, "Export task failed");
             }
         });
@@ -92,7 +96,9 @@ async fn main() -> Result<()> {
         let import_spec_clone = import_spec.clone();
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = import::run_import_mode(session_clone, &import_spec_clone).await {
+            if let Err(e) =
+                import::run_import_mode(session_clone, &import_spec_clone, buffer_size).await
+            {
                 tracing::error!(spec = %import_spec_clone, error = %e, "Import task failed");
             }
         });
@@ -105,7 +111,9 @@ async fn main() -> Result<()> {
         let export_spec_clone = export_spec.clone();
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = export::run_http_export_mode(session_clone, &export_spec_clone).await {
+            if let Err(e) =
+                export::run_http_export_mode(session_clone, &export_spec_clone, buffer_size).await
+            {
                 tracing::error!(spec = %export_spec_clone, error = %e, "HTTP export task failed");
             }
         });
@@ -118,7 +126,9 @@ async fn main() -> Result<()> {
         let import_spec_clone = import_spec.clone();
         let session_clone = session.clone();
         let task = tokio::spawn(async move {
-            if let Err(e) = import::run_http_import_mode(session_clone, &import_spec_clone).await {
+            if let Err(e) =
+                import::run_http_import_mode(session_clone, &import_spec_clone, buffer_size).await
+            {
                 tracing::error!(spec = %import_spec_clone, error = %e, "HTTP import task failed");
             }
         });

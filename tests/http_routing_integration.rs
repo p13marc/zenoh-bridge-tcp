@@ -101,6 +101,7 @@ async fn test_http_routing_multiple_backends() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/api.example.com/127.0.0.1:19001",
+            65536,
         )
         .await
         .unwrap();
@@ -111,6 +112,7 @@ async fn test_http_routing_multiple_backends() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/web.example.com/127.0.0.1:19002",
+            65536,
         )
         .await
         .unwrap();
@@ -126,6 +128,7 @@ async fn test_http_routing_multiple_backends() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -325,6 +328,7 @@ async fn test_http_routing_concurrent_clients() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/concurrent.example.com/127.0.0.1:19003",
+            65536,
         )
         .await
         .unwrap();
@@ -339,6 +343,7 @@ async fn test_http_routing_concurrent_clients() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -411,6 +416,7 @@ async fn test_http_routing_backend_becomes_available() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -441,6 +447,7 @@ async fn test_http_routing_backend_becomes_available() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/delayed.example.com/127.0.0.1:19004",
+            65536,
         )
         .await
         .unwrap();

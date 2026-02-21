@@ -73,6 +73,7 @@ async fn test_missing_host_header() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19101",
+            65536,
         )
         .await
         .unwrap();
@@ -87,6 +88,7 @@ async fn test_missing_host_header() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -160,6 +162,7 @@ async fn test_malformed_http_requests() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19102",
+            65536,
         )
         .await
         .unwrap();
@@ -174,6 +177,7 @@ async fn test_malformed_http_requests() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -250,6 +254,7 @@ async fn test_very_long_headers() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19103",
+            65536,
         )
         .await
         .unwrap();
@@ -264,6 +269,7 @@ async fn test_very_long_headers() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -355,6 +361,7 @@ async fn test_special_characters_in_hostname() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/my-api.example.com/127.0.0.1:19104",
+            65536,
         )
         .await
         .unwrap();
@@ -369,6 +376,7 @@ async fn test_special_characters_in_hostname() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -473,6 +481,7 @@ async fn test_http_methods() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19105",
+            65536,
         )
         .await
         .unwrap();
@@ -487,6 +496,7 @@ async fn test_http_methods() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
@@ -600,6 +610,7 @@ async fn test_connection_lifecycle() {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19106",
+            65536,
         )
         .await
         .unwrap();
@@ -614,6 +625,7 @@ async fn test_connection_lifecycle() {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &format!("http-service/{}", import_addr),
+            65536,
         )
         .await
         .unwrap();
