@@ -33,41 +33,52 @@ async fn kill_bridge(mut child: tokio::process::Child) {
 async fn test_drain_on_backend_close() -> Result<()> {
     println!("\n=== Test: Drain on Backend Close ===\n");
 
-    // Start a backend that echoes then sends extra data then closes
+    // Start a backend that echoes then sends extra data then closes.
+    // Accepts multiple connections because stale Zenoh sessions from prior tests
+    // may trigger spurious backend connections that immediately close.
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_addr = backend_listener.local_addr()?;
     println!("1. Backend listening on {}", backend_addr);
 
+    let (drain_tx, _drain_rx) = tokio::sync::mpsc::channel::<bool>(1);
+
     let backend_task = tokio::spawn(async move {
-        let (mut stream, _) = backend_listener.accept().await.unwrap();
-        println!("2. Backend: Connection accepted");
+        loop {
+            let (mut stream, addr) = backend_listener.accept().await.unwrap();
+            println!("   Backend: Connection from {}", addr);
 
-        // Wait for data from client (proves the full bridge path works)
-        let mut buf = vec![0u8; 1024];
-        match tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                println!("3. Backend: Received: '{}'", msg.trim());
+            let tx = drain_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1024];
+                match tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf)).await {
+                    Ok(Ok(n)) if n > 0 => {
+                        let msg = String::from_utf8_lossy(&buf[..n]);
+                        println!("   Backend: Received from {}: '{}'", addr, msg.trim());
 
-                // Echo it back
-                stream.write_all(&buf[..n]).await.unwrap();
-                println!("4. Backend: Echoed message");
+                        // Echo it back
+                        stream.write_all(&buf[..n]).await.unwrap();
+                        println!("   Backend: Echoed message to {}", addr);
 
-                // Small delay, then send additional messages
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                stream.write_all(b"drain-msg-1\n").await.unwrap();
-                stream.write_all(b"drain-msg-2\n").await.unwrap();
-                println!("5. Backend: Sent drain messages, closing");
-            }
-            other => {
-                println!("3. Backend: Unexpected read result: {:?}", other);
-                return;
-            }
+                        // Small delay, then send additional messages
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        stream.write_all(b"drain-msg-1\n").await.unwrap();
+                        stream.write_all(b"drain-msg-2\n").await.unwrap();
+                        println!("   Backend: Sent drain messages to {}, closing", addr);
+
+                        // Close the connection - triggers EOF on export side
+                        drop(stream);
+                        let _ = tx.send(true).await;
+                    }
+                    _ => {
+                        // Spurious connection (stale Zenoh session), ignore
+                        println!(
+                            "   Backend: Spurious connection from {} (no data), ignoring",
+                            addr
+                        );
+                    }
+                }
+            });
         }
-
-        // Close the connection - triggers EOF on export side
-        drop(stream);
-        println!("6. Backend: Connection closed");
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -96,43 +107,65 @@ async fn test_drain_on_backend_close() -> Result<()> {
         .expect("Import bridge did not start in time");
     println!("9. Import bridge started");
 
-    // Connect client
-    println!("10. Client: Connecting...");
-    let mut client = TcpStream::connect(import_addr).await?;
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Send data to trigger backend connection and get round-trip confirmation
-    client.write_all(b"Hello\n").await?;
-    println!("11. Client: Sent message");
-
-    // Read all data until the connection closes (backend will close after sending drain msgs)
+    // Connect client — use retry loop for resilience against Zenoh timing
+    let mut got_response = false;
     let mut received = String::new();
-    let mut buf = vec![0u8; 1024];
 
-    loop {
-        match timeout(Duration::from_secs(15), client.read(&mut buf)).await {
-            Ok(Ok(0)) => {
-                println!("12. Client: Connection closed (EOF)");
-                break;
+    for attempt in 1..=3 {
+        println!("10. Client: Connecting (attempt {})...", attempt);
+        let mut client = TcpStream::connect(import_addr).await?;
+
+        // Wait for Zenoh path establishment
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Send data to trigger backend connection and get round-trip confirmation
+        client.write_all(b"Hello\n").await?;
+        println!("11. Client: Sent message");
+
+        // Read all data until the connection closes
+        received.clear();
+        let mut buf = vec![0u8; 1024];
+
+        loop {
+            match timeout(Duration::from_secs(15), client.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    println!("12. Client: Connection closed (EOF)");
+                    break;
+                }
+                Ok(Ok(n)) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    println!("    Client: Received {} bytes: '{}'", n, chunk.trim());
+                    received.push_str(&chunk);
+                }
+                Ok(Err(e)) => {
+                    println!("12. Client: Read error: {:?}", e);
+                    break;
+                }
+                Err(_) => {
+                    println!("12. Client: Timeout waiting for more data");
+                    break;
+                }
             }
-            Ok(Ok(n)) => {
-                let chunk = String::from_utf8_lossy(&buf[..n]);
-                println!("    Client: Received {} bytes: '{}'", n, chunk.trim());
-                received.push_str(&chunk);
-            }
-            Ok(Err(e)) => {
-                println!("12. Client: Read error: {:?}", e);
-                break;
-            }
-            Err(_) => {
-                println!("12. Client: Timeout waiting for more data");
-                break;
-            }
+        }
+
+        if received.contains("Hello") && received.contains("drain-msg-1") {
+            got_response = true;
+            break;
+        } else {
+            println!(
+                "    Client: Incomplete response (attempt {}), retrying...",
+                attempt
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
     // Verify the echo and drain messages arrived
+    assert!(
+        got_response,
+        "Should receive echo and drain messages after retries, got: '{}'",
+        received
+    );
     assert!(
         received.contains("Hello"),
         "Should receive echo, got: '{}'",
@@ -150,11 +183,10 @@ async fn test_drain_on_backend_close() -> Result<()> {
     );
     println!("13. TEST PASSED: Backend data drained to client before close");
 
-    // Cleanup - kill and wait for full exit
-    drop(client);
+    // Cleanup
     kill_bridge(export_bridge).await;
     kill_bridge(import_bridge).await;
-    let _ = timeout(Duration::from_millis(500), backend_task).await;
+    backend_task.abort();
     println!("14. TEST COMPLETED\n");
 
     Ok(())

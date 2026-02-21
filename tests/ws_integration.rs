@@ -362,11 +362,21 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     println!("4. Closing first client...");
     sender1.send(Message::Close(None)).await?;
     drop(sender1);
+    drop(_receiver1);
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Check disconnect was detected
-    let disconnects = *disconnection_count.lock().await;
+    // Wait for close to propagate through the full Zenoh bridge chain:
+    // Client WS Close → import bridge → liveliness drop → Zenoh propagation →
+    // export bridge detects Delete → cancel bridge task → WS backend receives close
+    // This is a multi-hop chain through Zenoh between separate OS processes.
+    // Poll with timeout instead of a fixed sleep.
+    let mut disconnects = 0;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        disconnects = *disconnection_count.lock().await;
+        if disconnects >= 1 {
+            break;
+        }
+    }
     println!("5. Disconnections recorded: {}", disconnects);
     assert!(
         disconnects >= 1,

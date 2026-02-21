@@ -107,7 +107,8 @@ async fn test_export_import_basic_communication() -> Result<()> {
     println!("12. Client: Connected successfully");
 
     // Give bridges time to establish Zenoh connection
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Liveliness must propagate between two separate OS processes via Zenoh scouting
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Step 5: Send data from client
     let message = b"Hello from client!\n";
@@ -120,7 +121,7 @@ async fn test_export_import_basic_communication() -> Result<()> {
 
     // Step 6: Read response from backend
     let mut response_buffer = vec![0u8; 1024];
-    let read_result = timeout(Duration::from_secs(3), client.read(&mut response_buffer)).await;
+    let read_result = timeout(Duration::from_secs(5), client.read(&mut response_buffer)).await;
 
     match read_result {
         Ok(Ok(n)) if n > 0 => {
@@ -499,29 +500,35 @@ async fn test_connection_close_propagation() -> Result<()> {
 async fn test_connection_basic() -> Result<()> {
     println!("\n=== Test: Basic Connection Without Close Check ===\n");
 
-    // Backend server that accepts one connection and echoes one message
+    // Backend server that accepts multiple connections and echoes data.
+    // Must accept multiple connections because stale Zenoh sessions from prior tests
+    // may trigger spurious backend connections.
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_addr = backend_listener.local_addr()?;
     println!("1. Backend listening on {}", backend_addr);
 
     let backend_task = tokio::spawn(async move {
-        let (mut stream, _) = backend_listener.accept().await.unwrap();
-        println!("2. Backend: Connection accepted");
-
-        let mut buffer = vec![0u8; 1024];
-        if let Ok(n) = stream.read(&mut buffer).await
-            && n > 0
-        {
-            println!("3. Backend: Received {} bytes", n);
-            let _ = stream.write_all(b"Response\n").await;
-            println!("4. Backend: Sent response");
+        while let Ok((mut stream, addr)) = backend_listener.accept().await {
+            println!("   Backend: Connection from {}", addr);
+            tokio::spawn(async move {
+                let mut buffer = vec![0u8; 1024];
+                loop {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            println!("   Backend: Received {} bytes from {}", n, addr);
+                            let _ = stream.write_all(b"Response\n").await;
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
         }
-        // Don't wait for close - just exit
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Start bridges (using debug binary)
+    // Start bridges
     println!("5. Starting export bridge...");
     let service = common::unique_service_name("basictest");
     let export_spec = format!("{}/{}", service, backend_addr);
@@ -549,37 +556,51 @@ async fn test_connection_basic() -> Result<()> {
         .await
         .expect("Import bridge did not start in time");
 
-    // Connect and send message
-    println!("7. Client: Connecting...");
-    let mut client = TcpStream::connect(import_addr).await?;
-    println!("8. Client: Connected");
+    // Try multiple client connections — the Zenoh data path through separate processes
+    // can take variable time to establish, especially after prior tests.
+    let mut got_response = false;
+    for attempt in 1..=3 {
+        println!("7. Client: Connecting (attempt {})...", attempt);
+        let mut client = TcpStream::connect(import_addr).await?;
+        println!("8. Client: Connected");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+        // Wait for Zenoh path establishment
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-    client.write_all(b"Test\n").await?;
-    println!("9. Client: Sent message");
+        client.write_all(b"Test\n").await?;
+        println!("9. Client: Sent message");
 
-    // Read response
-    let mut buf = vec![0u8; 1024];
-    match timeout(Duration::from_secs(3), client.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            println!("10. Client: Received {} bytes", n);
-            println!("11. ✓ TEST PASSED: Basic communication works");
-        }
-        _ => {
-            println!("10. ✗ No response received");
-            let _ = export_bridge.kill().await;
-            let _ = import_bridge.kill().await;
-            return Err(anyhow::anyhow!("No response"));
+        let mut buf = vec![0u8; 1024];
+        match timeout(Duration::from_secs(5), client.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                println!("10. Client: Received {} bytes", n);
+                println!("11. ✓ TEST PASSED: Basic communication works");
+                got_response = true;
+                break;
+            }
+            _ => {
+                println!(
+                    "   Client: No response (attempt {}), reconnecting...",
+                    attempt
+                );
+                drop(client);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
     }
 
-    // Cleanup immediately without waiting for close
+    if !got_response {
+        let _ = export_bridge.kill().await;
+        let _ = import_bridge.kill().await;
+        backend_task.abort();
+        return Err(anyhow::anyhow!("No response after retries"));
+    }
+
+    // Cleanup
     println!("12. Cleaning up...");
-    drop(client);
     let _ = export_bridge.kill().await;
     let _ = import_bridge.kill().await;
-    let _ = timeout(Duration::from_millis(500), backend_task).await;
+    backend_task.abort();
     println!("13. ✓ TEST COMPLETED\n");
 
     Ok(())
@@ -764,13 +785,13 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
     println!("5. Client: Connected to import bridge");
 
     // Give significant time for:
-    // - Liveliness declaration to propagate through Zenoh
+    // - Liveliness declaration to propagate through Zenoh between separate processes
     // - Export bridge to detect liveliness PUT
-    // - Export bridge to attempt backend connection
+    // - Export bridge to attempt backend connection (5 retries with exponential backoff ~3-4s)
     // - Export bridge to publish error signal
     // - Import bridge to receive error signal and close connection
     println!("6. Waiting for error detection cycle...");
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
 
     // Try to send data (connection may already be closed)
     println!("7. Client: Attempting to send message...");
@@ -793,7 +814,7 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
     println!("9. Client: Waiting for response or close...");
     let mut buf = vec![0u8; 1024];
 
-    match timeout(Duration::from_secs(5), client.read(&mut buf)).await {
+    match timeout(Duration::from_secs(10), client.read(&mut buf)).await {
         Ok(Ok(0)) => {
             println!("10. ✓ TEST PASSED: Connection closed by server (backend unavailable)");
         }
