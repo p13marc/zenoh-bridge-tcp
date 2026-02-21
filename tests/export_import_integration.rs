@@ -94,7 +94,10 @@ async fn test_export_import_basic_communication() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for import bridge to start listening
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
     println!("10. Import bridge started");
 
     // Step 4: Connect a client to the import bridge
@@ -258,7 +261,9 @@ async fn test_multiple_clients_separate_connections() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect first client
     println!("8. Client 1: Connecting...");
@@ -421,7 +426,9 @@ async fn test_connection_close_propagation() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect client
     println!("9. Client: Connecting...");
@@ -533,7 +540,9 @@ async fn test_connection_basic() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect and send message
     println!("7. Client: Connecting...");
@@ -636,7 +645,9 @@ async fn test_bidirectional_data_flow() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect client and test echo
     println!("7. Client: Connecting...");
@@ -736,7 +747,9 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect client
     println!("4. Client: Connecting...");
@@ -862,7 +875,9 @@ async fn test_rapid_connect_disconnect() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     println!("2. Bridges started, beginning rapid connection test...");
 
@@ -1005,7 +1020,9 @@ async fn test_concurrent_connections() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     println!("2. Bridges started, connecting 5 concurrent clients...");
 
@@ -1125,7 +1142,9 @@ async fn test_large_message_transfer() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect client
     println!("3. Client: Connecting...");
@@ -1258,7 +1277,9 @@ async fn test_rapid_data_send() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     // Connect client
     println!("3. Client: Connecting...");
@@ -1338,7 +1359,9 @@ async fn test_backend_restart_recovery() -> Result<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
 
     println!("2. Bridges started (no backend yet)");
 
