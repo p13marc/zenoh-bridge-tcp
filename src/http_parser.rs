@@ -116,7 +116,7 @@ fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
 
             Ok(Some(ParsedHttpRequest {
                 dns,
-                buffer: buffer[..body_offset].to_vec(),
+                buffer: buffer.to_vec(),
             }))
         }
         Ok(httparse::Status::Partial) => {
@@ -447,7 +447,32 @@ mod tests {
 
         let parsed = result.unwrap();
         assert_eq!(parsed.dns, "api.example.com");
-        // Buffer should only contain headers, not body
+        // Buffer should contain headers AND any body bytes already read
+        let body_marker = parsed
+            .buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("should contain header terminator");
+        assert!(
+            parsed.buffer.len() > body_marker + 4,
+            "Buffer should include body bytes that were already read"
+        );
+        assert!(
+            String::from_utf8_lossy(&parsed.buffer).contains("Hello, World!"),
+            "Buffer should contain the POST body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_get_no_body() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(request);
+
+        let result = parse_http_request(&mut cursor).await;
+        assert!(result.is_ok());
+
+        let parsed = result.unwrap();
+        // GET request buffer should end at headers since there's no body
         assert!(parsed.buffer.ends_with(b"\r\n\r\n"));
     }
 
