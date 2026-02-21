@@ -38,23 +38,21 @@ pub fn parse_response_headers(buffer: &[u8]) -> Result<Option<(usize, ResponseBo
 
             // Check Transfer-Encoding
             for header in response.headers.iter() {
-                if header.name.eq_ignore_ascii_case("transfer-encoding") {
-                    if let Ok(value) = std::str::from_utf8(header.value) {
-                        if value.to_lowercase().contains("chunked") {
-                            return Ok(Some((header_len, ResponseBodyFraming::Chunked)));
-                        }
-                    }
+                if header.name.eq_ignore_ascii_case("transfer-encoding")
+                    && let Ok(value) = std::str::from_utf8(header.value)
+                    && value.to_lowercase().contains("chunked")
+                {
+                    return Ok(Some((header_len, ResponseBodyFraming::Chunked)));
                 }
             }
 
             // Check Content-Length
             for header in response.headers.iter() {
-                if header.name.eq_ignore_ascii_case("content-length") {
-                    if let Ok(value) = std::str::from_utf8(header.value) {
-                        if let Ok(len) = value.trim().parse::<usize>() {
-                            return Ok(Some((header_len, ResponseBodyFraming::ContentLength(len))));
-                        }
-                    }
+                if header.name.eq_ignore_ascii_case("content-length")
+                    && let Ok(value) = std::str::from_utf8(header.value)
+                    && let Ok(len) = value.trim().parse::<usize>()
+                {
+                    return Ok(Some((header_len, ResponseBodyFraming::ContentLength(len))));
                 }
             }
 
@@ -76,12 +74,11 @@ pub fn is_connection_close(buffer: &[u8]) -> bool {
 
     if let Ok(httparse::Status::Complete(_)) = response.parse(buffer) {
         for header in response.headers.iter() {
-            if header.name.eq_ignore_ascii_case("connection") {
-                if let Ok(value) = std::str::from_utf8(header.value) {
-                    if value.to_lowercase().contains("close") {
-                        return true;
-                    }
-                }
+            if header.name.eq_ignore_ascii_case("connection")
+                && let Ok(value) = std::str::from_utf8(header.value)
+                && value.to_lowercase().contains("close")
+            {
+                return true;
             }
         }
     }
