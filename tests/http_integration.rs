@@ -23,17 +23,17 @@
 #[cfg(test)]
 mod http_tests {
     use axum::{
+        Router,
         extract::Path,
         http::StatusCode,
         response::Json,
         routing::{get, post},
-        Router,
     };
     use http_body_util::{BodyExt, Empty};
     use hyper::body::Bytes;
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
-    use rcgen::{generate_simple_self_signed, CertifiedKey};
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use serde::{Deserialize, Serialize};
     use std::net::SocketAddr;
@@ -236,13 +236,15 @@ mod http_tests {
 
                 tokio::spawn(async move {
                     if let Ok(mut stream) = TcpStream::connect(backend_addr).await
-                        && stream.write_all(&payload).await.is_ok() {
-                            let mut buffer = vec![0u8; 65536];
-                            if let Ok(n) = stream.read(&mut buffer).await
-                                && n > 0 {
-                                    let _ = session.put(&pub_key, &buffer[..n]).await;
-                                }
+                        && stream.write_all(&payload).await.is_ok()
+                    {
+                        let mut buffer = vec![0u8; 65536];
+                        if let Ok(n) = stream.read(&mut buffer).await
+                            && n > 0
+                        {
+                            let _ = session.put(&pub_key, &buffer[..n]).await;
                         }
+                    }
                 });
             }
         });
@@ -549,5 +551,4 @@ mod http_tests {
 
         println!("\n✅ SUCCESS: Multiple HTTP requests work through bridge!");
     }
-
 }

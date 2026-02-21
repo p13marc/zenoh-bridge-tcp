@@ -147,7 +147,9 @@ async fn main() -> Result<()> {
         spawn_bridge_tasks(&mut tasks, &args.export, "export", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
-                async move { export::run_export_mode(session, &spec, buffer_size, drain_timeout, token).await }
+                async move {
+                    export::run_export_mode(session, &spec, buffer_size, drain_timeout, token).await
+                }
             }
         });
     }
@@ -158,7 +160,9 @@ async fn main() -> Result<()> {
         spawn_bridge_tasks(&mut tasks, &args.import, "import", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
-                async move { import::run_import_mode(session, &spec, buffer_size, drain_timeout, token).await }
+                async move {
+                    import::run_import_mode(session, &spec, buffer_size, drain_timeout, token).await
+                }
             }
         });
     }
@@ -175,7 +179,14 @@ async fn main() -> Result<()> {
                 move |spec, token| {
                     let session = session.clone();
                     async move {
-                        export::run_http_export_mode(session, &spec, buffer_size, drain_timeout, token).await
+                        export::run_http_export_mode(
+                            session,
+                            &spec,
+                            buffer_size,
+                            drain_timeout,
+                            token,
+                        )
+                        .await
                     }
                 }
             },
@@ -194,7 +205,14 @@ async fn main() -> Result<()> {
                 move |spec, token| {
                     let session = session.clone();
                     async move {
-                        import::run_http_import_mode(session, &spec, buffer_size, drain_timeout, token).await
+                        import::run_http_import_mode(
+                            session,
+                            &spec,
+                            buffer_size,
+                            drain_timeout,
+                            token,
+                        )
+                        .await
                     }
                 }
             },
@@ -204,35 +222,23 @@ async fn main() -> Result<()> {
     // WebSocket export tasks
     {
         let session = session.clone();
-        spawn_bridge_tasks(
-            &mut tasks,
-            &args.ws_export,
-            "ws_export",
-            &shutdown_token,
-            {
-                move |spec, token| {
-                    let session = session.clone();
-                    async move { export::run_ws_export_mode(session, &spec, drain_timeout, token).await }
-                }
-            },
-        );
+        spawn_bridge_tasks(&mut tasks, &args.ws_export, "ws_export", &shutdown_token, {
+            move |spec, token| {
+                let session = session.clone();
+                async move { export::run_ws_export_mode(session, &spec, drain_timeout, token).await }
+            }
+        });
     }
 
     // WebSocket import tasks
     {
         let session = session.clone();
-        spawn_bridge_tasks(
-            &mut tasks,
-            &args.ws_import,
-            "ws_import",
-            &shutdown_token,
-            {
-                move |spec, token| {
-                    let session = session.clone();
-                    async move { import::run_ws_import_mode(session, &spec, token).await }
-                }
-            },
-        );
+        spawn_bridge_tasks(&mut tasks, &args.ws_import, "ws_import", &shutdown_token, {
+            move |spec, token| {
+                let session = session.clone();
+                async move { import::run_ws_import_mode(session, &spec, token).await }
+            }
+        });
     }
 
     // Auto-detecting import tasks
@@ -247,7 +253,14 @@ async fn main() -> Result<()> {
                 move |spec, token| {
                     let session = session.clone();
                     async move {
-                        import::run_auto_import_mode(session, &spec, buffer_size, drain_timeout, token).await
+                        import::run_auto_import_mode(
+                            session,
+                            &spec,
+                            buffer_size,
+                            drain_timeout,
+                            token,
+                        )
+                        .await
                     }
                 }
             },

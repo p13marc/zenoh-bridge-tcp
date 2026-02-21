@@ -135,7 +135,10 @@ fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
             // Need more data
             Ok(None)
         }
-        Err(e) => Err(BridgeError::HttpParse(format!("Invalid HTTP request: {}", e))),
+        Err(e) => Err(BridgeError::HttpParse(format!(
+            "Invalid HTTP request: {}",
+            e
+        ))),
     }
 }
 
@@ -158,15 +161,16 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
 
     // HTTP/1.0 might use absolute URI: GET http://example.com/path HTTP/1.0
     if let Some(path) = req.path
-        && let Some(host) = extract_host_from_absolute_uri(path) {
-            let normalized = normalize_dns(host);
-            if normalized.is_empty() {
-                return Err(BridgeError::HttpParse(
-                    "Host is empty in absolute URI".to_string(),
-                ));
-            }
-            return Ok(normalized);
+        && let Some(host) = extract_host_from_absolute_uri(path)
+    {
+        let normalized = normalize_dns(host);
+        if normalized.is_empty() {
+            return Err(BridgeError::HttpParse(
+                "Host is empty in absolute URI".to_string(),
+            ));
         }
+        return Ok(normalized);
+    }
 
     // No Host header found
     warn!("HTTP request missing Host header");
@@ -560,7 +564,10 @@ mod tests {
         let parts: Vec<&str> = response_str.split("\r\n").collect();
         for (i, part) in parts.iter().enumerate() {
             if i == 0 {
-                assert!(part.starts_with("HTTP/1.1"), "Status line should start with HTTP/1.1");
+                assert!(
+                    part.starts_with("HTTP/1.1"),
+                    "Status line should start with HTTP/1.1"
+                );
             } else if !part.is_empty() {
                 assert!(
                     !part.starts_with(' '),
@@ -571,7 +578,9 @@ mod tests {
         }
 
         // Verify Content-Length matches actual body
-        let header_end = response_str.find("\r\n\r\n").expect("should have header terminator");
+        let header_end = response_str
+            .find("\r\n\r\n")
+            .expect("should have header terminator");
         let body = &response_str[header_end + 4..];
         let expected_cl = format!("Content-Length: {}\r\n", body.len());
         assert!(
@@ -593,7 +602,10 @@ mod tests {
         let parts: Vec<&str> = response_str.split("\r\n").collect();
         for (i, part) in parts.iter().enumerate() {
             if i == 0 {
-                assert!(part.starts_with("HTTP/1.1"), "Status line should start with HTTP/1.1");
+                assert!(
+                    part.starts_with("HTTP/1.1"),
+                    "Status line should start with HTTP/1.1"
+                );
             } else if !part.is_empty() {
                 assert!(
                     !part.starts_with(' '),
@@ -604,7 +616,9 @@ mod tests {
         }
 
         // Verify Content-Length matches actual body
-        let header_end = response_str.find("\r\n\r\n").expect("should have header terminator");
+        let header_end = response_str
+            .find("\r\n\r\n")
+            .expect("should have header terminator");
         let body = &response_str[header_end + 4..];
         let expected_cl = format!("Content-Length: {}\r\n", body.len());
         assert!(

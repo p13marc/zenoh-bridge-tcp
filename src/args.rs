@@ -142,9 +142,7 @@ impl Args {
         }
 
         #[cfg(feature = "tls-termination")]
-        if !self.https_terminate.is_empty()
-            && (self.tls_cert.is_none() || self.tls_key.is_none())
-        {
+        if !self.https_terminate.is_empty() && (self.tls_cert.is_none() || self.tls_key.is_none()) {
             return Err(anyhow::anyhow!(
                 "--https-terminate requires both --tls-cert and --tls-key"
             ));

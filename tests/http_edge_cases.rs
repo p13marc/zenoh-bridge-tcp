@@ -3,7 +3,7 @@
 //! This test suite validates error handling, edge cases, and boundary conditions
 //! for the HTTP routing feature.
 
-use axum::{http::StatusCode, response::Json, routing::get, Router};
+use axum::{Router, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;

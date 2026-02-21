@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 
 /// Test basic export/import communication through the bridge
@@ -510,11 +510,12 @@ async fn test_connection_basic() -> Result<()> {
 
         let mut buffer = vec![0u8; 1024];
         if let Ok(n) = stream.read(&mut buffer).await
-            && n > 0 {
-                println!("3. Backend: Received {} bytes", n);
-                let _ = stream.write_all(b"Response\n").await;
-                println!("4. Backend: Sent response");
-            }
+            && n > 0
+        {
+            println!("3. Backend: Received {} bytes", n);
+            let _ = stream.write_all(b"Response\n").await;
+            println!("4. Backend: Sent response");
+        }
         // Don't wait for close - just exit
     });
 
@@ -1401,10 +1402,11 @@ async fn test_backend_restart_recovery() -> Result<()> {
             println!("   Backend: Connection accepted");
             let mut buf = vec![0u8; 1024];
             if let Ok(n) = stream.read(&mut buf).await
-                && n > 0 {
-                    let _ = stream.write_all(b"backend_ok\n").await;
-                    return true;
-                }
+                && n > 0
+            {
+                let _ = stream.write_all(b"backend_ok\n").await;
+                return true;
+            }
         }
         false
     });

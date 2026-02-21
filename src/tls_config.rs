@@ -53,10 +53,7 @@ pub fn load_tls_config<P1: AsRef<Path>, P2: AsRef<Path>>(
     let key = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No private key found in '{}'",
-                key_path.as_ref().display()
-            )
+            anyhow::anyhow!("No private key found in '{}'", key_path.as_ref().display())
         })?;
 
     let config = ServerConfig::builder()

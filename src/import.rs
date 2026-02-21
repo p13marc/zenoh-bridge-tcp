@@ -17,9 +17,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, info_span, warn, Instrument};
-use zenoh::key_expr::KeyExpr;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use zenoh::Session;
+use zenoh::key_expr::KeyExpr;
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
     MissDetectionConfig, RecoveryConfig,
@@ -55,8 +55,15 @@ pub async fn run_import_mode(
     drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(session, import_spec, false, buffer_size, drain_timeout, shutdown_token)
-        .await
+    run_import_mode_internal(
+        session,
+        import_spec,
+        false,
+        buffer_size,
+        drain_timeout,
+        shutdown_token,
+    )
+    .await
 }
 
 /// Run HTTP-aware import mode for a single service
@@ -73,8 +80,15 @@ pub async fn run_http_import_mode(
     drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(session, import_spec, true, buffer_size, drain_timeout, shutdown_token)
-        .await
+    run_import_mode_internal(
+        session,
+        import_spec,
+        true,
+        buffer_size,
+        drain_timeout,
+        shutdown_token,
+    )
+    .await
 }
 
 /// Internal implementation for both regular and HTTP import modes
@@ -462,7 +476,10 @@ where
         debug!("Client {}: Zenoh to TCP task completed", client_id_clone);
         // Explicitly undeclare subscriber before task exits
         if let Err(e) = subscriber.undeclare().await {
-            debug!("Client {}: Error undeclaring subscriber: {:?}", client_id_clone, e);
+            debug!(
+                "Client {}: Error undeclaring subscriber: {:?}",
+                client_id_clone, e
+            );
         }
     });
 
@@ -494,7 +511,10 @@ where
         }
         // Explicitly undeclare publisher before task exits
         if let Err(e) = publisher.undeclare().await {
-            debug!("Client {}: Error undeclaring publisher: {:?}", client_id_clone, e);
+            debug!(
+                "Client {}: Error undeclaring publisher: {:?}",
+                client_id_clone, e
+            );
         }
     });
 
@@ -533,7 +553,10 @@ where
 
     // Explicitly undeclare liveliness token
     if let Err(e) = liveliness_token.undeclare().await {
-        debug!("Client {}: Error undeclaring liveliness: {:?}", client_id, e);
+        debug!(
+            "Client {}: Error undeclaring liveliness: {:?}",
+            client_id, e
+        );
     }
 
     Ok(())
@@ -657,7 +680,9 @@ async fn handle_multiroute_connection(
 
         if !backend_available {
             warn!(request_id = %request_id, dns = %dns, "No backend available");
-            let _ = stream.write_all(&crate::http_parser::http_502_response(dns)).await;
+            let _ = stream
+                .write_all(&crate::http_parser::http_502_response(dns))
+                .await;
             // Don't close the persistent connection — client may retry with different Host
             continue;
         }
@@ -667,9 +692,10 @@ async fn handle_multiroute_connection(
         let dns_suffix = format!("/{}", dns);
 
         let tx_key = format!("{}{}/tx/{}", service_name, dns_suffix, sub_request_id);
-        let rx_key: KeyExpr<'static> = format!("{}{}/rx/{}", service_name, dns_suffix, sub_request_id)
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+        let rx_key: KeyExpr<'static> =
+            format!("{}{}/rx/{}", service_name, dns_suffix, sub_request_id)
+                .try_into()
+                .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
 
         // Declare liveliness for this sub-request (triggers export to connect to backend)
         let liveliness_key = format!("{}{}/clients/{}", service_name, dns_suffix, sub_request_id);
@@ -752,7 +778,9 @@ async fn handle_multiroute_connection(
                             response_complete = true;
                             break;
                         }
-                        crate::http_response_parser::ResponseBodyFraming::ContentLength(expected) => {
+                        crate::http_response_parser::ResponseBodyFraming::ContentLength(
+                            expected,
+                        ) => {
                             if body_received >= *expected {
                                 response_complete = true;
                                 break;
@@ -801,14 +829,16 @@ async fn handle_multiroute_connection(
             }
             Err(_) => {
                 warn!(request_id = %request_id, "Response timeout");
-                let _ = stream.write_all(&crate::http_parser::http_504_response()).await;
+                let _ = stream
+                    .write_all(&crate::http_parser::http_504_response())
+                    .await;
                 break;
             }
         }
 
         // 5. Check if we should keep the connection alive
-        let should_close = !response_complete
-            || crate::http_response_parser::is_connection_close(&response_buf);
+        let should_close =
+            !response_complete || crate::http_response_parser::is_connection_close(&response_buf);
 
         if should_close {
             debug!(request_id = %request_id, "Closing persistent connection");
@@ -1018,7 +1048,10 @@ async fn handle_ws_import_connection(
         );
         // Explicitly undeclare subscriber before task exits
         if let Err(e) = subscriber.undeclare().await {
-            debug!("WebSocket client {}: Error undeclaring subscriber: {:?}", client_id_clone, e);
+            debug!(
+                "WebSocket client {}: Error undeclaring subscriber: {:?}",
+                client_id_clone, e
+            );
         }
     });
 
@@ -1066,7 +1099,10 @@ async fn handle_ws_import_connection(
         }
         // Explicitly undeclare publisher before task exits
         if let Err(e) = publisher.undeclare().await {
-            debug!("WebSocket client {}: Error undeclaring publisher: {:?}", client_id_for_sender, e);
+            debug!(
+                "WebSocket client {}: Error undeclaring publisher: {:?}",
+                client_id_for_sender, e
+            );
         }
     });
 
@@ -1084,7 +1120,10 @@ async fn handle_ws_import_connection(
 
     // Explicitly undeclare liveliness token
     if let Err(e) = liveliness_token.undeclare().await {
-        debug!("WebSocket client {}: Error undeclaring liveliness: {:?}", client_id, e);
+        debug!(
+            "WebSocket client {}: Error undeclaring liveliness: {:?}",
+            client_id, e
+        );
     }
 
     Ok(())
@@ -1174,7 +1213,7 @@ async fn handle_auto_import_connection(
     buffer_size: usize,
     drain_timeout: Duration,
 ) -> Result<()> {
-    use crate::protocol_detect::{detect_protocol, DetectedProtocol};
+    use crate::protocol_detect::{DetectedProtocol, detect_protocol};
 
     // Peek at the first bytes to detect the protocol
     let mut peek_buf = vec![0u8; 16];
@@ -1195,17 +1234,41 @@ async fn handle_auto_import_connection(
         DetectedProtocol::Tls => {
             // Delegate to HTTP mode which already handles TLS detection
             // via is_tls_handshake + parse_tls_client_hello
-            handle_import_connection(session, stream, service_name, client_id, true, buffer_size, drain_timeout)
-                .await
+            handle_import_connection(
+                session,
+                stream,
+                service_name,
+                client_id,
+                true,
+                buffer_size,
+                drain_timeout,
+            )
+            .await
         }
         DetectedProtocol::Http => {
             // Could be regular HTTP or WebSocket upgrade
-            handle_auto_http_connection(session, stream, service_name, client_id, buffer_size, drain_timeout).await
+            handle_auto_http_connection(
+                session,
+                stream,
+                service_name,
+                client_id,
+                buffer_size,
+                drain_timeout,
+            )
+            .await
         }
         DetectedProtocol::RawTcp => {
             // Raw TCP passthrough — no DNS routing
-            handle_import_connection(session, stream, service_name, client_id, false, buffer_size, drain_timeout)
-                .await
+            handle_import_connection(
+                session,
+                stream,
+                service_name,
+                client_id,
+                false,
+                buffer_size,
+                drain_timeout,
+            )
+            .await
         }
     }
 }
@@ -1225,8 +1288,8 @@ async fn handle_auto_http_connection(
 
     if peek_len > 0 {
         let peek_lower = String::from_utf8_lossy(&peek_buf[..peek_len]).to_lowercase();
-        let looks_like_ws = peek_lower.contains("upgrade: websocket")
-            || peek_lower.contains("upgrade:websocket");
+        let looks_like_ws =
+            peek_lower.contains("upgrade: websocket") || peek_lower.contains("upgrade:websocket");
 
         if looks_like_ws {
             info!(client_id = %client_id, "Detected WebSocket upgrade request");
@@ -1248,7 +1311,16 @@ async fn handle_auto_http_connection(
     }
 
     // Regular HTTP — delegate to HTTP import handler
-    handle_import_connection(session, stream, service_name, client_id, true, buffer_size, drain_timeout).await
+    handle_import_connection(
+        session,
+        stream,
+        service_name,
+        client_id,
+        true,
+        buffer_size,
+        drain_timeout,
+    )
+    .await
 }
 
 /// Run HTTPS import mode with TLS termination.
@@ -1366,10 +1438,7 @@ async fn handle_tls_terminated_connection(
 
     // After TLS termination, we have plaintext HTTP. Parse Host header for routing.
     let parsed = parse_http_request(&mut tls_reader).await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to parse HTTP request after TLS termination: {}",
-            e
-        )
+        anyhow::anyhow!("Failed to parse HTTP request after TLS termination: {}", e)
     })?;
 
     let dns = parsed.dns.clone();
@@ -1394,10 +1463,7 @@ async fn handle_tls_terminated_connection(
     .unwrap_or(false);
 
     if !backend_available {
-        warn!(
-            "Client {}: No backend for DNS: {}",
-            client_id, dns
-        );
+        warn!("Client {}: No backend for DNS: {}", client_id, dns);
         return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
     }
 

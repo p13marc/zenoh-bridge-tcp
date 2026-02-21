@@ -3,7 +3,7 @@
 //! This test suite validates DNS-based routing with multiple HTTP backends.
 //! Tests the complete flow: HTTP client -> Import bridge -> Zenoh -> Export bridge -> Backend
 
-use axum::{extract::Path as AxumPath, http::StatusCode, response::Json, routing::get, Router};
+use axum::{Router, extract::Path as AxumPath, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;

@@ -3,8 +3,8 @@
 //! This test suite validates DNS-based routing with HTTPS backends using SNI extraction.
 //! Tests the complete flow: HTTPS client -> Import bridge -> Zenoh -> Export bridge -> HTTPS Backend
 
-use axum::{extract::Path as AxumPath, http::StatusCode, response::Json, routing::get, Router};
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use axum::{Router, extract::Path as AxumPath, http::StatusCode, response::Json, routing::get};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;

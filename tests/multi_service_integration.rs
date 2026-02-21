@@ -432,25 +432,20 @@ async fn simulate_export_mode(
                             let service_name = service_name.to_string();
                             let client_id_clone = client_id.clone();
 
-                            let (cancel_tx, mut cancel_rx) =
-                                tokio::sync::mpsc::channel::<()>(1);
+                            let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
 
                             let handle = tokio::spawn(async move {
-                                let sub_key =
-                                    format!("{}/tx/{}", service_name, client_id_clone);
-                                let pub_key =
-                                    format!("{}/rx/{}", service_name, client_id_clone);
+                                let sub_key = format!("{}/tx/{}", service_name, client_id_clone);
+                                let pub_key = format!("{}/rx/{}", service_name, client_id_clone);
 
-                                let subscriber = match session_clone
-                                    .declare_subscriber(&sub_key)
-                                    .await
-                                {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        warn!("Failed to subscribe: {:?}", e);
-                                        return;
-                                    }
-                                };
+                                let subscriber =
+                                    match session_clone.declare_subscriber(&sub_key).await {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            warn!("Failed to subscribe: {:?}", e);
+                                            return;
+                                        }
+                                    };
 
                                 let session_for_pub = session_clone.clone();
 
@@ -472,11 +467,7 @@ async fn simulate_export_mode(
                                 let mut zenoh_to_backend = tokio::spawn(async move {
                                     while let Ok(sample) = subscriber.recv_async().await {
                                         let payload = sample.payload().to_bytes();
-                                        if backend_writer
-                                            .write_all(&payload)
-                                            .await
-                                            .is_err()
-                                        {
+                                        if backend_writer.write_all(&payload).await.is_err() {
                                             break;
                                         }
                                     }
@@ -498,10 +489,7 @@ async fn simulate_export_mode(
                                 .insert(client_id, (cancel_tx, handle));
                         }
                         Err(e) => {
-                            warn!(
-                                "Export simulation: failed to connect to backend: {:?}",
-                                e
-                            );
+                            warn!("Export simulation: failed to connect to backend: {:?}", e);
                         }
                     }
                 }

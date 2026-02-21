@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, info_span, warn, Instrument};
-use zenoh::key_expr::KeyExpr;
+use tracing::{Instrument, debug, error, info, info_span, warn};
 use zenoh::Session;
+use zenoh::key_expr::KeyExpr;
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
     MissDetectionConfig, RecoveryConfig,
@@ -78,8 +78,15 @@ pub async fn run_export_mode(
     drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_export_mode_internal(session, export_spec, None, buffer_size, drain_timeout, shutdown_token)
-        .await
+    run_export_mode_internal(
+        session,
+        export_spec,
+        None,
+        buffer_size,
+        drain_timeout,
+        shutdown_token,
+    )
+    .await
 }
 
 /// Run HTTP-aware export mode for a single service with DNS-based routing
@@ -445,7 +452,10 @@ async fn handle_client_bridge(
         }
         // Explicitly undeclare publisher before task exits
         if let Err(e) = publisher.undeclare().await {
-            debug!("Error undeclaring publisher for {}: {:?}", client_id_for_reader, e);
+            debug!(
+                "Error undeclaring publisher for {}: {:?}",
+                client_id_for_reader, e
+            );
         }
     });
 
@@ -479,7 +489,10 @@ async fn handle_client_bridge(
         }
         // Explicitly undeclare subscriber before task exits
         if let Err(e) = subscriber.undeclare().await {
-            debug!("Error undeclaring subscriber for {}: {:?}", client_id_for_writer, e);
+            debug!(
+                "Error undeclaring subscriber for {}: {:?}",
+                client_id_for_writer, e
+            );
         }
     });
 
@@ -549,13 +562,13 @@ async fn handle_client_disconnect(
                 info!("  Backend connection drained and closed for: {}", client_id);
             }
             Ok(Err(e)) => {
-                warn!("  Backend connection task error during drain for {}: {:?}", client_id, e);
+                warn!(
+                    "  Backend connection task error during drain for {}: {:?}",
+                    client_id, e
+                );
             }
             Err(_) => {
-                warn!(
-                    "  Drain timeout for backend connection: {}",
-                    client_id
-                );
+                warn!("  Drain timeout for backend connection: {}", client_id);
             }
         }
     }
@@ -721,22 +734,22 @@ async fn handle_ws_client_connect(
         let url = ws_url_owned.clone();
         async move { connect_async(&url).await }
     })
-        .retry(
-            ExponentialBuilder::default()
-                .with_min_delay(Duration::from_millis(100))
-                .with_max_delay(Duration::from_secs(5))
-                .with_max_times(5),
-        )
-        .notify(move |err, dur| {
-            warn!(
-                client_id = %client_id_for_log,
-                ws_url = %ws_url_for_log,
-                error = %err,
-                retry_in = ?dur,
-                "WebSocket backend connection failed, retrying"
-            );
-        })
-        .await;
+    .retry(
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(5))
+            .with_max_times(5),
+    )
+    .notify(move |err, dur| {
+        warn!(
+            client_id = %client_id_for_log,
+            ws_url = %ws_url_for_log,
+            error = %err,
+            retry_in = ?dur,
+            "WebSocket backend connection failed, retrying"
+        );
+    })
+    .await;
 
     match connect_result {
         Ok((ws_stream, _response)) => {
@@ -904,7 +917,10 @@ async fn handle_ws_client_bridge(
         }
         // Explicitly undeclare publisher before task exits
         if let Err(e) = publisher.undeclare().await {
-            debug!("Error undeclaring WS publisher for {}: {:?}", client_id_for_receiver, e);
+            debug!(
+                "Error undeclaring WS publisher for {}: {:?}",
+                client_id_for_receiver, e
+            );
         }
     });
 
@@ -941,7 +957,10 @@ async fn handle_ws_client_bridge(
         }
         // Explicitly undeclare subscriber before task exits
         if let Err(e) = subscriber.undeclare().await {
-            debug!("Error undeclaring WS subscriber for {}: {:?}", client_id_for_sender, e);
+            debug!(
+                "Error undeclaring WS subscriber for {}: {:?}",
+                client_id_for_sender, e
+            );
         }
     });
 
@@ -1120,7 +1139,10 @@ mod tests {
     fn test_parse_export_spec_with_wildcards() {
         // Zenoh wildcards in service names: parsing succeeds but usage would be invalid
         let result = parse_export_spec("my*service/127.0.0.1:8080");
-        assert!(result.is_ok(), "Parser accepts wildcards (validation is at Zenoh level)");
+        assert!(
+            result.is_ok(),
+            "Parser accepts wildcards (validation is at Zenoh level)"
+        );
     }
 
     #[test]

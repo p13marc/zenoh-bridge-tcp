@@ -191,22 +191,19 @@ mod tests {
 
     #[test]
     fn test_connection_close_detected() {
-        let response =
-            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK";
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK";
         assert!(is_connection_close(response));
     }
 
     #[test]
     fn test_connection_keep_alive() {
-        let response =
-            b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
+        let response = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 2\r\n\r\nOK";
         assert!(!is_connection_close(response));
     }
 
     #[test]
     fn test_connection_close_case_insensitive() {
-        let response =
-            b"HTTP/1.1 200 OK\r\nconnection: Close\r\nContent-Length: 2\r\n\r\nOK";
+        let response = b"HTTP/1.1 200 OK\r\nconnection: Close\r\nContent-Length: 2\r\n\r\nOK";
         assert!(is_connection_close(response));
     }
 

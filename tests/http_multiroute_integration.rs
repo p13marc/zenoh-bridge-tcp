@@ -3,7 +3,7 @@
 //! Tests per-request Host-header routing where a single persistent TCP
 //! connection can reach different backends based on Host header per request.
 
-use axum::{response::Json, routing::get, Router};
+use axum::{Router, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,10 +45,7 @@ async fn start_backend(backend_id: &str) -> SocketAddr {
 /// Send a raw HTTP/1.1 request on an existing TCP stream and read the response.
 /// Returns the full response as a string.
 async fn http_request(stream: &mut tokio::net::TcpStream, host: &str) -> String {
-    let request = format!(
-        "GET / HTTP/1.1\r\nHost: {}\r\n\r\n",
-        host
-    );
+    let request = format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", host);
     stream.write_all(request.as_bytes()).await.unwrap();
 
     // Read response — we expect small JSON responses, read in a loop until we
@@ -75,13 +72,7 @@ async fn http_request(stream: &mut tokio::net::TcpStream, host: &str) -> String 
                 .lines()
                 .find(|l| l.to_lowercase().starts_with("content-length:"))
             {
-                let cl: usize = cl_line
-                    .split(':')
-                    .nth(1)
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap();
+                let cl: usize = cl_line.split(':').nth(1).unwrap().trim().parse().unwrap();
                 let body_start = header_end + 4;
                 if response.len() >= body_start + cl {
                     break;
@@ -188,18 +179,30 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let t1 = shutdown_token.child_token();
     let spec_a = format!("{}/host-a.test/{}", service, backend_a_addr);
     let export_a = tokio::spawn(async move {
-        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec_a, 65536, Duration::from_secs(5), t1)
-            .await
-            .unwrap();
+        zenoh_bridge_tcp::export::run_http_export_mode(
+            s1,
+            &spec_a,
+            65536,
+            Duration::from_secs(5),
+            t1,
+        )
+        .await
+        .unwrap();
     });
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
     let spec_b = format!("{}/host-b.test/{}", service, backend_b_addr);
     let export_b = tokio::spawn(async move {
-        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec_b, 65536, Duration::from_secs(5), t1)
-            .await
-            .unwrap();
+        zenoh_bridge_tcp::export::run_http_export_mode(
+            s1,
+            &spec_b,
+            65536,
+            Duration::from_secs(5),
+            t1,
+        )
+        .await
+        .unwrap();
     });
 
     sleep(Duration::from_millis(500)).await;
@@ -284,9 +287,15 @@ async fn test_multiroute_unavailable_host_returns_502() {
     let t1 = shutdown_token.child_token();
     let spec = format!("{}/host-a.test/{}", service, backend_addr);
     let export_task = tokio::spawn(async move {
-        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, 65536, Duration::from_secs(5), t1)
-            .await
-            .unwrap();
+        zenoh_bridge_tcp::export::run_http_export_mode(
+            s1,
+            &spec,
+            65536,
+            Duration::from_secs(5),
+            t1,
+        )
+        .await
+        .unwrap();
     });
 
     sleep(Duration::from_millis(500)).await;

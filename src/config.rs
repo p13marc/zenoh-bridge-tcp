@@ -45,11 +45,7 @@ impl Default for BridgeConfig {
 
 impl BridgeConfig {
     /// Create a new BridgeConfig with custom values.
-    pub fn new(
-        buffer_size: usize,
-        read_timeout_secs: u64,
-        drain_timeout_secs: u64,
-    ) -> Self {
+    pub fn new(buffer_size: usize, read_timeout_secs: u64, drain_timeout_secs: u64) -> Self {
         Self {
             buffer_size,
             read_timeout: Duration::from_secs(read_timeout_secs),

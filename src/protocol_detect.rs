@@ -17,7 +17,14 @@ pub enum DetectedProtocol {
 /// WebSocket is detected as Http first, then distinguished during HTTP parsing
 /// by the presence of the `Upgrade: websocket` header.
 const HTTP_METHODS: &[&[u8]] = &[
-    b"GET ", b"POST ", b"PUT ", b"DELETE ", b"HEAD ", b"OPTIONS ", b"PATCH ", b"CONNECT ",
+    b"GET ",
+    b"POST ",
+    b"PUT ",
+    b"DELETE ",
+    b"HEAD ",
+    b"OPTIONS ",
+    b"PATCH ",
+    b"CONNECT ",
     b"TRACE ",
 ];
 
@@ -104,10 +111,7 @@ mod tests {
             detect_protocol(b"\x00\x01\x02\x03"),
             DetectedProtocol::RawTcp
         );
-        assert_eq!(
-            detect_protocol(b"HELLO server"),
-            DetectedProtocol::RawTcp
-        );
+        assert_eq!(detect_protocol(b"HELLO server"), DetectedProtocol::RawTcp);
         assert_eq!(
             detect_protocol(b"SSH-2.0-OpenSSH"),
             DetectedProtocol::RawTcp

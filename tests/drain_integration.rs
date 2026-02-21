@@ -268,8 +268,7 @@ async fn test_drain_timeout_enforced() -> Result<()> {
     let export_spec = format!("{}/{}", service, backend_addr);
     println!("2. Starting export bridge with --drain-timeout 2");
 
-    let export_bridge =
-        spawn_bridge(&["--export", &export_spec, "--drain-timeout", "2"]).await;
+    let export_bridge = spawn_bridge(&["--export", &export_spec, "--drain-timeout", "2"]).await;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -281,8 +280,7 @@ async fn test_drain_timeout_enforced() -> Result<()> {
     let import_spec = format!("{}/{}", service, import_addr);
     println!("3. Starting import bridge with --drain-timeout 2");
 
-    let import_bridge =
-        spawn_bridge(&["--import", &import_spec, "--drain-timeout", "2"]).await;
+    let import_bridge = spawn_bridge(&["--import", &import_spec, "--drain-timeout", "2"]).await;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await

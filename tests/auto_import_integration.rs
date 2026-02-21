@@ -90,7 +90,8 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
         Ok(Ok(n)) if n > 0 => {
             println!("10. Client: Received {} bytes", n);
             assert_eq!(
-                &buf[..n], message,
+                &buf[..n],
+                message,
                 "Echo response should match sent message"
             );
             println!("11. TEST PASSED: Auto-import handled raw TCP correctly");

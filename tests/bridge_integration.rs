@@ -142,10 +142,7 @@ fn test_invalid_connection() {
     );
 
     // Connection should fail or timeout (port 65534 is unlikely to be open)
-    assert!(
-        result.is_err(),
-        "Expected connection to port 65534 to fail"
-    );
+    assert!(result.is_err(), "Expected connection to port 65534 to fail");
 }
 
 /// Test concurrent connections
@@ -189,9 +186,10 @@ fn test_concurrent_connections() {
     let mut success_count = 0;
     for handle in handles {
         if let Ok(response) = handle.join()
-            && !response.is_empty() {
-                success_count += 1;
-            }
+            && !response.is_empty()
+        {
+            success_count += 1;
+        }
     }
 
     assert!(

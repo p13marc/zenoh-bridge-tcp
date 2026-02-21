@@ -4540,6 +4540,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
