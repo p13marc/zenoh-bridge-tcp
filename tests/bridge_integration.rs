@@ -141,10 +141,10 @@ fn test_invalid_connection() {
         Duration::from_millis(100),
     );
 
-    // Connection should fail or timeout
+    // Connection should fail or timeout (port 65534 is unlikely to be open)
     assert!(
-        result.is_err() || result.is_ok(),
-        "Connection attempt handled"
+        result.is_err(),
+        "Expected connection to port 65534 to fail"
     );
 }
 
@@ -266,11 +266,10 @@ fn test_connection_refused() {
     // Try to connect to a closed port
     let result = TcpStream::connect("127.0.0.1:1");
 
-    // Should fail with connection refused (requires root to bind to port 1)
-    // or succeed if somehow the port is open
+    // Should fail with connection refused (port 1 requires root)
     assert!(
-        result.is_err() || result.is_ok(),
-        "Connection handled appropriately"
+        result.is_err(),
+        "Expected connection to port 1 to be refused"
     );
 }
 
