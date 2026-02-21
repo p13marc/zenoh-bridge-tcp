@@ -1046,4 +1046,29 @@ mod tests {
         let result = parse_ws_export_spec("/ws://example.com");
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_cancellation_token_propagation() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+
+        let task = tokio::spawn({
+            let child = child.clone();
+            async move {
+                child.cancelled().await;
+                true
+            }
+        });
+
+        // Child should not be cancelled yet
+        assert!(!child.is_cancelled());
+
+        // Cancel parent
+        parent.cancel();
+
+        // Child task should complete
+        let result = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().unwrap());
+    }
 }
