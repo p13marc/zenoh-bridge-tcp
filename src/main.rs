@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
     let ws_export_count = args.ws_export.len();
     let ws_import_count = args.ws_import.len();
     let auto_import_count = args.auto_import.len();
+    let http_multiroute_import_count = args.http_multiroute_import.len();
 
     let buffer_size = args.buffer_size;
     let drain_timeout = std::time::Duration::from_secs(args.drain_timeout);
@@ -253,6 +254,32 @@ async fn main() -> Result<()> {
         );
     }
 
+    // HTTP multiroute import tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(
+            &mut tasks,
+            &args.http_multiroute_import,
+            "http_multiroute_import",
+            &shutdown_token,
+            {
+                move |spec, token| {
+                    let session = session.clone();
+                    async move {
+                        import::run_http_multiroute_import_mode(
+                            session,
+                            &spec,
+                            buffer_size,
+                            drain_timeout,
+                            token,
+                        )
+                        .await
+                    }
+                }
+            },
+        );
+    }
+
     // HTTPS termination import tasks (feature-gated)
     #[cfg(feature = "tls-termination")]
     let https_terminate_count = args.https_terminate.len();
@@ -297,6 +324,7 @@ async fn main() -> Result<()> {
         ws_exports = ws_export_count,
         ws_imports = ws_import_count,
         auto_imports = auto_import_count,
+        http_multiroute_imports = http_multiroute_import_count,
         https_terminates = https_terminate_count,
         "All bridge tasks started"
     );
