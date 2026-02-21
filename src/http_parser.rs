@@ -103,7 +103,7 @@ fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
     let mut req = httparse::Request::new(&mut headers);
 
     match req.parse(buffer) {
-        Ok(httparse::Status::Complete(body_offset)) => {
+        Ok(httparse::Status::Complete(_body_offset)) => {
             // Successfully parsed headers
             let dns = extract_and_normalize_host(&req, buffer)?;
 

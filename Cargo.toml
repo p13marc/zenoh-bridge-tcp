@@ -27,6 +27,7 @@ tls-parser = "0.12"
 thiserror = "1"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tokio-stream = "0.1"

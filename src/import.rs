@@ -85,14 +85,11 @@ async fn run_import_mode_internal(
 
     info!(listen_addr = %listen_addr, service = %service_name, "Import bridge ready");
 
-    let mut connection_id = 0u64;
-
     // Accept connections
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                connection_id += 1;
-                let client_id = format!("client_{}", connection_id);
+                let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
                 info!(
                     client_id = %client_id,
                     remote_addr = %addr,
@@ -477,14 +474,11 @@ pub async fn run_ws_import_mode(session: Arc<Session>, import_spec: &str) -> Res
 
     info!(listen_addr = %listen_addr, service = %service_name, "WebSocket import bridge ready");
 
-    let mut connection_id = 0u64;
-
     // Accept connections
     loop {
         match listener.accept().await {
             Ok((stream, addr)) => {
-                connection_id += 1;
-                let client_id = format!("wsclient_{}", connection_id);
+                let client_id = format!("wsclient_{}", uuid::Uuid::new_v4().as_simple());
                 info!(client_id = %client_id, remote_addr = %addr, "New WebSocket connection");
 
                 let session = session.clone();
@@ -717,5 +711,16 @@ mod tests {
     fn test_parse_import_spec_too_many_parts() {
         let result = parse_import_spec("service/addr/extra");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_client_ids_are_unique() {
+        let id1 = format!("client_{}", uuid::Uuid::new_v4().as_simple());
+        let id2 = format!("client_{}", uuid::Uuid::new_v4().as_simple());
+        assert_ne!(id1, id2);
+        // Verify format is valid for Zenoh key expressions (no slashes, wildcards)
+        assert!(!id1.contains('/'));
+        assert!(!id1.contains('*'));
+        assert!(!id1.contains('?'));
     }
 }
