@@ -307,7 +307,7 @@ async fn handle_client_bridge(
         .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
     let publisher = session
         .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(10))
+        .cache(CacheConfig::default().max_samples(64))
         .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
         .publisher_detection()
         .await
@@ -654,7 +654,7 @@ async fn handle_ws_client_bridge(
         .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
     let publisher = session
         .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(10))
+        .cache(CacheConfig::default().max_samples(64))
         .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
         .publisher_detection()
         .await
