@@ -8,6 +8,7 @@ pub mod config;
 pub mod error;
 pub mod export;
 pub mod http_parser;
+pub mod http_response_parser;
 pub mod import;
 pub mod protocol_detect;
 pub mod tls_parser;
