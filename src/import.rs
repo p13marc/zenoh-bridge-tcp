@@ -52,9 +52,11 @@ pub async fn run_import_mode(
     session: Arc<Session>,
     import_spec: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(session, import_spec, false, buffer_size, shutdown_token).await
+    run_import_mode_internal(session, import_spec, false, buffer_size, drain_timeout, shutdown_token)
+        .await
 }
 
 /// Run HTTP-aware import mode for a single service
@@ -68,9 +70,11 @@ pub async fn run_http_import_mode(
     session: Arc<Session>,
     import_spec: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(session, import_spec, true, buffer_size, shutdown_token).await
+    run_import_mode_internal(session, import_spec, true, buffer_size, drain_timeout, shutdown_token)
+        .await
 }
 
 /// Internal implementation for both regular and HTTP import modes
@@ -79,6 +83,7 @@ async fn run_import_mode_internal(
     import_spec: &str,
     http_mode: bool,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
@@ -132,6 +137,7 @@ async fn run_import_mode_internal(
                                     &client_id_clone,
                                     http_mode,
                                     buffer_size,
+                                    drain_timeout,
                                 )
                                 .await
                                 {
@@ -173,6 +179,7 @@ async fn handle_import_connection(
     client_id: &str,
     http_mode: bool,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) -> Result<()> {
     // Parse HTTP/HTTPS request if in HTTP mode to extract DNS
     let (dns_suffix, initial_buffer) = if http_mode {
@@ -289,6 +296,7 @@ async fn handle_import_connection(
         &dns_suffix,
         initial_buffer,
         buffer_size,
+        drain_timeout,
     )
     .await
 }
@@ -307,6 +315,7 @@ async fn bridge_import_connection<R, W>(
     dns_suffix: &str,
     initial_buffer: Option<Vec<u8>>,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) -> Result<()>
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -503,10 +512,21 @@ where
         },
         error_result = &mut error_monitor => {
             if let Ok(true) = error_result {
-                error!("Client {}: Backend unavailable, closing connection", client_id);
-                // Abort both tasks to immediately close the TCP connection
-                zenoh_to_tcp.abort();
+                warn!("Client {}: Backend unavailable, draining remaining data", client_id);
+
+                // Stop sending to the dead backend
                 tcp_to_zenoh.abort();
+
+                // Give the zenoh_to_tcp task time to drain buffered samples
+                match tokio::time::timeout(drain_timeout, &mut zenoh_to_tcp).await {
+                    Ok(_) => {
+                        info!("Client {}: Drain completed", client_id);
+                    }
+                    Err(_) => {
+                        warn!("Client {}: Drain timed out after {:?}, aborting", client_id, drain_timeout);
+                        zenoh_to_tcp.abort();
+                    }
+                }
             }
         },
     }
@@ -786,6 +806,7 @@ pub async fn run_auto_import_mode(
     session: Arc<Session>,
     import_spec: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
@@ -827,7 +848,7 @@ pub async fn run_auto_import_mode(
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_auto_import_connection(
-                                session, stream, &service_name, &client_id, buffer_size,
+                                session, stream, &service_name, &client_id, buffer_size, drain_timeout,
                             ).await {
                                 error!(error = %e, "Connection error");
                             }
@@ -857,6 +878,7 @@ async fn handle_auto_import_connection(
     service_name: &str,
     client_id: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) -> Result<()> {
     use crate::protocol_detect::{detect_protocol, DetectedProtocol};
 
@@ -879,16 +901,16 @@ async fn handle_auto_import_connection(
         DetectedProtocol::Tls => {
             // Delegate to HTTP mode which already handles TLS detection
             // via is_tls_handshake + parse_tls_client_hello
-            handle_import_connection(session, stream, service_name, client_id, true, buffer_size)
+            handle_import_connection(session, stream, service_name, client_id, true, buffer_size, drain_timeout)
                 .await
         }
         DetectedProtocol::Http => {
             // Could be regular HTTP or WebSocket upgrade
-            handle_auto_http_connection(session, stream, service_name, client_id, buffer_size).await
+            handle_auto_http_connection(session, stream, service_name, client_id, buffer_size, drain_timeout).await
         }
         DetectedProtocol::RawTcp => {
             // Raw TCP passthrough — no DNS routing
-            handle_import_connection(session, stream, service_name, client_id, false, buffer_size)
+            handle_import_connection(session, stream, service_name, client_id, false, buffer_size, drain_timeout)
                 .await
         }
     }
@@ -901,6 +923,7 @@ async fn handle_auto_http_connection(
     service_name: &str,
     client_id: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) -> Result<()> {
     // Peek enough to detect "Upgrade: websocket" in headers
     let mut peek_buf = vec![0u8; 4096];
@@ -931,7 +954,7 @@ async fn handle_auto_http_connection(
     }
 
     // Regular HTTP — delegate to HTTP import handler
-    handle_import_connection(session, stream, service_name, client_id, true, buffer_size).await
+    handle_import_connection(session, stream, service_name, client_id, true, buffer_size, drain_timeout).await
 }
 
 /// Run HTTPS import mode with TLS termination.
@@ -950,6 +973,7 @@ pub async fn run_https_terminate_import_mode(
     import_spec: &str,
     tls_config: Arc<rustls::ServerConfig>,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     use tokio_rustls::TlsAcceptor;
@@ -1003,6 +1027,7 @@ pub async fn run_https_terminate_import_mode(
                                         &service_name,
                                         &client_id,
                                         buffer_size,
+                                        drain_timeout,
                                     ).await {
                                         error!(error = %e, "TLS connection error");
                                     }
@@ -1041,6 +1066,7 @@ async fn handle_tls_terminated_connection(
     service_name: &str,
     client_id: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) -> Result<()> {
     let (mut tls_reader, tls_writer) = tokio::io::split(tls_stream);
 
@@ -1094,6 +1120,7 @@ async fn handle_tls_terminated_connection(
         &dns_suffix,
         Some(parsed.buffer),
         buffer_size,
+        drain_timeout,
     )
     .await
 }

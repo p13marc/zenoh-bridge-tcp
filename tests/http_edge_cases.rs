@@ -77,6 +77,7 @@ async fn test_missing_host_header() {
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19101",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -94,6 +95,7 @@ async fn test_missing_host_header() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -171,6 +173,7 @@ async fn test_malformed_http_requests() {
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19102",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -188,6 +191,7 @@ async fn test_malformed_http_requests() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -272,6 +276,7 @@ async fn test_very_long_headers() {
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19103",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -289,6 +294,7 @@ async fn test_very_long_headers() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -384,6 +390,7 @@ async fn test_special_characters_in_hostname() {
             session1_clone,
             "http-service/my-api.example.com/127.0.0.1:19104",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -401,6 +408,7 @@ async fn test_special_characters_in_hostname() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -509,6 +517,7 @@ async fn test_http_methods() {
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19105",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -526,6 +535,7 @@ async fn test_http_methods() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -643,6 +653,7 @@ async fn test_connection_lifecycle() {
             session1_clone,
             "http-service/test.example.com/127.0.0.1:19106",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -660,6 +671,7 @@ async fn test_connection_lifecycle() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await

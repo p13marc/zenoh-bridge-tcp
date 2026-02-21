@@ -135,6 +135,7 @@ async fn test_https_routing_multiple_backends() {
             session1_clone,
             "https-service/api.secure.test/127.0.0.1:29001",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -148,6 +149,7 @@ async fn test_https_routing_multiple_backends() {
             session1_clone,
             "https-service/web.secure.test/127.0.0.1:29002",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -166,6 +168,7 @@ async fn test_https_routing_multiple_backends() {
             session2_clone,
             &format!("https-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -334,6 +337,7 @@ async fn test_https_routing_concurrent_clients() {
             session1_clone,
             "https-service/concurrent.secure.test/127.0.0.1:29003",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -351,6 +355,7 @@ async fn test_https_routing_concurrent_clients() {
             session2_clone,
             &format!("https-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -431,6 +436,7 @@ async fn test_https_backend_becomes_available() {
             session2_clone,
             &format!("https-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -467,6 +473,7 @@ async fn test_https_backend_becomes_available() {
             session1_clone,
             "https-service/delayed.secure.test/127.0.0.1:29004",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await

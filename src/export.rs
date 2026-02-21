@@ -75,9 +75,11 @@ pub async fn run_export_mode(
     session: Arc<Session>,
     export_spec: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_export_mode_internal(session, export_spec, None, buffer_size, shutdown_token).await
+    run_export_mode_internal(session, export_spec, None, buffer_size, drain_timeout, shutdown_token)
+        .await
 }
 
 /// Run HTTP-aware export mode for a single service with DNS-based routing
@@ -92,6 +94,7 @@ pub async fn run_http_export_mode(
     session: Arc<Session>,
     export_spec: &str,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, dns, backend_addr) = parse_http_export_spec(export_spec)?;
@@ -100,6 +103,7 @@ pub async fn run_http_export_mode(
         &format!("{}/{}", service_name, backend_addr),
         Some(dns),
         buffer_size,
+        drain_timeout,
         shutdown_token,
     )
     .await
@@ -111,6 +115,7 @@ async fn run_export_mode_internal(
     export_spec: &str,
     dns_suffix: Option<String>,
     buffer_size: usize,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, backend_addr) = parse_export_spec(export_spec)?;
@@ -182,6 +187,7 @@ async fn run_export_mode_internal(
                     &cancellation_senders,
                     dns_suffix.as_deref(),
                     buffer_size,
+                    drain_timeout,
                 )
                 .await;
             }
@@ -208,11 +214,12 @@ async fn run_export_mode_internal(
                                         &cancellation_senders,
                                         dns_suffix.as_deref(),
                                         buffer_size,
+                                        drain_timeout,
                                     )
                                     .await;
                                 }
                                 zenoh::sample::SampleKind::Delete => {
-                                    handle_client_disconnect(&client_id, &cancellation_senders).await;
+                                    handle_client_disconnect(&client_id, &cancellation_senders, drain_timeout).await;
                                 }
                             }
                         }
@@ -240,6 +247,7 @@ async fn run_export_mode_internal(
 }
 
 /// Handle a client connection event
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_connect(
     session: &Arc<Session>,
     service_name: &str,
@@ -248,6 +256,7 @@ async fn handle_client_connect(
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
     dns_suffix: Option<&str>,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) {
     info!(client_id = %client_id, "Client connected, connecting to backend");
 
@@ -306,6 +315,7 @@ async fn handle_client_connect(
                         cancel_rx,
                         dns_suffix_owned.as_deref(),
                         buffer_size,
+                        drain_timeout,
                     )
                     .await
                     {
@@ -349,6 +359,7 @@ async fn handle_client_bridge(
     mut cancel_rx: mpsc::Receiver<()>,
     dns_suffix: Option<&str>,
     buffer_size: usize,
+    drain_timeout: Duration,
 ) -> Result<()> {
     let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
     // Subscribe to messages from this specific client using AdvancedSubscriber
@@ -488,11 +499,22 @@ async fn handle_client_bridge(
         },
         _ = cancel_rx.recv() => {
             info!("Cancellation received for client: {}", client_id_for_final);
-            // Abort both tasks and wait for them to finish
-            backend_to_zenoh_handle.abort();
+
+            // Stop receiving from Zenoh (client is gone)
             zenoh_to_backend_handle.abort();
-            let _ = backend_to_zenoh_handle.await;
             let _ = zenoh_to_backend_handle.await;
+
+            // Let backend_to_zenoh drain its current read with a timeout
+            match tokio::time::timeout(drain_timeout, &mut backend_to_zenoh_handle).await {
+                Ok(_) => {
+                    debug!("Backend-to-Zenoh drained for client: {}", client_id_for_final);
+                }
+                Err(_) => {
+                    debug!("Backend-to-Zenoh drain timeout for client: {}", client_id_for_final);
+                    backend_to_zenoh_handle.abort();
+                    let _ = backend_to_zenoh_handle.await;
+                }
+            }
         },
     }
 
@@ -508,6 +530,7 @@ async fn handle_client_bridge(
 async fn handle_client_disconnect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    drain_timeout: Duration,
 ) {
     info!("Client disconnected: {}", client_id);
 
@@ -520,17 +543,20 @@ async fn handle_client_disconnect(
             client_id
         );
 
-        // Wait for the task to complete with a timeout
-        if tokio::time::timeout(std::time::Duration::from_secs(2), task_handle)
-            .await
-            .is_ok()
-        {
-            info!("  Backend connection closed for: {}", client_id);
-        } else {
-            warn!(
-                "  Timeout waiting for backend connection to close for: {}",
-                client_id
-            );
+        // Wait for the task to drain and complete with a timeout
+        match tokio::time::timeout(drain_timeout, task_handle).await {
+            Ok(Ok(())) => {
+                info!("  Backend connection drained and closed for: {}", client_id);
+            }
+            Ok(Err(e)) => {
+                warn!("  Backend connection task error during drain for {}: {:?}", client_id, e);
+            }
+            Err(_) => {
+                warn!(
+                    "  Drain timeout for backend connection: {}",
+                    client_id
+                );
+            }
         }
     }
 }
@@ -573,6 +599,7 @@ pub fn parse_ws_export_spec(export_spec: &str) -> Result<(String, String)> {
 pub async fn run_ws_export_mode(
     session: Arc<Session>,
     export_spec: &str,
+    drain_timeout: Duration,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, ws_url) = parse_ws_export_spec(export_spec)?;
@@ -618,6 +645,7 @@ pub async fn run_ws_export_mode(
                     &ws_url,
                     &client_id,
                     &cancellation_senders,
+                    drain_timeout,
                 )
                 .await;
             }
@@ -642,11 +670,12 @@ pub async fn run_ws_export_mode(
                                         &ws_url,
                                         &client_id,
                                         &cancellation_senders,
+                                        drain_timeout,
                                     )
                                     .await;
                                 }
                                 zenoh::sample::SampleKind::Delete => {
-                                    handle_client_disconnect(&client_id, &cancellation_senders).await;
+                                    handle_client_disconnect(&client_id, &cancellation_senders, drain_timeout).await;
                                 }
                             }
                         }
@@ -680,6 +709,7 @@ async fn handle_ws_client_connect(
     ws_url: &str,
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    drain_timeout: Duration,
 ) {
     info!(client_id = %client_id, "WebSocket client connected, connecting to backend");
 
@@ -739,6 +769,7 @@ async fn handle_ws_client_connect(
                         ws_sender,
                         ws_receiver,
                         cancel_rx,
+                        drain_timeout,
                     )
                     .await
                     {
@@ -783,6 +814,7 @@ async fn handle_ws_client_bridge(
         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
     >,
     mut cancel_rx: mpsc::Receiver<()>,
+    drain_timeout: Duration,
 ) -> Result<()> {
     // Subscribe to messages from this specific client
     let sub_key = format!("{}/tx/{}", service_name, client_id);
@@ -927,10 +959,22 @@ async fn handle_ws_client_bridge(
         },
         _ = cancel_rx.recv() => {
             info!("Cancellation received for WebSocket client: {}", client_id_for_final);
-            ws_to_zenoh_handle.abort();
+
+            // Stop receiving from Zenoh (client is gone)
             zenoh_to_ws_handle.abort();
-            let _ = ws_to_zenoh_handle.await;
             let _ = zenoh_to_ws_handle.await;
+
+            // Let ws_to_zenoh drain with timeout
+            match tokio::time::timeout(drain_timeout, &mut ws_to_zenoh_handle).await {
+                Ok(_) => {
+                    debug!("WS-to-Zenoh drained for client: {}", client_id_for_final);
+                }
+                Err(_) => {
+                    debug!("WS-to-Zenoh drain timeout for client: {}", client_id_for_final);
+                    ws_to_zenoh_handle.abort();
+                    let _ = ws_to_zenoh_handle.await;
+                }
+            }
         },
     }
 

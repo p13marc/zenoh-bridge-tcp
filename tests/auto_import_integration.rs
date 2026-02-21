@@ -27,11 +27,11 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
         println!("2. Backend: Connection accepted");
 
         let mut buffer = vec![0u8; 1024];
-        if let Ok(n) = stream.read(&mut buffer).await {
-            if n > 0 {
-                println!("3. Backend: Received {} bytes, echoing back", n);
-                let _ = stream.write_all(&buffer[..n]).await;
-            }
+        if let Ok(n) = stream.read(&mut buffer).await
+            && n > 0
+        {
+            println!("3. Backend: Received {} bytes, echoing back", n);
+            let _ = stream.write_all(&buffer[..n]).await;
         }
     });
 
@@ -134,16 +134,16 @@ async fn test_auto_import_http_detection() -> Result<()> {
         println!("2. Backend: Connection accepted");
 
         let mut buffer = vec![0u8; 4096];
-        if let Ok(n) = stream.read(&mut buffer).await {
-            if n > 0 {
-                let request = String::from_utf8_lossy(&buffer[..n]);
-                println!("3. Backend: Received HTTP request:\n{}", request);
+        if let Ok(n) = stream.read(&mut buffer).await
+            && n > 0
+        {
+            let request = String::from_utf8_lossy(&buffer[..n]);
+            println!("3. Backend: Received HTTP request:\n{}", request);
 
-                // Send HTTP response
-                let response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
-                let _ = stream.write_all(response.as_bytes()).await;
-                println!("4. Backend: Sent HTTP response");
-            }
+            // Send HTTP response
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
+            let _ = stream.write_all(response.as_bytes()).await;
+            println!("4. Backend: Sent HTTP response");
         }
     });
 

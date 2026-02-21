@@ -105,6 +105,7 @@ async fn test_http_routing_multiple_backends() {
             session1_clone,
             "http-service/api.example.com/127.0.0.1:19001",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -118,6 +119,7 @@ async fn test_http_routing_multiple_backends() {
             session1_clone,
             "http-service/web.example.com/127.0.0.1:19002",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -136,6 +138,7 @@ async fn test_http_routing_multiple_backends() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -339,6 +342,7 @@ async fn test_http_routing_concurrent_clients() {
             session1_clone,
             "http-service/concurrent.example.com/127.0.0.1:19003",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -356,6 +360,7 @@ async fn test_http_routing_concurrent_clients() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -432,6 +437,7 @@ async fn test_http_routing_backend_becomes_available() {
             session2_clone,
             &format!("http-service/{}", import_addr),
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
@@ -465,6 +471,7 @@ async fn test_http_routing_backend_becomes_available() {
             session1_clone,
             "http-service/delayed.example.com/127.0.0.1:19004",
             65536,
+            Duration::from_secs(5),
             shutdown_token_clone,
         )
         .await
