@@ -219,10 +219,10 @@ pub fn normalize_dns(host: &str) -> String {
     // Strip default ports using proper port parsing
     if let Some(colon_pos) = host.rfind(':') {
         let port_str = &host[colon_pos + 1..];
-        if let Ok(port) = port_str.parse::<u16>() {
-            if port == 80 || port == 443 {
-                return host[..colon_pos].to_string();
-            }
+        if let Ok(port) = port_str.parse::<u16>()
+            && (port == 80 || port == 443)
+        {
+            return host[..colon_pos].to_string();
         }
     }
     host

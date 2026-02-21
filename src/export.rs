@@ -298,6 +298,7 @@ async fn handle_client_connect(
 }
 
 /// Handle the bridge logic for a single client connection
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_bridge(
     session: Arc<Session>,
     service_name: String,
