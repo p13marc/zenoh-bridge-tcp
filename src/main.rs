@@ -135,6 +135,7 @@ async fn main() -> Result<()> {
     let http_import_count = args.http_import.len();
     let ws_export_count = args.ws_export.len();
     let ws_import_count = args.ws_import.len();
+    let auto_import_count = args.auto_import.len();
 
     let buffer_size = args.buffer_size;
 
@@ -232,6 +233,25 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Auto-detecting import tasks
+    {
+        let session = session.clone();
+        spawn_bridge_tasks(
+            &mut tasks,
+            &args.auto_import,
+            "auto_import",
+            &shutdown_token,
+            {
+                move |spec, token| {
+                    let session = session.clone();
+                    async move {
+                        import::run_auto_import_mode(session, &spec, buffer_size, token).await
+                    }
+                }
+            },
+        );
+    }
+
     // HTTPS termination import tasks (feature-gated)
     #[cfg(feature = "tls-termination")]
     let https_terminate_count = args.https_terminate.len();
@@ -274,6 +294,7 @@ async fn main() -> Result<()> {
         http_imports = http_import_count,
         ws_exports = ws_export_count,
         ws_imports = ws_import_count,
+        auto_imports = auto_import_count,
         https_terminates = https_terminate_count,
         "All bridge tasks started"
     );

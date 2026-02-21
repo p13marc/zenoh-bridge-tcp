@@ -54,6 +54,14 @@ pub struct Args {
     #[arg(long)]
     pub ws_import: Vec<String>,
 
+    /// Auto-detecting import: 'service_name/listen_addr'
+    /// Example: --auto-import 'myservice/0.0.0.0:8080'
+    /// Detects protocol (TLS/HTTPS, HTTP, WebSocket, raw TCP) from first bytes
+    /// and dispatches to the appropriate handler automatically
+    /// Can be specified multiple times for multiple auto-detect listeners
+    #[arg(long)]
+    pub auto_import: Vec<String>,
+
     /// Import HTTPS service with TLS termination: 'service_name/listen_addr'
     /// Example: --https-terminate 'https-service/0.0.0.0:8443'
     /// Terminates TLS at the bridge; backends receive plaintext HTTP
@@ -109,7 +117,8 @@ impl Args {
             || !self.http_export.is_empty()
             || !self.http_import.is_empty()
             || !self.ws_export.is_empty()
-            || !self.ws_import.is_empty();
+            || !self.ws_import.is_empty()
+            || !self.auto_import.is_empty();
 
         #[cfg(feature = "tls-termination")]
         let has_spec = has_spec || !self.https_terminate.is_empty();
