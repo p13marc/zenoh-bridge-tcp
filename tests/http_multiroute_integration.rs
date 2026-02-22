@@ -183,14 +183,9 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let spec_a = format!("{}/host-a.test/{}", service, backend_a_addr);
     let bridge_config = config.clone();
     let export_a = tokio::spawn(async move {
-        zenoh_bridge_tcp::export::run_http_export_mode(
-            s1,
-            &spec_a,
-            bridge_config,
-            t1,
-        )
-        .await
-        .unwrap();
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec_a, bridge_config, t1)
+            .await
+            .unwrap();
     });
 
     let s1 = session1.clone();
@@ -198,14 +193,9 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let spec_b = format!("{}/host-b.test/{}", service, backend_b_addr);
     let bridge_config = config.clone();
     let export_b = tokio::spawn(async move {
-        zenoh_bridge_tcp::export::run_http_export_mode(
-            s1,
-            &spec_b,
-            bridge_config,
-            t1,
-        )
-        .await
-        .unwrap();
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec_b, bridge_config, t1)
+            .await
+            .unwrap();
     });
 
     sleep(Duration::from_millis(500)).await;
@@ -292,14 +282,9 @@ async fn test_multiroute_unavailable_host_returns_502() {
     let spec = format!("{}/host-a.test/{}", service, backend_addr);
     let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
-        zenoh_bridge_tcp::export::run_http_export_mode(
-            s1,
-            &spec,
-            bridge_config,
-            t1,
-        )
-        .await
-        .unwrap();
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, bridge_config, t1)
+            .await
+            .unwrap();
     });
 
     sleep(Duration::from_millis(500)).await;

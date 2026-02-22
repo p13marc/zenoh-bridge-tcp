@@ -8,7 +8,9 @@
 
 mod common;
 
-use common::{BridgePair, BridgeProcess, PortGuard, start_echo_server, unique_service_name, wait_for_port};
+use common::{
+    BridgePair, BridgeProcess, PortGuard, start_echo_server, unique_service_name, wait_for_port,
+};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -72,7 +74,7 @@ async fn test_backend_not_available() {
 
     match result {
         Ok(Ok(0)) => {} // Connection closed (acceptable)
-        Err(_) => {}     // Timeout — no response (expected)
+        Err(_) => {}    // Timeout — no response (expected)
         Ok(Ok(_n)) => panic!("Should not receive data when no export bridge is running"),
         Ok(Err(_)) => {} // Read error (acceptable)
     }
@@ -113,7 +115,7 @@ async fn test_backend_goes_down() {
         let result = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
         match result {
             Ok(Ok(0)) => {} // Connection closed
-            Err(_) => {}     // Timeout — no response
+            Err(_) => {}    // Timeout — no response
             Ok(Ok(n)) => {
                 // Might get back "After" if there was buffered data; acceptable
                 let _ = n;

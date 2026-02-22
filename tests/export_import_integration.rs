@@ -1125,7 +1125,10 @@ async fn test_rapid_data_send() -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     received_count = *message_count.lock().await;
-    println!("7. Backend received {}/{} messages", received_count, num_messages);
+    println!(
+        "7. Backend received {}/{} messages",
+        received_count, num_messages
+    );
 
     // Assert a majority of messages arrived. Due to Zenoh discovery timing
     // across bridge subprocesses, some messages sent before the full pub/sub
@@ -1136,7 +1139,8 @@ async fn test_rapid_data_send() -> Result<()> {
         received_count >= num_messages / 2,
         "Expected at least 50% of {} messages, but only {} arrived. \
          This indicates a significant regression in data delivery.",
-        num_messages, received_count
+        num_messages,
+        received_count
     );
 
     // Cleanup

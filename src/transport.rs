@@ -131,7 +131,7 @@ where
             match self.inner.next().await {
                 None => return Ok(Vec::new()),
                 Some(Err(e)) => {
-                    return Err(io::Error::other(format!("WebSocket read error: {}", e)))
+                    return Err(io::Error::other(format!("WebSocket read error: {}", e)));
                 }
                 Some(Ok(msg)) => match msg {
                     Message::Binary(data) => return Ok(data.to_vec()),

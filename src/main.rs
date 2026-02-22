@@ -179,9 +179,7 @@ async fn main() -> Result<()> {
                 move |spec, token| {
                     let session = session.clone();
                     let config = bridge_config.clone();
-                    async move {
-                        export::run_http_export_mode(session, &spec, config, token).await
-                    }
+                    async move { export::run_http_export_mode(session, &spec, config, token).await }
                 }
             },
         );
@@ -200,9 +198,7 @@ async fn main() -> Result<()> {
                 move |spec, token| {
                     let session = session.clone();
                     let config = bridge_config.clone();
-                    async move {
-                        import::run_http_import_mode(session, &spec, config, token).await
-                    }
+                    async move { import::run_http_import_mode(session, &spec, config, token).await }
                 }
             },
         );
@@ -247,9 +243,7 @@ async fn main() -> Result<()> {
                 move |spec, token| {
                     let session = session.clone();
                     let config = bridge_config.clone();
-                    async move {
-                        import::run_auto_import_mode(session, &spec, config, token).await
-                    }
+                    async move { import::run_auto_import_mode(session, &spec, config, token).await }
                 }
             },
         );
@@ -269,8 +263,7 @@ async fn main() -> Result<()> {
                     let session = session.clone();
                     let config = bridge_config.clone();
                     async move {
-                        import::run_http_multiroute_import_mode(session, &spec, config, token)
-                            .await
+                        import::run_http_multiroute_import_mode(session, &spec, config, token).await
                     }
                 }
             },

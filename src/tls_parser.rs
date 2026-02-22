@@ -292,12 +292,12 @@ mod tests {
         let sni_ext_len = 2 + 1 + 2 + name_bytes.len();
         let ext_len = sni_ext_len;
         let sni_ext: Vec<u8> = [
-            &[0x00, 0x00],                                          // Extension type: SNI
-            &((ext_len as u16).to_be_bytes())[..],                  // Extension data length
-            &(((ext_len - 2) as u16).to_be_bytes())[..],           // SNI list length
-            &[0x00],                                                 // Name type: host_name
-            &((name_bytes.len() as u16).to_be_bytes())[..],        // Name length
-            name_bytes,                                              // The hostname
+            &[0x00, 0x00],                                  // Extension type: SNI
+            &((ext_len as u16).to_be_bytes())[..],          // Extension data length
+            &(((ext_len - 2) as u16).to_be_bytes())[..],    // SNI list length
+            &[0x00],                                        // Name type: host_name
+            &((name_bytes.len() as u16).to_be_bytes())[..], // Name length
+            name_bytes,                                     // The hostname
         ]
         .concat();
 
@@ -309,12 +309,12 @@ mod tests {
         //   compression_len(1) + null compression(1) +
         //   extensions_len(2) + extensions
         let client_hello_body: Vec<u8> = [
-            &[0x03, 0x03],                          // TLS 1.2
-            &[0x00u8; 32][..],                      // Random (32 zero bytes)
-            &[0x00],                                 // Session ID length: 0
-            &[0x00, 0x02],                           // Cipher suites length: 2
-            &[0x00, 0xFF],                           // Cipher suite: TLS_EMPTY_RENEGOTIATION_INFO_SCSV
-            &[0x01, 0x00],                           // Compression methods: 1, null
+            &[0x03, 0x03],     // TLS 1.2
+            &[0x00u8; 32][..], // Random (32 zero bytes)
+            &[0x00],           // Session ID length: 0
+            &[0x00, 0x02],     // Cipher suites length: 2
+            &[0x00, 0xFF],     // Cipher suite: TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+            &[0x01, 0x00],     // Compression methods: 1, null
             &((extensions_total_len as u16).to_be_bytes())[..],
             &sni_ext,
         ]
@@ -332,7 +332,7 @@ mod tests {
         //   content_type(1) + version(2) + length(2) + handshake
         let record_len = handshake.len();
         [
-            &[0x16, 0x03, 0x01],                                    // Handshake, TLS 1.0 (legacy)
+            &[0x16, 0x03, 0x01], // Handshake, TLS 1.0 (legacy)
             &((record_len as u16).to_be_bytes())[..],
             &handshake,
         ]

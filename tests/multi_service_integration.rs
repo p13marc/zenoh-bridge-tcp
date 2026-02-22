@@ -365,7 +365,9 @@ async fn test_service_isolation() {
     });
 
     let reverse_task = tokio::spawn(async move {
-        let mut stream = tokio::net::TcpStream::connect(import_reverse).await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(import_reverse)
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
         let mut buf = [0u8; 1024];
         for i in 0..5 {

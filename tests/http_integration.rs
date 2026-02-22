@@ -85,9 +85,7 @@ async fn start_http_backend() -> SocketAddr {
 
 /// Spawn a TCP export+import pair using the real library functions.
 /// Returns (shutdown_token, import_addr).
-async fn spawn_tcp_bridge_pair(
-    backend_addr: SocketAddr,
-) -> (CancellationToken, SocketAddr) {
+async fn spawn_tcp_bridge_pair(backend_addr: SocketAddr) -> (CancellationToken, SocketAddr) {
     let shutdown_token = CancellationToken::new();
     let config = Arc::new(BridgeConfig::default());
     let service = common::unique_service_name("httpint");
@@ -219,8 +217,7 @@ async fn test_tls_passthrough() {
     // The backend may respond with a TLS alert or partial ServerHello.
     // We just verify the bridge accepted and forwarded the bytes.
     let mut buffer = vec![0u8; 1024];
-    let result =
-        tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer)).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buffer)).await;
 
     // Either we get TLS response bytes or a timeout (incomplete handshake),
     // both prove the bridge forwarded the data.
