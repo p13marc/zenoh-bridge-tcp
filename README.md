@@ -369,7 +369,7 @@ The project includes comprehensive integration tests. Use `cargo nextest run` fo
 
 ### Test Suites
 - **`tests/export_import_integration.rs`** - Core export/import functionality
-- **`tests/bridge_integration.rs`** - Basic bridge operations
+- **`tests/tcp_sanity_tests.rs`** - Basic TCP sanity checks
 - **`tests/http_integration.rs`** - HTTP/HTTPS service bridging
 - **`tests/liveliness_integration.rs`** - Liveliness detection
 - **`tests/multi_service_integration.rs`** - Multiple concurrent services

@@ -35,8 +35,8 @@ End-to-end integration tests using bridge subprocesses.
 [Client] --TCP--> [Import Bridge] --Zenoh--> [Export Bridge] --TCP--> [Backend]
 ```
 
-### `bridge_integration.rs`
-Basic TCP bridge library tests (in-process, no subprocesses).
+### `tcp_sanity_tests.rs`
+Basic TCP sanity checks (in-process, no subprocesses).
 
 - TCP echo server functionality
 - Connection handling and lifecycle

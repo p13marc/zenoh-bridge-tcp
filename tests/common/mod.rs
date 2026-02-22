@@ -233,6 +233,56 @@ impl BridgePair {
         }
     }
 
+    /// Start an HTTP export+import bridge pair with DNS-based routing.
+    /// Waits for the import bridge to accept connections before returning.
+    pub async fn http(service: &str, dns: &str, backend_addr: SocketAddr) -> Self {
+        let export_spec = format!("{}/{}/{}", service, dns, backend_addr);
+        let export = BridgeProcess::new(&["--http-export", &export_spec]).await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let import_port = PortGuard::new();
+        let import_addr = import_port.addr();
+        let import_spec = format!("{}/{}", service, import_addr);
+        let import_addr = import_port.release();
+        let import = BridgeProcess::new(&["--http-import", &import_spec]).await;
+
+        wait_for_port(import_addr, Duration::from_secs(10))
+            .await
+            .expect("HTTP import bridge did not start in time");
+
+        Self {
+            export,
+            import,
+            import_addr,
+        }
+    }
+
+    /// Start a WebSocket export+import bridge pair.
+    /// Waits for the import bridge to accept connections before returning.
+    pub async fn ws(service: &str, backend_url: &str) -> Self {
+        let export_spec = format!("{}/{}", service, backend_url);
+        let export = BridgeProcess::new(&["--ws-export", &export_spec]).await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let import_port = PortGuard::new();
+        let import_addr = import_port.addr();
+        let import_spec = format!("{}/{}", service, import_addr);
+        let import_addr = import_port.release();
+        let import = BridgeProcess::new(&["--ws-import", &import_spec]).await;
+
+        wait_for_port(import_addr, Duration::from_secs(10))
+            .await
+            .expect("WS import bridge did not start in time");
+
+        Self {
+            export,
+            import,
+            import_addr,
+        }
+    }
+
     pub async fn kill_and_wait(&mut self) {
         self.export.kill_and_wait().await;
         self.import.kill_and_wait().await;
