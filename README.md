@@ -492,7 +492,7 @@ Development/test dependencies include: `axum`, `hyper`, `rustls`, `reqwest`, `fu
 
 ## Version Information
 
-- **Current Version**: 0.3.1
+- **Current Version**: 0.4.0
 - **Zenoh Version**: 1.6.2
 - **Rust Edition**: 2024
 - **MSRV**: 1.85 (required by edition 2024)

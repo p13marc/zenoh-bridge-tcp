@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.0] - 2026-02-22
+
+### Changed
+
+- **Transport trait abstraction**: Introduced `TransportReader` and `TransportWriter` traits in `src/transport.rs`, replacing duplicated TCP/WebSocket bridging logic with generic `bridge_import_connection<R, W>()` and `handle_client_bridge<R, W>()`
+- **Unified export liveliness loop**: Consolidated TCP and WebSocket export modes into a single `run_export_loop()` that dispatches based on `ExportBackend` enum
+- **Module directory split**: Split monolithic `export.rs` (1005 lines) and `import.rs` (1387 lines) into focused submodule directories (`src/export/` and `src/import/`) with no public API changes
+
+### Fixed
+
+- WebSocket export now sends error signal to import side on backend connection failure (was silently dropping)
+- Integration tests use dynamic ports and unique service names to prevent cross-test interference
+- WebSocket integration tests resilient to stale processes and race conditions
+
 ## [0.3.0] - 2026-02-21
 
 ### Added

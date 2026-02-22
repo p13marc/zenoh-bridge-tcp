@@ -71,8 +71,21 @@ Single crate with library and binary:
 - `src/args.rs` - Command-line argument parsing (clap)
 - `src/config.rs` - Zenoh and bridge configuration (BridgeConfig)
 - `src/error.rs` - Structured error types (BridgeError)
-- `src/export.rs` - Export mode: TCP/WebSocket backend -> Zenoh
-- `src/import.rs` - Import mode: Zenoh -> TCP/WebSocket listener
+- `src/transport.rs` - `TransportReader`/`TransportWriter` traits with TCP and WebSocket implementations
+- `src/export/` - Export mode: TCP/WebSocket backend -> Zenoh
+  - `mod.rs` - Types (`ExportBackend`), spec parsers, entry point wrappers
+  - `bridge.rs` - `run_export_loop()`, generic `handle_client_bridge<R,W>()`
+  - `tcp.rs` - TCP backend connection with retry
+  - `ws.rs` - WebSocket backend connection with retry
+- `src/import/` - Import mode: Zenoh -> TCP/WebSocket listener
+  - `mod.rs` - Spec parser, entry point wrappers
+  - `bridge.rs` - Generic `bridge_import_connection<R,W>()` bidirectional relay
+  - `listener.rs` - TCP accept loop (`run_import_mode_internal`)
+  - `connection.rs` - HTTP/TLS detection and DNS extraction
+  - `multiroute.rs` - Per-request HTTP routing with keep-alive
+  - `ws.rs` - WebSocket import mode
+  - `auto.rs` - Protocol auto-detection dispatch
+  - `tls.rs` - TLS termination (feature-gated: `tls-termination`)
 - `src/http_parser.rs` - HTTP request parsing, Host header extraction
 - `src/http_response_parser.rs` - HTTP response body framing detection
 - `src/tls_parser.rs` - TLS ClientHello parsing, SNI extraction
