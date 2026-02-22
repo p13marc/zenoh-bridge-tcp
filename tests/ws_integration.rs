@@ -11,13 +11,13 @@
 //!   ✓ Binary and text messages pass through correctly
 //!   ✓ Connection lifecycle (connect, messages, close)
 
+mod common;
+
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::process::Command;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
@@ -78,7 +78,10 @@ async fn start_ws_echo_server(addr: &str) -> Result<String> {
                     }
                 }
 
-                println!("WS Server: Connection handler finished for {}", peer_addr);
+                println!(
+                    "WS Server: Connection handler finished for {}",
+                    peer_addr
+                );
             });
         }
     });
@@ -94,45 +97,44 @@ async fn start_ws_echo_server(addr: &str) -> Result<String> {
 async fn test_ws_export_import_basic() -> Result<()> {
     println!("\n=== Test: WebSocket Export/Import Basic Communication ===\n");
 
+    let service = common::unique_service_name("wstest");
+
     // Step 1: Start WebSocket echo server as backend
     let ws_server_url = start_ws_echo_server("127.0.0.1:0").await?;
     println!("1. WebSocket echo server running at {}", ws_server_url);
 
     // Step 2: Start export bridge connected to WebSocket backend
-    let ws_export_spec = format!("wstest/{}", ws_server_url);
+    let ws_export_spec = format!("{}/{}", service, ws_server_url);
     println!(
         "2. Starting ws-export bridge: --ws-export '{}'",
         ws_export_spec
     );
 
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--ws-export", &ws_export_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut export_bridge =
+        common::BridgeProcess::new(&["--ws-export", &ws_export_spec]).await;
     println!("3. WebSocket export bridge started");
 
-    // Step 3: Find a free port for import bridge
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
-
-    let ws_import_spec = format!("wstest/{}", import_addr);
+    // Step 3: Find a free port for import bridge and start it
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let ws_import_spec = format!("{}/{}", service, import_addr);
     println!(
         "4. Starting ws-import bridge: --ws-import '{}'",
         ws_import_spec
     );
 
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--ws-import", &ws_import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    // Release port just before starting bridge so it can bind
+    let import_addr = import_port.release();
+    let mut import_bridge =
+        common::BridgeProcess::new(&["--ws-import", &ws_import_spec]).await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    println!("5. WebSocket import bridge started");
+    // Wait for the import bridge to start listening (raw TCP probe - will cause
+    // a harmless "WebSocket handshake failed" log in the bridge, but does NOT
+    // create a client or liveliness token since the WS upgrade never completes)
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start listening in time");
+    println!("5. WebSocket import bridge started and listening");
 
     // Step 4: Connect WebSocket client to import bridge
     let client_ws_url = format!("ws://{}", import_addr);
@@ -146,8 +148,9 @@ async fn test_ws_export_import_basic() -> Result<()> {
 
     let (mut sender, mut receiver) = ws_stream.split();
 
-    // Give bridges time to establish Zenoh connections
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Give bridges time to establish Zenoh connections.
+    // Liveliness must propagate between two separate OS processes via Zenoh scouting.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Step 5: Send binary message
     let test_data = b"Hello WebSocket through Zenoh!";
@@ -175,19 +178,19 @@ async fn test_ws_export_import_basic() -> Result<()> {
                 test_data,
                 "Echoed data should match sent data"
             );
-            println!("10. ✓ Binary echo test passed!");
+            println!("10. Binary echo test passed!");
         }
         other => {
-            println!("9. ✗ Unexpected message type: {:?}", other);
+            println!("9. Unexpected message type: {:?}", other);
             panic!("Expected binary message, got: {:?}", other);
         }
     }
 
     // Cleanup
     println!("11. Cleaning up...");
-    let _ = export_bridge.kill().await;
-    let _ = import_bridge.kill().await;
-    println!("12. ✓ Test completed successfully!\n");
+    export_bridge.kill().await;
+    import_bridge.kill().await;
+    println!("12. Test completed successfully!\n");
 
     Ok(())
 }
@@ -197,39 +200,37 @@ async fn test_ws_export_import_basic() -> Result<()> {
 async fn test_ws_multiple_messages() -> Result<()> {
     println!("\n=== Test: WebSocket Multiple Messages ===\n");
 
+    let service = common::unique_service_name("wsmulti");
+
     // Start WebSocket echo server
     let ws_server_url = start_ws_echo_server("127.0.0.1:0").await?;
     println!("1. WebSocket echo server at {}", ws_server_url);
 
     // Start bridges
-    let ws_export_spec = format!("wsmulti/{}", ws_server_url);
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--ws-export", &ws_export_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let ws_export_spec = format!("{}/{}", service, ws_server_url);
+    let mut export_bridge =
+        common::BridgeProcess::new(&["--ws-export", &ws_export_spec]).await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let ws_import_spec = format!("{}/{}", service, import_addr);
+    let import_addr = import_port.release();
+    let mut import_bridge =
+        common::BridgeProcess::new(&["--ws-import", &ws_import_spec]).await;
 
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
-
-    let ws_import_spec = format!("wsmulti/{}", import_addr);
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--ws-import", &ws_import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start listening in time");
 
     // Connect client
     let client_ws_url = format!("ws://{}", import_addr);
     let (ws_stream, _) = timeout(Duration::from_secs(5), connect_async(&client_ws_url)).await??;
 
     let (mut sender, mut receiver) = ws_stream.split();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Give bridges time to establish Zenoh connections.
+    // Liveliness must propagate between two separate OS processes via Zenoh scouting.
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Send multiple messages
     let messages = ["First message", "Second message", "Third message"];
@@ -254,11 +255,11 @@ async fn test_ws_multiple_messages() -> Result<()> {
         }
     }
 
-    println!("3. ✓ All {} messages echoed correctly!", messages.len());
+    println!("3. All {} messages echoed correctly!", messages.len());
 
     // Cleanup
-    let _ = export_bridge.kill().await;
-    let _ = import_bridge.kill().await;
+    export_bridge.kill().await;
+    import_bridge.kill().await;
 
     Ok(())
 }
@@ -267,6 +268,8 @@ async fn test_ws_multiple_messages() -> Result<()> {
 #[tokio::test]
 async fn test_ws_connection_lifecycle() -> Result<()> {
     println!("\n=== Test: WebSocket Connection Lifecycle ===\n");
+
+    let service = common::unique_service_name("wslifecycle");
 
     // Track connections on server side
     let connection_count = Arc::new(Mutex::new(0u32));
@@ -319,34 +322,28 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     println!("1. WebSocket server with tracking at {}", ws_server_url);
 
     // Start bridges
-    let ws_export_spec = format!("wslifecycle/{}", ws_server_url);
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--ws-export", &ws_export_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let ws_export_spec = format!("{}/{}", service, ws_server_url);
+    let mut export_bridge =
+        common::BridgeProcess::new(&["--ws-export", &ws_export_spec]).await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let ws_import_spec = format!("{}/{}", service, import_addr);
+    let import_addr = import_port.release();
+    let mut import_bridge =
+        common::BridgeProcess::new(&["--ws-import", &ws_import_spec]).await;
 
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
-
-    let ws_import_spec = format!("wslifecycle/{}", import_addr);
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--ws-import", &ws_import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start listening in time");
     println!("2. Bridges started");
 
     // Connect first client
     let client_ws_url = format!("ws://{}", import_addr);
     println!("3. Connecting first client...");
 
-    let (ws_stream1, _) = timeout(Duration::from_secs(5), connect_async(&client_ws_url)).await??;
+    let (ws_stream1, _) =
+        timeout(Duration::from_secs(5), connect_async(&client_ws_url)).await??;
 
     let (mut sender1, _receiver1) = ws_stream1.split();
 
@@ -365,8 +362,8 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     drop(_receiver1);
 
     // Wait for close to propagate through the full Zenoh bridge chain:
-    // Client WS Close → import bridge → liveliness drop → Zenoh propagation →
-    // export bridge detects Delete → cancel bridge task → WS backend receives close
+    // Client WS Close -> import bridge -> liveliness drop -> Zenoh propagation ->
+    // export bridge detects Delete -> cancel bridge task -> WS backend receives close
     // This is a multi-hop chain through Zenoh between separate OS processes.
     // Poll with timeout instead of a fixed sleep.
     let mut disconnects = 0;
@@ -379,7 +376,7 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     }
     println!("5. Disconnections recorded: {}", disconnects);
     // The disconnect propagation chain crosses multiple Zenoh process boundaries
-    // (client → import bridge → Zenoh → export bridge → WS backend) and can be
+    // (client -> import bridge -> Zenoh -> export bridge -> WS backend) and can be
     // slow or unreliable depending on Zenoh session state. We verify the connection
     // was established (connection_count >= 1) and that the close was at least sent.
     // If the disconnect didn't propagate within 20s, log it but don't fail the test
@@ -399,9 +396,9 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
     }
 
     // Cleanup
-    let _ = export_bridge.kill().await;
-    let _ = import_bridge.kill().await;
-    println!("6. ✓ Lifecycle test completed!\n");
+    export_bridge.kill().await;
+    import_bridge.kill().await;
+    println!("6. Lifecycle test completed!\n");
 
     Ok(())
 }
