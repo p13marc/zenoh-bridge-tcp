@@ -36,17 +36,31 @@ fn create_test_server(backend_id: &str) -> Router {
     )
 }
 
-/// Start an HTTP server
-async fn start_test_backend(addr: SocketAddr, backend_id: &str) {
+/// Start an HTTP server on a dynamic port, returning the bound address.
+async fn start_test_backend(backend_id: &str) -> SocketAddr {
     let app = create_test_server(backend_id);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    println!("🔧 Test backend '{}' listening on {}", backend_id, addr);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    println!("Test backend '{}' listening on {}", backend_id, addr);
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
 
     sleep(Duration::from_millis(200)).await;
+    addr
+}
+
+/// Allocate a free port for the import listener.
+fn alloc_import_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
+    // listener drops here, freeing the port
+}
+
+/// Generate a unique service name for test isolation.
+fn unique_service(prefix: &str) -> String {
+    format!("{}_{}", prefix, uuid::Uuid::new_v4().as_simple())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -54,8 +68,10 @@ async fn test_missing_host_header() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
 
-    println!("\n🧪 TEST: Missing Host Header");
+    println!("\nTEST: Missing Host Header");
     println!("============================");
+
+    let service = unique_service("httpedge");
 
     let mut config1 = Config::default();
     config1.insert_json5("mode", "\"peer\"").unwrap();
@@ -66,16 +82,16 @@ async fn test_missing_host_header() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start backend
-    let backend_addr: SocketAddr = "127.0.0.1:19101".parse().unwrap();
-    start_test_backend(backend_addr, "test-backend").await;
+    let backend_addr = start_test_backend("test-backend").await;
 
     // Start export
+    let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/test.example.com/127.0.0.1:19101",
+            &export_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -87,13 +103,14 @@ async fn test_missing_host_header() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18101".parse().unwrap();
+    let import_addr = alloc_import_addr();
+    let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
+            &import_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -103,10 +120,10 @@ async fn test_missing_host_header() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Test 1: Request without Host header
-    println!("\n📡 Test 1: HTTP request without Host header");
+    println!("\nTest 1: HTTP request without Host header");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     stream
@@ -119,10 +136,10 @@ async fn test_missing_host_header() {
 
     assert!(response.contains("400 Bad Request"));
     assert!(response.contains("Missing Host header"));
-    println!("   ✓ Got 400 Bad Request as expected");
+    println!("   Got 400 Bad Request as expected");
 
     // Test 2: Empty Host header
-    println!("\n📡 Test 2: HTTP request with empty Host header");
+    println!("\nTest 2: HTTP request with empty Host header");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     stream
@@ -134,9 +151,9 @@ async fn test_missing_host_header() {
     stream.read_to_string(&mut response).await.unwrap();
 
     assert!(response.contains("400 Bad Request"));
-    println!("   ✓ Got 400 Bad Request for empty host");
+    println!("   Got 400 Bad Request for empty host");
 
-    println!("\n✅ Missing Host header test passed!");
+    println!("\nMissing Host header test passed!");
 
     // Cleanup
     export_task.abort();
@@ -150,8 +167,10 @@ async fn test_malformed_http_requests() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
 
-    println!("\n🧪 TEST: Malformed HTTP Requests");
+    println!("\nTEST: Malformed HTTP Requests");
     println!("================================");
+
+    let service = unique_service("httpedge");
 
     let mut config1 = Config::default();
     config1.insert_json5("mode", "\"peer\"").unwrap();
@@ -162,16 +181,16 @@ async fn test_malformed_http_requests() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start backend
-    let backend_addr: SocketAddr = "127.0.0.1:19102".parse().unwrap();
-    start_test_backend(backend_addr, "test-backend").await;
+    let backend_addr = start_test_backend("test-backend").await;
 
     // Start export
+    let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/test.example.com/127.0.0.1:19102",
+            &export_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -183,13 +202,14 @@ async fn test_malformed_http_requests() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18102".parse().unwrap();
+    let import_addr = alloc_import_addr();
+    let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
+            &import_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -199,10 +219,10 @@ async fn test_malformed_http_requests() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Test 1: Invalid HTTP method line
-    println!("\n📡 Test 1: Invalid HTTP request line");
+    println!("\nTest 1: Invalid HTTP request line");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     stream
@@ -216,10 +236,10 @@ async fn test_malformed_http_requests() {
         tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response)).await;
 
     assert!(result.is_ok());
-    println!("   ✓ Invalid request handled (connection closed or error)");
+    println!("   Invalid request handled (connection closed or error)");
 
     // Test 2: Incomplete request (no \r\n\r\n terminator)
-    println!("\n📡 Test 2: Incomplete HTTP request");
+    println!("\nTest 2: Incomplete HTTP request");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     stream
@@ -237,9 +257,9 @@ async fn test_malformed_http_requests() {
         result.is_err() || matches!(result, Ok(Ok(0)) | Ok(Err(_))),
         "Incomplete HTTP request should timeout or close connection"
     );
-    println!("   ✓ Incomplete request handled");
+    println!("   Incomplete request handled");
 
-    println!("\n✅ Malformed request test passed!");
+    println!("\nMalformed request test passed!");
 
     // Cleanup
     export_task.abort();
@@ -253,8 +273,10 @@ async fn test_very_long_headers() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
 
-    println!("\n🧪 TEST: Very Long HTTP Headers");
+    println!("\nTEST: Very Long HTTP Headers");
     println!("================================");
+
+    let service = unique_service("httpedge");
 
     let mut config1 = Config::default();
     config1.insert_json5("mode", "\"peer\"").unwrap();
@@ -265,16 +287,16 @@ async fn test_very_long_headers() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start backend
-    let backend_addr: SocketAddr = "127.0.0.1:19103".parse().unwrap();
-    start_test_backend(backend_addr, "test-backend").await;
+    let backend_addr = start_test_backend("test-backend").await;
 
     // Start export
+    let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/test.example.com/127.0.0.1:19103",
+            &export_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -286,13 +308,14 @@ async fn test_very_long_headers() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18103".parse().unwrap();
+    let import_addr = alloc_import_addr();
+    let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
+            &import_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -302,10 +325,10 @@ async fn test_very_long_headers() {
     });
 
     sleep(Duration::from_secs(2)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Test 1: Long but valid headers
-    println!("\n📡 Test 1: Long but valid headers");
+    println!("\nTest 1: Long but valid headers");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     let mut request =
@@ -325,14 +348,14 @@ async fn test_very_long_headers() {
 
     assert!(read_result.is_ok(), "Timeout reading response");
     assert!(response.contains("200 OK"));
-    println!("   ✓ Long headers handled correctly");
+    println!("   Long headers handled correctly");
     drop(stream);
 
     // Wait for connection cleanup
     sleep(Duration::from_millis(500)).await;
 
     // Test 2: Extremely long Host header (valid DNS can be up to 253 chars)
-    println!("\n📡 Test 2: Very long hostname");
+    println!("\nTest 2: Very long hostname");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     let long_hostname = format!("{}.example.com", "a".repeat(200));
@@ -350,10 +373,10 @@ async fn test_very_long_headers() {
 
     assert!(read_result.is_ok(), "Timeout reading response");
     assert!(response.contains("502 Bad Gateway"));
-    println!("   ✓ Very long hostname handled");
+    println!("   Very long hostname handled");
     drop(stream);
 
-    println!("\n✅ Long headers test passed!");
+    println!("\nLong headers test passed!");
 
     // Cleanup
     export_task.abort();
@@ -367,8 +390,10 @@ async fn test_special_characters_in_hostname() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
 
-    println!("\n🧪 TEST: Special Characters in Hostname");
+    println!("\nTEST: Special Characters in Hostname");
     println!("========================================");
+
+    let service = unique_service("httpedge");
 
     let mut config1 = Config::default();
     config1.insert_json5("mode", "\"peer\"").unwrap();
@@ -379,16 +404,16 @@ async fn test_special_characters_in_hostname() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start backend
-    let backend_addr: SocketAddr = "127.0.0.1:19104".parse().unwrap();
-    start_test_backend(backend_addr, "test-backend").await;
+    let backend_addr = start_test_backend("test-backend").await;
 
     // Start export with hyphen in domain
+    let export_spec = format!("{}/my-api.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/my-api.example.com/127.0.0.1:19104",
+            &export_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -400,13 +425,14 @@ async fn test_special_characters_in_hostname() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18104".parse().unwrap();
+    let import_addr = alloc_import_addr();
+    let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
+            &import_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -416,10 +442,10 @@ async fn test_special_characters_in_hostname() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Test 1: Hostname with hyphens (valid)
-    println!("\n📡 Test 1: Hostname with hyphens");
+    println!("\nTest 1: Hostname with hyphens");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -434,10 +460,10 @@ async fn test_special_characters_in_hostname() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    println!("   ✓ Hyphens in hostname work correctly");
+    println!("   Hyphens in hostname work correctly");
 
     // Test 2: Hostname with numbers (valid)
-    println!("\n📡 Test 2: Hostname with numbers");
+    println!("\nTest 2: Hostname with numbers");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     stream
@@ -450,10 +476,10 @@ async fn test_special_characters_in_hostname() {
 
     // Will get 502 because not registered, but should parse correctly
     assert!(response.contains("502 Bad Gateway"));
-    println!("   ✓ Numbers in hostname handled");
+    println!("   Numbers in hostname handled");
 
     // Test 3: Subdomain with multiple levels
-    println!("\n📡 Test 3: Multiple subdomain levels");
+    println!("\nTest 3: Multiple subdomain levels");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
     stream
@@ -468,9 +494,9 @@ async fn test_special_characters_in_hostname() {
 
     // Will get 502 because not registered, but should parse correctly
     assert!(response.contains("502 Bad Gateway"));
-    println!("   ✓ Multiple subdomain levels handled");
+    println!("   Multiple subdomain levels handled");
 
-    println!("\n✅ Special characters test passed!");
+    println!("\nSpecial characters test passed!");
 
     // Cleanup
     export_task.abort();
@@ -484,8 +510,10 @@ async fn test_http_methods() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
 
-    println!("\n🧪 TEST: Various HTTP Methods");
+    println!("\nTEST: Various HTTP Methods");
     println!("==============================");
+
+    let service = unique_service("httpedge");
 
     let mut config1 = Config::default();
     config1.insert_json5("mode", "\"peer\"").unwrap();
@@ -496,26 +524,27 @@ async fn test_http_methods() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start backend that handles various methods
-    let backend_addr: SocketAddr = "127.0.0.1:19105".parse().unwrap();
     let app = Router::new()
         .route("/", get(|| async { "GET OK" }))
         .route("/", axum::routing::post(|| async { "POST OK" }))
         .route("/", axum::routing::put(|| async { "PUT OK" }))
         .route("/", axum::routing::delete(|| async { "DELETE OK" }));
 
-    let listener = tokio::net::TcpListener::bind(backend_addr).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
     sleep(Duration::from_millis(500)).await;
 
     // Start export
+    let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/test.example.com/127.0.0.1:19105",
+            &export_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -527,13 +556,14 @@ async fn test_http_methods() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18105".parse().unwrap();
+    let import_addr = alloc_import_addr();
+    let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
+            &import_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -543,10 +573,10 @@ async fn test_http_methods() {
     });
 
     sleep(Duration::from_secs(2)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Test GET
-    println!("\n📡 Test 1: GET request");
+    println!("\nTest 1: GET request");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
     stream
         .write_all(b"GET / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\n\r\n")
@@ -559,12 +589,12 @@ async fn test_http_methods() {
     assert!(read_result.is_ok(), "Timeout reading GET response");
     assert!(response.contains("200 OK"));
     assert!(response.contains("GET OK"));
-    println!("   ✓ GET works");
+    println!("   GET works");
     drop(stream);
     sleep(Duration::from_millis(500)).await;
 
     // Test POST
-    println!("\n📡 Test 2: POST request");
+    println!("\nTest 2: POST request");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
     stream
         .write_all(b"POST / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
@@ -577,12 +607,12 @@ async fn test_http_methods() {
     assert!(read_result.is_ok(), "Timeout reading POST response");
     assert!(response.contains("200 OK"));
     assert!(response.contains("POST OK"));
-    println!("   ✓ POST works");
+    println!("   POST works");
     drop(stream);
     sleep(Duration::from_millis(500)).await;
 
     // Test PUT
-    println!("\n📡 Test 3: PUT request");
+    println!("\nTest 3: PUT request");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
     stream
         .write_all(b"PUT / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
@@ -595,12 +625,12 @@ async fn test_http_methods() {
     assert!(read_result.is_ok(), "Timeout reading PUT response");
     assert!(response.contains("200 OK"));
     assert!(response.contains("PUT OK"));
-    println!("   ✓ PUT works");
+    println!("   PUT works");
     drop(stream);
     sleep(Duration::from_millis(500)).await;
 
     // Test DELETE
-    println!("\n📡 Test 4: DELETE request");
+    println!("\nTest 4: DELETE request");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
     stream
         .write_all(b"DELETE / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\n\r\n")
@@ -613,10 +643,10 @@ async fn test_http_methods() {
     assert!(read_result.is_ok(), "Timeout reading DELETE response");
     assert!(response.contains("200 OK"));
     assert!(response.contains("DELETE OK"));
-    println!("   ✓ DELETE works");
+    println!("   DELETE works");
     drop(stream);
 
-    println!("\n✅ HTTP methods test passed!");
+    println!("\nHTTP methods test passed!");
 
     // Cleanup
     export_task.abort();
@@ -630,8 +660,10 @@ async fn test_connection_lifecycle() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
 
-    println!("\n🧪 TEST: Connection Lifecycle");
+    println!("\nTEST: Connection Lifecycle");
     println!("==============================");
+
+    let service = unique_service("httpedge");
 
     let mut config1 = Config::default();
     config1.insert_json5("mode", "\"peer\"").unwrap();
@@ -642,16 +674,16 @@ async fn test_connection_lifecycle() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start backend
-    let backend_addr: SocketAddr = "127.0.0.1:19106".parse().unwrap();
-    start_test_backend(backend_addr, "test-backend").await;
+    let backend_addr = start_test_backend("test-backend").await;
 
     // Start export
+    let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/test.example.com/127.0.0.1:19106",
+            &export_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -663,13 +695,14 @@ async fn test_connection_lifecycle() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18106".parse().unwrap();
+    let import_addr = alloc_import_addr();
+    let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
+            &import_spec,
             65536,
             Duration::from_secs(5),
             shutdown_token_clone,
@@ -679,10 +712,10 @@ async fn test_connection_lifecycle() {
     });
 
     sleep(Duration::from_secs(2)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Test: Rapid sequential connections (using raw TCP with Connection: close)
-    println!("\n📡 Test: Rapid sequential connections");
+    println!("\nTest: Rapid sequential connections");
     for i in 0..5 {
         let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
         stream
@@ -701,14 +734,14 @@ async fn test_connection_lifecycle() {
             i + 1
         );
         assert!(response.contains("200 OK"));
-        println!("   ✓ Connection {} succeeded", i + 1);
+        println!("   Connection {} succeeded", i + 1);
         drop(stream);
 
         // Wait between connections to ensure cleanup
         sleep(Duration::from_millis(300)).await;
     }
 
-    println!("\n✅ Connection lifecycle test passed!");
+    println!("\nConnection lifecycle test passed!");
 
     // Cleanup
     export_task.abort();
