@@ -2,11 +2,6 @@
 
 A bidirectional bridge that connects TCP services to the Zenoh distributed data bus. Export TCP backends as Zenoh services or import Zenoh services as TCP listeners.
 
-**New in v0.2.0**: 
-- **WebSocket Support**: Bridge WebSocket backends with `--ws-export` and `--ws-import`
-- **Configurable Logging**: `--log-level` and `--log-format` (pretty/compact/json)
-- **HTTP/HTTPS Routing**: Route by Host header or SNI to multiple backends
-
 ## Overview
 
 This bridge enables:
@@ -23,14 +18,22 @@ This bridge enables:
 - **Concurrent Services**: Handle multiple services in one bridge process
 - **Flexible Configuration**: Command-line arguments or Zenoh config files
 - **WebSocket Support**: Bridge WebSocket backends alongside TCP services
+- **Graceful Shutdown**: Clean shutdown via CancellationToken with connection draining
+- **Backend Reconnection**: Exponential backoff retry when backends become unavailable
 
-### HTTP/HTTPS Routing (New!)
+### HTTP/HTTPS Routing
 - **DNS-Based Routing**: Route HTTP requests by Host header to different backends
 - **SNI-Based HTTPS**: Route HTTPS traffic by SNI without terminating TLS
 - **Automatic Protocol Detection**: Detects HTTP vs HTTPS automatically
 - **DNS Normalization**: Case-insensitive, port-aware routing
 - **Multiple Backends**: One listener can route to N different HTTP/HTTPS servers
 - **End-to-End TLS**: HTTPS traffic is never decrypted by the bridge
+- **Per-Request Multiroute**: HTTP/1.1 keep-alive connections can route to different backends per request
+- **Optional TLS Termination**: Decrypt HTTPS at the bridge with `--https-terminate` (requires `tls-termination` feature)
+
+### Protocol Auto-Detection
+- **Auto-Import Mode**: Single listener detects TLS/HTTPS, HTTP, WebSocket, or raw TCP from the first bytes
+- **Zero Configuration**: No need to pre-declare protocol per listener
 
 ### Liveliness Detection
 - Automatic client presence tracking using Zenoh liveliness tokens
@@ -115,7 +118,8 @@ zenoh-bridge-tcp \
 ## Building
 
 ### Prerequisites
-- Rust 1.70 or later
+- Rust 1.85 or later (edition 2024)
+
 ### Build
 ```bash
 cargo build --release
@@ -123,18 +127,21 @@ cargo build --release
 
 The binary will be at `target/release/zenoh-bridge-tcp`.
 
+### Build with TLS Termination
+```bash
+cargo build --release --features tls-termination
+```
+
 ### Run Tests
 ```bash
-# Run all tests
-cargo test
-
-# Run specific test suite (recommended: use nextest for better test isolation)
+# Run all tests (recommended: use nextest for better test isolation)
 cargo nextest run
 
-# Or with regular cargo test (use --test-threads=1 for http_edge_cases)
-cargo test --test export_import_integration -- --test-threads=1
-cargo test --test bridge_integration
-cargo test --test http_integration
+# Run unit tests only
+cargo test --lib
+
+# Run a specific integration test suite
+cargo nextest run --test http_routing_integration
 ```
 
 ## Usage
@@ -145,34 +152,46 @@ cargo test --test http_integration
 zenoh-bridge-tcp [OPTIONS]
 
 Options:
-  -c, --config <FILE>              Path to Zenoh configuration file (JSON5)
-      --export <SPEC>              Export TCP backend as Zenoh service
-                                   Format: 'service_name/backend_addr'
-                                   Example: 'myapi/127.0.0.1:3000'
-      --import <SPEC>              Import Zenoh service as TCP listener
-                                   Format: 'service_name/listen_addr'
-                                   Example: 'myapi/0.0.0.0:8080'
-      --http-export <SPEC>         Export HTTP backend with DNS-based routing
-                                   Format: 'service_name/dns/backend_addr'
-                                   Example: 'http-service/api.example.com/127.0.0.1:8000'
-      --http-import <SPEC>         Import HTTP service with DNS-based routing
-                                   Format: 'service_name/listen_addr'
-                                   Example: 'http-service/0.0.0.0:8080'
-      --ws-export <SPEC>           Export WebSocket backend as Zenoh service
-                                   Format: 'service_name/ws_url'
-                                   Example: 'myws/ws://127.0.0.1:9000'
-      --ws-import <SPEC>           Import Zenoh service as WebSocket listener
-                                   Format: 'service_name/listen_addr'
-                                   Example: 'myws/0.0.0.0:8080'
-  -m, --mode <MODE>                Zenoh mode: peer, client, or router [default: peer]
-  -e, --connect <ENDPOINT>         Zenoh connect endpoint (e.g., tcp/localhost:7447)
-  -l, --listen <ENDPOINT>          Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
-      --buffer-size <BYTES>        Buffer size for read operations [default: 65536]
-      --read-timeout <SECS>        Timeout for reading headers [default: 10]
-      --log-level <LEVEL>          Log level: trace, debug, info, warn, error [default: info]
-      --log-format <FORMAT>        Log format: pretty, compact, json [default: pretty]
-  -h, --help                       Print help
-  -V, --version                    Print version
+  -c, --config <FILE>                        Path to Zenoh configuration file (JSON5)
+      --export <SPEC>                        Export TCP backend as Zenoh service
+                                             Format: 'service_name/backend_addr'
+                                             Example: 'myapi/127.0.0.1:3000'
+      --import <SPEC>                        Import Zenoh service as TCP listener
+                                             Format: 'service_name/listen_addr'
+                                             Example: 'myapi/0.0.0.0:8080'
+      --http-export <SPEC>                   Export HTTP backend with DNS-based routing
+                                             Format: 'service_name/dns/backend_addr'
+                                             Example: 'http-service/api.example.com/127.0.0.1:8000'
+      --http-import <SPEC>                   Import HTTP service with DNS-based routing
+                                             Format: 'service_name/listen_addr'
+                                             Example: 'http-service/0.0.0.0:8080'
+      --http-multiroute-import <SPEC>        Import HTTP with per-request Host routing
+                                             Format: 'service_name/listen_addr'
+                                             Example: 'http-service/0.0.0.0:8080'
+      --auto-import <SPEC>                   Auto-detect protocol and route accordingly
+                                             Format: 'service_name/listen_addr'
+                                             Example: 'myservice/0.0.0.0:8080'
+      --https-terminate <SPEC>               Import HTTPS with TLS termination (feature: tls-termination)
+                                             Format: 'service_name/listen_addr'
+                                             Example: 'https-service/0.0.0.0:8443'
+      --tls-cert <PATH>                      TLS certificate for --https-terminate
+      --tls-key <PATH>                       TLS private key for --https-terminate
+      --ws-export <SPEC>                     Export WebSocket backend as Zenoh service
+                                             Format: 'service_name/ws_url'
+                                             Example: 'myws/ws://127.0.0.1:9000'
+      --ws-import <SPEC>                     Import Zenoh service as WebSocket listener
+                                             Format: 'service_name/listen_addr'
+                                             Example: 'myws/0.0.0.0:8080'
+  -m, --mode <MODE>                          Zenoh mode: peer, client, or router [default: peer]
+  -e, --connect <ENDPOINT>                   Zenoh connect endpoint (e.g., tcp/localhost:7447)
+  -l, --listen <ENDPOINT>                    Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
+      --buffer-size <BYTES>                  Buffer size for read operations [default: 65536]
+      --read-timeout <SECS>                  Timeout for reading headers [default: 10]
+      --drain-timeout <SECS>                 Connection drain timeout [default: 5]
+      --log-level <LEVEL>                    Log level: trace, debug, info, warn, error [default: info]
+      --log-format <FORMAT>                  Log format: pretty, compact, json [default: pretty]
+  -h, --help                                 Print help
+  -V, --version                              Print version
 ```
 
 ### Export Specification Format
@@ -203,16 +222,10 @@ Use a Zenoh configuration file for advanced settings:
 
 ```bash
 zenoh-bridge-tcp \
-  --config examples/zenoh-config.json5 \
+  --config zenoh-config.json5 \
   --export 'myservice/127.0.0.1:8003' \
   --import 'myservice/0.0.0.0:8002'
 ```
-
-Example configuration files are in the `examples/` directory:
-- `zenoh-config-minimal.json5` - Minimal peer configuration
-- `zenoh-config-client.json5` - Client mode connecting to router
-- `zenoh-config-router.json5` - Router mode configuration
-- `zenoh-config.json5` - Full-featured example
 
 ## Examples
 
@@ -232,7 +245,7 @@ zenoh-bridge-tcp --import 'http/127.0.0.1:8002' --connect tcp/exporter-host:7447
 curl http://127.0.0.1:8002
 ```
 
-### Example 1b: HTTP Routing with Multiple Backends (New!)
+### Example 2: HTTP Routing with Multiple Backends
 
 ```bash
 # Terminal 1: Start multiple HTTP servers
@@ -249,11 +262,11 @@ zenoh-bridge-tcp --http-export 'http-service/web.example.com/127.0.0.1:8002'
 zenoh-bridge-tcp --http-import 'http-service/0.0.0.0:8080'
 
 # Terminal 5: Test routing by Host header
-curl -H "Host: api.example.com" http://127.0.0.1:8080/  # → API backend
-curl -H "Host: web.example.com" http://127.0.0.1:8080/  # → Web backend
+curl -H "Host: api.example.com" http://127.0.0.1:8080/  # -> API backend
+curl -H "Host: web.example.com" http://127.0.0.1:8080/  # -> Web backend
 ```
 
-### Example 1c: HTTPS Routing with SNI (New!)
+### Example 3: HTTPS Routing with SNI
 
 ```bash
 # Start HTTPS backends with certificates
@@ -271,7 +284,7 @@ curl https://api.example.com:8443/ --resolve api.example.com:8443:127.0.0.1
 curl https://web.example.com:8443/ --resolve web.example.com:8443:127.0.0.1
 ```
 
-### Example 1d: WebSocket Bridge
+### Example 4: WebSocket Bridge
 
 ```bash
 # Terminal 1: Start WebSocket echo server (using websocat or similar)
@@ -288,7 +301,7 @@ websocat ws://127.0.0.1:8080
 # Type messages - they go through Zenoh to the WebSocket backend
 ```
 
-### Example 2: Netcat Echo Test
+### Example 5: Netcat Echo Test
 
 ```bash
 # Terminal 1: Start netcat server
@@ -305,7 +318,7 @@ nc 127.0.0.1 8002
 # Type messages - they go through Zenoh to the server
 ```
 
-### Example 3: Multiple Services
+### Example 6: Multiple Services
 
 ```bash
 zenoh-bridge-tcp \
@@ -316,7 +329,7 @@ zenoh-bridge-tcp \
   --mode peer
 ```
 
-### Example 4: With Zenoh Router
+### Example 7: With Zenoh Router
 
 ```bash
 # Terminal 1: Start Zenoh router
@@ -350,77 +363,40 @@ docker-compose up -d
 docker-compose --profile multi-bridge up -d
 ```
 
-See [examples/DOCKER.md](examples/DOCKER.md) for detailed Docker deployment instructions.
-
 ## Testing
 
-The project includes comprehensive integration tests:
+The project includes comprehensive integration tests. Use `cargo nextest run` for best results (parallel execution with process isolation).
 
-### Core Bridge Tests
+### Test Suites
 - **`tests/export_import_integration.rs`** - Core export/import functionality
 - **`tests/bridge_integration.rs`** - Basic bridge operations
 - **`tests/http_integration.rs`** - HTTP/HTTPS service bridging
 - **`tests/liveliness_integration.rs`** - Liveliness detection
 - **`tests/multi_service_integration.rs`** - Multiple concurrent services
-
-### HTTP/HTTPS Routing Tests (New!)
 - **`tests/http_routing_integration.rs`** - HTTP routing with multiple backends
-  - Multiple HTTP servers with different Host headers
-  - DNS normalization (case, port stripping)
-  - Backend availability detection
-  - Concurrent clients (10 simultaneous)
-  - Dynamic backend registration
-  
 - **`tests/https_routing_integration.rs`** - HTTPS routing with SNI
-  - SNI-based routing to multiple backends
-  - End-to-end TLS (no termination)
-  - Self-signed certificate testing
-  - DNS normalization for SNI
-  - Concurrent HTTPS clients
-  
 - **`tests/http_edge_cases.rs`** - Edge cases and error handling
-  - Missing/empty Host headers
-  - Malformed HTTP requests
-  - Very long headers
-  - Special characters in hostnames
-  - Various HTTP methods (GET, POST, PUT, DELETE)
-
-### Test Statistics
-```
-Total Test Suites: 10 suites
-Unit Tests: 56 tests
-Integration Tests: 56 tests
-WebSocket Tests: 3 tests
-Total: 112+ tests passing
-```
+- **`tests/http_multiroute_integration.rs`** - Per-request HTTP multiroute
+- **`tests/ws_integration.rs`** - WebSocket bridging
+- **`tests/drain_integration.rs`** - Connection drain on shutdown
+- **`tests/auto_import_integration.rs`** - Protocol auto-detection
+- **`tests/https_termination_integration.rs`** - TLS termination
+- **`tests/stress_test.rs`** - Load and stress testing
 
 Run tests:
 
 ```bash
-# All tests
-cargo test
+# All tests (recommended)
+cargo nextest run
 
-# Core TCP bridge tests
-cargo test --test export_import_integration -- --test-threads=1 --nocapture
-
-# HTTP routing tests
-cargo test --test http_routing_integration -- --test-threads=1 --nocapture
-
-# HTTPS routing tests
-cargo test --test https_routing_integration -- --test-threads=1 --nocapture
-
-# Edge case tests
-cargo test --test http_edge_cases -- --test-threads=1 --nocapture
-
-# Unit tests
+# Unit tests only
 cargo test --lib
 
-# HTTP integration tests
-cargo test --test http_integration -- --nocapture
-
+# Specific test suite
+cargo nextest run --test http_routing_integration
 ```
 
-See [tests/README.md](tests/README.md) for detailed testing documentation and [docs/HTTP_ROUTING_GUIDE.md](docs/HTTP_ROUTING_GUIDE.md) for HTTP/HTTPS routing guide.
+See [tests/README.md](tests/README.md) for detailed testing documentation and [docs/HTTP_ROUTING_GUIDE.md](docs/HTTP_ROUTING_GUIDE.md) for the HTTP/HTTPS routing guide.
 
 ## Zenoh Key Expression Design
 
@@ -428,15 +404,15 @@ The bridge uses a structured key expression pattern:
 
 ### Traditional TCP Mode
 ```
-{service_name}/tx/{client_id}      # Client → Backend data
-{service_name}/rx/{client_id}      # Backend → Client data
+{service_name}/tx/{client_id}      # Client -> Backend data
+{service_name}/rx/{client_id}      # Backend -> Client data
 {service_name}/clients/{client_id} # Liveliness token
 ```
 
 ### HTTP/HTTPS Mode (DNS-based routing)
 ```
-{service_name}/{dns}/tx/{client_id}      # Client → Backend data (for specific DNS)
-{service_name}/{dns}/rx/{client_id}      # Backend → Client data (for specific DNS)
+{service_name}/{dns}/tx/{client_id}      # Client -> Backend data (for specific DNS)
+{service_name}/{dns}/rx/{client_id}      # Backend -> Client data (for specific DNS)
 {service_name}/{dns}/clients/{client_id} # Liveliness token (per DNS)
 {service_name}/{dns}/available           # Backend availability signal
 ```
@@ -472,7 +448,7 @@ RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --export 'service/12
 
 ## Performance Considerations
 
-- **Buffer Size**: 4KB default per connection
+- **Buffer Size**: 64KB (65,536 bytes) default per connection
 - **Concurrent Connections**: Limited by system resources (file descriptors, memory)
 - **Latency**: Adds ~1-2ms overhead vs direct TCP (depends on Zenoh setup)
 - **Throughput**: Tested with HTTP, HTTPS, and raw TCP; handles typical workloads well
@@ -487,7 +463,7 @@ RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --export 'service/12
 - **Multi-Region Deployment**: Leverage Zenoh's peer-to-peer or routed mesh
 - **Protocol Bridging**: Connect TCP clients to Zenoh-based backends
 
-### HTTP/HTTPS Routing (New!)
+### HTTP/HTTPS Routing
 - **Virtual Host Routing**: Route HTTP traffic by hostname to different backends
 - **Multi-Tenant SaaS**: Single listener routes customers to their dedicated backends
 - **API Gateway**: Route API requests by domain to microservices
@@ -501,31 +477,25 @@ Core dependencies:
 - `zenoh` 1.6.2 - Zenoh distributed data bus
 - `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
+- `tokio-util` - CancellationToken for graceful shutdown
 - `clap` - Command-line parsing
-- `anyhow` - Error handling
-- `thiserror` - Structured error types
-- `tracing` - Structured logging
-- `tracing-subscriber` - Log formatting (pretty, compact, json)
+- `anyhow` / `thiserror` - Error handling
+- `tracing` / `tracing-subscriber` - Structured logging (pretty, compact, json)
 - `httparse` - HTTP/1.x parser (for HTTP routing)
 - `tls-parser` - TLS/SNI parser (for HTTPS routing)
 - `tokio-tungstenite` - WebSocket support
 - `futures-util` - Async stream utilities
+- `backon` - Retry with exponential backoff
+- `uuid` - Unique client ID generation
 
 Development/test dependencies include: `axum`, `hyper`, `rustls`, `reqwest`, `futures` for protocol testing.
 
 ## Version Information
 
-- **Current Version**: 0.1.0
+- **Current Version**: 0.3.1
 - **Zenoh Version**: 1.6.2
-- **Rust Edition**: 2021
-- **MSRV**: 1.70 (not officially declared, but known to work)
-
-## Migration Notes
-
-If migrating from an older Zenoh version:
-- Zenoh 1.x uses different API than 0.x versions
-- Key expressions remain compatible
-- Session configuration has changed - see examples for current format
+- **Rust Edition**: 2024
+- **MSRV**: 1.85 (required by edition 2024)
 
 ## Quality Tools
 
@@ -538,12 +508,11 @@ cargo fmt
 # Lint
 cargo clippy
 
-# Check for issues
+# Check dependencies
 cargo deny check
 ```
 
 Configuration files:
-- `.cargo/config.toml` - Cargo settings
 - `deny.toml` - Dependency auditing
 
 ## Feature Highlights
@@ -555,7 +524,7 @@ The HTTP/HTTPS routing feature enables DNS-based service discovery and routing:
 **How it works:**
 1. **Import side** listens for HTTP/HTTPS connections
 2. **Protocol detection**: Automatically detects HTTP (text) vs HTTPS (TLS)
-3. **DNS extraction**: 
+3. **DNS extraction**:
    - HTTP: Parses `Host` header
    - HTTPS: Extracts SNI from TLS ClientHello (before encryption)
 4. **DNS normalization**: Converts to lowercase, strips default ports (80/443)
@@ -564,24 +533,14 @@ The HTTP/HTTPS routing feature enables DNS-based service discovery and routing:
 7. **Pass-through**: For HTTPS, TLS handshake and data pass through unchanged
 
 **Benefits:**
-- One listener → N backends (multi-tenant)
+- One listener -> N backends (multi-tenant)
 - No configuration changes needed for new backends
 - HTTPS works without TLS termination (end-to-end encryption)
 - Automatic DNS normalization (case-insensitive, port-aware)
 - Backend availability detection (HTTP 502 when unavailable)
-- Production-ready with comprehensive error handling
-
-**Test Coverage:**
-- 9 comprehensive test suites (3 HTTP, 3 HTTPS, 3 edge cases)
-- 55 unit and integration tests passing ✅
-- 3 tests ignored (timing issues with complex scenarios)
-- Tests HTTP, HTTPS, concurrent clients, DNS normalization, edge cases, and more
-- Test pass rate: 95% (55/58 tests)
 
 **Documentation:**
 - [HTTP/HTTPS Routing Guide](docs/HTTP_ROUTING_GUIDE.md) - Complete guide with examples
-- [Phase B Summary](PHASE_B_SUMMARY.md) - Technical implementation details
-- [TODO.md](TODO.md) - Feature roadmap and implementation status
 
 ## Contributing
 
@@ -594,15 +553,10 @@ Contributions welcome! Please:
 
 ## License
 
-Licensed under either of:
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+Licensed under the MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT).
 
 ## Additional Resources
 
 - [Zenoh Documentation](https://zenoh.io/docs/)
 - [Zenoh GitHub](https://github.com/eclipse-zenoh/zenoh)
-- [Docker Deployment Guide](examples/DOCKER.md)
 - [Test Documentation](tests/README.md)

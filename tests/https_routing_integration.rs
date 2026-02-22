@@ -3,6 +3,8 @@
 //! This test suite validates DNS-based routing with HTTPS backends using SNI extraction.
 //! Tests the complete flow: HTTPS client -> Import bridge -> Zenoh -> Export bridge -> HTTPS Backend
 
+mod common;
+
 use axum::{Router, extract::Path as AxumPath, http::StatusCode, response::Json, routing::get};
 use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -13,6 +15,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
+use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Response {
@@ -84,7 +87,7 @@ async fn start_https_backend(addr: SocketAddr, domain: &str, backend_id: &str) {
         .unwrap();
 
     println!(
-        "🔧 HTTPS Backend '{}' (domain: {}) listening on {}",
+        "HTTPS Backend '{}' (domain: {}) listening on {}",
         backend_id, domain, addr
     );
 
@@ -105,8 +108,9 @@ async fn test_https_routing_multiple_backends() {
     // Initialize tracing for debugging
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    println!("\n🧪 TEST: HTTPS Routing with SNI and Multiple Backends");
+    println!("\nTEST: HTTPS Routing with SNI and Multiple Backends");
     println!("====================================================");
 
     // Create Zenoh sessions
@@ -116,40 +120,44 @@ async fn test_https_routing_multiple_backends() {
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
-    println!("✓ Zenoh sessions created");
+    println!("Zenoh sessions created");
 
-    // Start HTTPS backend servers with different domains
-    let api_backend_addr: SocketAddr = "127.0.0.1:29001".parse().unwrap();
-    let web_backend_addr: SocketAddr = "127.0.0.1:29002".parse().unwrap();
-
+    // Allocate dynamic ports for HTTPS backend servers
+    let api_backend_port = common::PortGuard::new();
+    let api_backend_addr = api_backend_port.release();
     start_https_backend(api_backend_addr, "api.secure.test", "api-backend").await;
+
+    let web_backend_port = common::PortGuard::new();
+    let web_backend_addr = web_backend_port.release();
     start_https_backend(web_backend_addr, "web.secure.test", "web-backend").await;
 
-    println!("✓ HTTPS backends started");
+    println!("HTTPS backends started");
 
     // Start HTTP export bridges (one per DNS)
+    let api_export_spec = format!("https-service/api.secure.test/{}", api_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_api_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "https-service/api.secure.test/127.0.0.1:29001",
-            65536,
-            Duration::from_secs(5),
+            &api_export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
         .unwrap();
     });
 
+    let web_export_spec = format!("https-service/web.secure.test/{}", web_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_web_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "https-service/web.secure.test/127.0.0.1:29002",
-            65536,
-            Duration::from_secs(5),
+            &web_export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -157,18 +165,21 @@ async fn test_https_routing_multiple_backends() {
     });
 
     sleep(Duration::from_millis(500)).await;
-    println!("✓ HTTPS export bridges started");
+    println!("HTTPS export bridges started");
 
     // Start HTTP import bridge (single listener for all DNS via SNI)
-    let import_addr: SocketAddr = "127.0.0.1:28443".parse().unwrap();
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("https-service/{}", import_addr);
+    let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("https-service/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            &import_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -176,7 +187,7 @@ async fn test_https_routing_multiple_backends() {
     });
 
     sleep(Duration::from_millis(500)).await;
-    println!("✓ HTTPS import bridge started on {}", import_addr);
+    println!("HTTPS import bridge started on {}", import_addr);
 
     // Give everything time to settle
     sleep(Duration::from_secs(1)).await;
@@ -191,7 +202,7 @@ async fn test_https_routing_multiple_backends() {
         .unwrap();
 
     // Test 1: Request to api.secure.test should reach api-backend
-    println!("\n📡 Test 1: HTTPS Request to api.secure.test");
+    println!("\nTest 1: HTTPS Request to api.secure.test");
     let response = client
         .get("https://api.secure.test/")
         .send()
@@ -203,10 +214,10 @@ async fn test_https_routing_multiple_backends() {
     println!("   Response: backend={}, path={}", body.backend, body.path);
     assert_eq!(body.backend, "api-backend");
     assert_eq!(body.path, "/");
-    println!("   ✓ Routed to correct backend via SNI (api-backend)");
+    println!("   Routed to correct backend via SNI (api-backend)");
 
     // Test 2: Request to web.secure.test should reach web-backend
-    println!("\n📡 Test 2: HTTPS Request to web.secure.test");
+    println!("\nTest 2: HTTPS Request to web.secure.test");
     let client2 = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0)
@@ -224,10 +235,10 @@ async fn test_https_routing_multiple_backends() {
     println!("   Response: backend={}, path={}", body.backend, body.path);
     assert_eq!(body.backend, "web-backend");
     assert_eq!(body.path, "/");
-    println!("   ✓ Routed to correct backend via SNI (web-backend)");
+    println!("   Routed to correct backend via SNI (web-backend)");
 
     // Test 3: Multiple HTTPS requests to different backends
-    println!("\n📡 Test 3: Multiple HTTPS requests to different hosts");
+    println!("\nTest 3: Multiple HTTPS requests to different hosts");
     for _ in 0..3 {
         // Request to API
         let client_api = reqwest::Client::builder()
@@ -261,10 +272,10 @@ async fn test_https_routing_multiple_backends() {
         assert_eq!(body.backend, "web-backend");
         assert_eq!(body.path, "/api/test");
     }
-    println!("   ✓ Multiple HTTPS requests routed correctly");
+    println!("   Multiple HTTPS requests routed correctly");
 
     // Test 4: DNS normalization with HTTPS
-    println!("\n📡 Test 4: HTTPS DNS normalization (uppercase)");
+    println!("\nTest 4: HTTPS DNS normalization (uppercase)");
     let client_norm = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0)
@@ -280,10 +291,10 @@ async fn test_https_routing_multiple_backends() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
     assert_eq!(body.backend, "api-backend");
-    println!("   ✓ Uppercase SNI normalized correctly");
+    println!("   Uppercase SNI normalized correctly");
 
     // Test 5: DNS normalization - port 443 should be stripped
-    println!("\n📡 Test 5: HTTPS DNS normalization (port 443)");
+    println!("\nTest 5: HTTPS DNS normalization (port 443)");
     let client_port = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0)
@@ -299,9 +310,9 @@ async fn test_https_routing_multiple_backends() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
     assert_eq!(body.backend, "api-backend");
-    println!("   ✓ Port 443 stripped correctly");
+    println!("   Port 443 stripped correctly");
 
-    println!("\n✅ All HTTPS routing tests passed!");
+    println!("\nAll HTTPS routing tests passed!");
 
     // Cleanup
     export_api_task.abort();
@@ -315,8 +326,9 @@ async fn test_https_routing_multiple_backends() {
 async fn test_https_routing_concurrent_clients() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    println!("\n🧪 TEST: Concurrent HTTPS Clients with SNI");
+    println!("\nTEST: Concurrent HTTPS Clients with SNI");
     println!("==========================================");
 
     // Setup
@@ -326,18 +338,20 @@ async fn test_https_routing_concurrent_clients() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start HTTPS backend
-    let backend_addr: SocketAddr = "127.0.0.1:29003".parse().unwrap();
+    let backend_port = common::PortGuard::new();
+    let backend_addr = backend_port.release();
     start_https_backend(backend_addr, "concurrent.secure.test", "concurrent-backend").await;
 
     // Start export
+    let export_spec = format!("https-service/concurrent.secure.test/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "https-service/concurrent.secure.test/127.0.0.1:29003",
-            65536,
-            Duration::from_secs(5),
+            &export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -347,15 +361,18 @@ async fn test_https_routing_concurrent_clients() {
     sleep(Duration::from_millis(500)).await;
 
     // Start import
-    let import_addr: SocketAddr = "127.0.0.1:28444".parse().unwrap();
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("https-service/{}", import_addr);
+    let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("https-service/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            &import_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -363,10 +380,10 @@ async fn test_https_routing_concurrent_clients() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Spawn 10 concurrent HTTPS clients
-    println!("\n📡 Sending 10 concurrent HTTPS requests...");
+    println!("\nSending 10 concurrent HTTPS requests...");
     let mut tasks = vec![];
     for i in 0..10 {
         let task = tokio::spawn(async move {
@@ -398,14 +415,14 @@ async fn test_https_routing_concurrent_clients() {
         .collect();
 
     assert_eq!(results.len(), 10);
-    println!("   ✓ All 10 concurrent HTTPS requests completed successfully");
+    println!("   All 10 concurrent HTTPS requests completed successfully");
 
     // Verify all went to the same backend
     for result in results {
         assert_eq!(result.backend, "concurrent-backend");
     }
 
-    println!("\n✅ Concurrent HTTPS client test passed!");
+    println!("\nConcurrent HTTPS client test passed!");
 
     // Cleanup
     export_task.abort();
@@ -418,8 +435,9 @@ async fn test_https_routing_concurrent_clients() {
 async fn test_https_backend_becomes_available() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    println!("\n🧪 TEST: HTTPS Backend Becomes Available After Import");
+    println!("\nTEST: HTTPS Backend Becomes Available After Import");
     println!("=====================================================");
 
     let config1 = Config::default();
@@ -428,15 +446,18 @@ async fn test_https_backend_becomes_available() {
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
     // Start import FIRST (backend doesn't exist yet)
-    let import_addr: SocketAddr = "127.0.0.1:28445".parse().unwrap();
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("https-service/{}", import_addr);
+    let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("https-service/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            &import_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -444,10 +465,10 @@ async fn test_https_backend_becomes_available() {
     });
 
     sleep(Duration::from_millis(500)).await;
-    println!("✓ Import bridge started (no backend yet)");
+    println!("Import bridge started (no backend yet)");
 
     // Try to connect - should fail (connection refused or timeout)
-    println!("\n📡 Test 1: HTTPS Request before backend exists");
+    println!("\nTest 1: HTTPS Request before backend exists");
     let client = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0)
@@ -460,20 +481,22 @@ async fn test_https_backend_becomes_available() {
 
     // Should fail because no backend is available
     assert!(result.is_err(), "Expected error when backend unavailable");
-    println!("   ✓ Connection failed as expected (no backend)");
+    println!("   Connection failed as expected (no backend)");
 
     // NOW start the backend and export
-    let backend_addr: SocketAddr = "127.0.0.1:29004".parse().unwrap();
+    let backend_port = common::PortGuard::new();
+    let backend_addr = backend_port.release();
     start_https_backend(backend_addr, "delayed.secure.test", "delayed-backend").await;
 
+    let export_spec = format!("https-service/delayed.secure.test/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "https-service/delayed.secure.test/127.0.0.1:29004",
-            65536,
-            Duration::from_secs(5),
+            &export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -481,10 +504,10 @@ async fn test_https_backend_becomes_available() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Backend and export started");
+    println!("Backend and export started");
 
     // Now request should succeed
-    println!("\n📡 Test 2: HTTPS Request after backend starts");
+    println!("\nTest 2: HTTPS Request after backend starts");
     let client2 = reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
         .pool_max_idle_per_host(0)
@@ -500,9 +523,9 @@ async fn test_https_backend_becomes_available() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
     assert_eq!(body.backend, "delayed-backend");
-    println!("   ✓ Request succeeded after backend became available");
+    println!("   Request succeeded after backend became available");
 
-    println!("\n✅ HTTPS backend availability test passed!");
+    println!("\nHTTPS backend availability test passed!");
 
     // Cleanup
     export_task.abort();

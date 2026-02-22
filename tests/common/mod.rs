@@ -128,33 +128,113 @@ pub fn unique_service_name(prefix: &str) -> String {
     format!("{}_{}", prefix, uuid::Uuid::new_v4().as_simple())
 }
 
-/// Start a bridge process using assert_cmd's cargo_bin.
+/// A bridge subprocess with automatic cleanup via `kill_on_drop`.
 pub struct BridgeProcess {
     child: tokio::process::Child,
 }
 
 impl BridgeProcess {
     pub async fn new(args: &[&str]) -> Self {
+        use std::process::Stdio;
         let child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
             .args(args)
             .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("Failed to start bridge process");
 
         Self { child }
     }
 
-    pub fn id(&self) -> Option<u32> {
-        self.child.id()
-    }
-
     pub async fn kill(&mut self) {
         let _ = self.child.kill().await;
+    }
+
+    /// Kill and wait for the process to fully exit (up to 2s).
+    pub async fn kill_and_wait(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
     }
 }
 
 impl Drop for BridgeProcess {
     fn drop(&mut self) {
         // kill_on_drop handles cleanup
+    }
+}
+
+/// A pair of export + import bridge subprocesses.
+/// Encapsulates the common boilerplate of starting both sides and waiting for readiness.
+pub struct BridgePair {
+    pub export: BridgeProcess,
+    pub import: BridgeProcess,
+    pub import_addr: SocketAddr,
+}
+
+impl BridgePair {
+    /// Start a TCP export+import bridge pair.
+    /// Waits for the import bridge to accept connections before returning.
+    pub async fn tcp(service: &str, backend_addr: SocketAddr) -> Self {
+        let export_spec = format!("{}/{}", service, backend_addr);
+        let export = BridgeProcess::new(&["--export", &export_spec]).await;
+
+        // Export bridge doesn't listen on TCP, so we must give it time
+        // to connect to the Zenoh network before starting the import side.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let import_port = PortGuard::new();
+        let import_addr = import_port.addr();
+        let import_spec = format!("{}/{}", service, import_addr);
+        let import_addr = import_port.release();
+        let import = BridgeProcess::new(&["--import", &import_spec]).await;
+
+        wait_for_port(import_addr, Duration::from_secs(10))
+            .await
+            .expect("Import bridge did not start in time");
+
+        Self {
+            export,
+            import,
+            import_addr,
+        }
+    }
+
+    /// Start a TCP export+import pair with extra CLI args on each side.
+    pub async fn tcp_with_args(
+        service: &str,
+        backend_addr: SocketAddr,
+        extra_export_args: &[&str],
+        extra_import_args: &[&str],
+    ) -> Self {
+        let export_spec = format!("{}/{}", service, backend_addr);
+        let mut export_args: Vec<&str> = vec!["--export", &export_spec];
+        export_args.extend_from_slice(extra_export_args);
+        let export = BridgeProcess::new(&export_args).await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let import_port = PortGuard::new();
+        let import_addr = import_port.addr();
+        let import_spec = format!("{}/{}", service, import_addr);
+        let import_addr = import_port.release();
+        let mut import_args: Vec<&str> = vec!["--import", &import_spec];
+        import_args.extend_from_slice(extra_import_args);
+        let import = BridgeProcess::new(&import_args).await;
+
+        wait_for_port(import_addr, Duration::from_secs(10))
+            .await
+            .expect("Import bridge did not start in time");
+
+        Self {
+            export,
+            import,
+            import_addr,
+        }
+    }
+
+    pub async fn kill_and_wait(&mut self) {
+        self.export.kill_and_wait().await;
+        self.import.kill_and_wait().await;
     }
 }

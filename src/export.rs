@@ -4,19 +4,28 @@
 //! Each export creates lazy connections to the backend - one connection per importing client.
 //!
 //! Supports regular TCP mode, HTTP-aware mode with DNS-based routing, and WebSocket mode.
+//!
+//! ## Error handling strategy
+//!
+//! - **Startup errors** (parse, liveliness, subscribe): propagated via `?`, fatal to the service.
+//! - **Per-client errors** (backend connect, read/write, publish): logged, close that connection
+//!   only. Backend connect uses exponential backoff (100ms–5s, 5 retries) before notifying the
+//!   import side via the error channel.
+//! - **Shutdown**: each task direction has a `CancellationToken`; the outer select cancels the
+//!   peer token and waits up to `drain_timeout` before a final `.abort()` fallback.
 
+use crate::config::BridgeConfig;
 use crate::http_parser::normalize_dns;
 use anyhow::Result;
 use backon::{ExponentialBuilder, Retryable};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::connect_async;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use zenoh::Session;
@@ -28,6 +37,15 @@ use zenoh_ext::{
 
 /// Type alias for cancellation sender and task handle
 type CancellationSender = (mpsc::Sender<()>, tokio::task::JoinHandle<()>);
+
+/// Backend type for export mode, determines how client connections are established
+enum ExportBackend {
+    Tcp {
+        addr: SocketAddr,
+        dns_suffix: Option<String>,
+    },
+    WebSocket(String),
+}
 
 /// Parse export specification in format 'service_name/backend_addr'
 pub fn parse_export_spec(export_spec: &str) -> Result<(String, SocketAddr)> {
@@ -74,16 +92,18 @@ pub fn parse_http_export_spec(export_spec: &str) -> Result<(String, String, Sock
 pub async fn run_export_mode(
     session: Arc<Session>,
     export_spec: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_export_mode_internal(
+    let (service_name, backend_addr) = parse_export_spec(export_spec)?;
+    run_export_loop(
         session,
-        export_spec,
-        None,
-        buffer_size,
-        drain_timeout,
+        &service_name,
+        ExportBackend::Tcp {
+            addr: backend_addr,
+            dns_suffix: None,
+        },
+        config,
         shutdown_token,
     )
     .await
@@ -100,43 +120,51 @@ pub async fn run_export_mode(
 pub async fn run_http_export_mode(
     session: Arc<Session>,
     export_spec: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, dns, backend_addr) = parse_http_export_spec(export_spec)?;
-    run_export_mode_internal(
+    run_export_loop(
         session,
-        &format!("{}/{}", service_name, backend_addr),
-        Some(dns),
-        buffer_size,
-        drain_timeout,
+        &service_name,
+        ExportBackend::Tcp {
+            addr: backend_addr,
+            dns_suffix: Some(dns),
+        },
+        config,
         shutdown_token,
     )
     .await
 }
 
-/// Internal implementation for both regular and HTTP export modes
-async fn run_export_mode_internal(
+/// Unified export loop for TCP, HTTP, and WebSocket backends
+///
+/// This function handles the liveliness monitoring loop shared by all export modes.
+/// The `backend` parameter determines how client connections are established.
+async fn run_export_loop(
     session: Arc<Session>,
-    export_spec: &str,
-    dns_suffix: Option<String>,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    service_name: &str,
+    backend: ExportBackend,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    let (service_name, backend_addr) = parse_export_spec(export_spec)?;
-
-    let mode = if dns_suffix.is_some() {
-        "http_export"
-    } else {
-        "export"
+    let dns_suffix = match &backend {
+        ExportBackend::Tcp { dns_suffix, .. } => dns_suffix.clone(),
+        ExportBackend::WebSocket(_) => None,
     };
+
+    let mode = match &backend {
+        ExportBackend::Tcp {
+            dns_suffix: Some(_),
+            ..
+        } => "http_export",
+        ExportBackend::Tcp { .. } => "export",
+        ExportBackend::WebSocket(_) => "ws_export",
+    };
+
     info!(
         mode = mode,
         service = %service_name,
-        backend = %backend_addr,
-        dns = dns_suffix.as_deref().unwrap_or("-"),
         "Starting export bridge"
     );
 
@@ -186,15 +214,13 @@ async fn run_export_mode_internal(
             if let Some(client_id) = key.rsplit('/').next() {
                 let client_id = client_id.to_string();
                 info!(client_id = %client_id, "Found existing client, connecting");
-                handle_client_connect(
+                dispatch_client_connect(
                     &session,
-                    &service_name,
-                    backend_addr,
+                    service_name,
+                    &backend,
                     &client_id,
                     &cancellation_senders,
-                    dns_suffix.as_deref(),
-                    buffer_size,
-                    drain_timeout,
+                    &config,
                 )
                 .await;
             }
@@ -213,27 +239,25 @@ async fn run_export_mode_internal(
 
                             match sample.kind() {
                                 zenoh::sample::SampleKind::Put => {
-                                    handle_client_connect(
+                                    dispatch_client_connect(
                                         &session,
-                                        &service_name,
-                                        backend_addr,
+                                        service_name,
+                                        &backend,
                                         &client_id,
                                         &cancellation_senders,
-                                        dns_suffix.as_deref(),
-                                        buffer_size,
-                                        drain_timeout,
+                                        &config,
                                     )
                                     .await;
                                 }
                                 zenoh::sample::SampleKind::Delete => {
-                                    handle_client_disconnect(&client_id, &cancellation_senders, drain_timeout).await;
+                                    handle_client_disconnect(&client_id, &cancellation_senders, config.drain_timeout).await;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        error!("Liveliness subscriber error: {:?}", e);
-                        return Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
+                        warn!("Liveliness subscriber error (continuing): {:?}", e);
+                        continue;
                     }
                 }
             }
@@ -253,8 +277,43 @@ async fn run_export_mode_internal(
     Ok(())
 }
 
+/// Dispatch a client connection to the appropriate backend handler
+async fn dispatch_client_connect(
+    session: &Arc<Session>,
+    service_name: &str,
+    backend: &ExportBackend,
+    client_id: &str,
+    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    config: &Arc<BridgeConfig>,
+) {
+    match backend {
+        ExportBackend::Tcp { addr, dns_suffix } => {
+            handle_client_connect(
+                session,
+                service_name,
+                *addr,
+                client_id,
+                cancellation_senders,
+                dns_suffix.as_deref(),
+                config,
+            )
+            .await;
+        }
+        ExportBackend::WebSocket(ws_url) => {
+            handle_ws_client_connect(
+                session,
+                service_name,
+                ws_url,
+                client_id,
+                cancellation_senders,
+                config,
+            )
+            .await;
+        }
+    }
+}
+
 /// Handle a client connection event
-#[allow(clippy::too_many_arguments)]
 async fn handle_client_connect(
     session: &Arc<Session>,
     service_name: &str,
@@ -262,8 +321,7 @@ async fn handle_client_connect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
     dns_suffix: Option<&str>,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: &Arc<BridgeConfig>,
 ) {
     info!(client_id = %client_id, "Client connected, connecting to backend");
 
@@ -292,12 +350,15 @@ async fn handle_client_connect(
             info!(client_id = %client_id, backend = %backend_addr, "Backend connection established");
 
             let (backend_reader, backend_writer) = backend_stream.into_split();
+            let reader = crate::transport::TcpReader::new(backend_reader, config.buffer_size);
+            let writer = crate::transport::TcpWriter::new(backend_writer);
 
             let session_clone = session.clone();
             let service_name_clone = service_name.to_string();
             let client_id_str = client_id.to_string();
             let client_id_for_map = client_id.to_string();
             let dns_suffix_owned = dns_suffix.map(|s| s.to_string());
+            let config = config.clone();
 
             // Create cancellation channel for graceful shutdown
             let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
@@ -311,18 +372,18 @@ async fn handle_client_connect(
             );
 
             // Spawn dedicated task for this client connection
+            let config_clone = config.clone();
             let main_handle = tokio::spawn(
                 async move {
                     if let Err(e) = handle_client_bridge(
                         session_clone,
                         service_name_clone,
                         client_id_str,
-                        backend_reader,
-                        backend_writer,
+                        reader,
+                        writer,
                         cancel_rx,
                         dns_suffix_owned.as_deref(),
-                        buffer_size,
-                        drain_timeout,
+                        config_clone,
                     )
                     .await
                     {
@@ -332,11 +393,16 @@ async fn handle_client_connect(
                 .instrument(span),
             );
 
-            // Store the cancellation sender and task handle
-            cancellation_senders
-                .lock()
-                .await
-                .insert(client_id_for_map, (cancel_tx, main_handle));
+            // Cancel any existing connection for this client ID before storing the new one
+            {
+                let mut senders = cancellation_senders.lock().await;
+                if let Some((old_cancel_tx, old_handle)) = senders.remove(&client_id_for_map) {
+                    warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
+                    drop(old_cancel_tx);
+                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
+                }
+                senders.insert(client_id_for_map, (cancel_tx, main_handle));
+            }
         }
         Err(e) => {
             error!(
@@ -355,19 +421,25 @@ async fn handle_client_connect(
     }
 }
 
-/// Handle the bridge logic for a single client connection
+/// Handle the bridge logic for a single client connection.
+///
+/// Generic over `TransportReader`/`TransportWriter` so the same function
+/// serves both TCP and WebSocket export paths.
 #[allow(clippy::too_many_arguments)]
-async fn handle_client_bridge(
+async fn handle_client_bridge<R, W>(
     session: Arc<Session>,
     service_name: String,
     client_id: String,
-    mut backend_reader: tokio::net::tcp::OwnedReadHalf,
-    mut backend_writer: tokio::net::tcp::OwnedWriteHalf,
+    mut backend_reader: R,
+    mut backend_writer: W,
     mut cancel_rx: mpsc::Receiver<()>,
     dns_suffix: Option<&str>,
-    buffer_size: usize,
-    drain_timeout: Duration,
-) -> Result<()> {
+    config: Arc<BridgeConfig>,
+) -> Result<()>
+where
+    R: crate::transport::TransportReader,
+    W: crate::transport::TransportWriter,
+{
     let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
     // Subscribe to messages from this specific client using AdvancedSubscriber
     // This enables late publisher detection and recovery of missed samples
@@ -375,7 +447,7 @@ async fn handle_client_bridge(
     let subscriber = session
         .declare_subscriber(&sub_key)
         .history(HistoryConfig::default().detect_late_publishers())
-        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
+        .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
         .subscriber_detection()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
@@ -395,7 +467,7 @@ async fn handle_client_bridge(
     let publisher = session
         .declare_publisher(pub_key.clone())
         .cache(CacheConfig::default().max_samples(64))
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
+        .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
         .publisher_detection()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
@@ -409,90 +481,79 @@ async fn handle_client_bridge(
     let client_id_for_writer = client_id.clone();
     let client_id_for_final = client_id.clone();
 
+    // Cancellation tokens for graceful shutdown of each direction
+    let cancel_backend_to_zenoh = CancellationToken::new();
+    let cancel_zenoh_to_backend = CancellationToken::new();
+
     // Task: read from backend and publish to Zenoh using AdvancedPublisher
+    let buffer_size = config.buffer_size;
+    let drain_timeout = config.drain_timeout;
+    let b2z_token = cancel_backend_to_zenoh.clone();
     let mut backend_to_zenoh_handle = tokio::spawn(async move {
-        let mut buffer = vec![0u8; buffer_size];
         loop {
-            match backend_reader.read(&mut buffer).await {
-                Ok(0) => {
-                    info!(
-                        "Backend closed connection for client: {}",
-                        client_id_for_reader
-                    );
-                    // Send empty payload as EOF signal to import side
-                    if let Err(e) = publisher.put(Vec::<u8>::new()).await {
-                        error!(
-                            "Failed to send EOF signal for client {}: {:?}",
-                            client_id_for_reader, e
-                        );
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    debug!(
-                        "← {} bytes from backend for client {}",
-                        n, client_id_for_reader
-                    );
-                    if let Err(e) = publisher.put(&buffer[..n]).await {
-                        error!(
-                            "Failed to publish for client {}: {:?}",
-                            client_id_for_reader, e
-                        );
-                        break;
+            tokio::select! {
+                result = backend_reader.read_data(buffer_size) => {
+                    match result {
+                        Ok(data) if data.is_empty() => {
+                            info!("Backend closed connection for client: {}", client_id_for_reader);
+                            if let Err(e) = publisher.put(Vec::<u8>::new()).await {
+                                error!("Failed to send EOF signal for client {}: {:?}", client_id_for_reader, e);
+                            }
+                            break;
+                        }
+                        Ok(data) => {
+                            debug!("← {} bytes from backend for client {}", data.len(), client_id_for_reader);
+                            if let Err(e) = publisher.put(&data[..]).await {
+                                error!("Failed to publish for client {}: {:?}", client_id_for_reader, e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Backend read error for client {}: {:?}", client_id_for_reader, e);
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Backend read error for client {}: {:?}",
-                        client_id_for_reader, e
-                    );
+                _ = b2z_token.cancelled() => {
+                    debug!("Backend-to-Zenoh cancelled for client: {}", client_id_for_reader);
                     break;
                 }
             }
         }
-        // Explicitly undeclare publisher before task exits
         if let Err(e) = publisher.undeclare().await {
-            debug!(
-                "Error undeclaring publisher for {}: {:?}",
-                client_id_for_reader, e
-            );
+            debug!("Error undeclaring publisher for {}: {:?}", client_id_for_reader, e);
         }
     });
 
     // Task: receive from Zenoh and write to backend
+    let z2b_token = cancel_zenoh_to_backend.clone();
     let mut zenoh_to_backend_handle = tokio::spawn(async move {
         loop {
-            match subscriber.recv_async().await {
-                Ok(sample) => {
-                    let payload = sample.payload().to_bytes();
-                    debug!(
-                        "→ {} bytes to backend for client {}",
-                        payload.len(),
-                        client_id_for_writer
-                    );
-                    if let Err(e) = backend_writer.write_all(&payload).await {
-                        error!(
-                            "Failed to write to backend for client {}: {:?}",
-                            client_id_for_writer, e
-                        );
-                        break;
+            tokio::select! {
+                result = subscriber.recv_async() => {
+                    match result {
+                        Ok(sample) => {
+                            let payload = sample.payload().to_bytes();
+                            debug!("→ {} bytes to backend for client {}", payload.len(), client_id_for_writer);
+                            if let Err(e) = backend_writer.write_data(&payload).await {
+                                error!("Failed to write to backend for client {}: {:?}", client_id_for_writer, e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Subscriber error for client {}: {:?}", client_id_for_writer, e);
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    error!(
-                        "Subscriber error for client {}: {:?}",
-                        client_id_for_writer, e
-                    );
+                _ = z2b_token.cancelled() => {
+                    debug!("Zenoh-to-backend cancelled for client: {}", client_id_for_writer);
                     break;
                 }
             }
         }
-        // Explicitly undeclare subscriber before task exits
         if let Err(e) = subscriber.undeclare().await {
-            debug!(
-                "Error undeclaring subscriber for {}: {:?}",
-                client_id_for_writer, e
-            );
+            debug!("Error undeclaring subscriber for {}: {:?}", client_id_for_writer, e);
         }
     });
 
@@ -500,24 +561,32 @@ async fn handle_client_bridge(
     tokio::select! {
         _result = &mut backend_to_zenoh_handle => {
             info!("Backend closed for client: {}", client_id_for_final);
-            // Abort the other task and wait for it
-            zenoh_to_backend_handle.abort();
-            let _ = zenoh_to_backend_handle.await;
+            cancel_zenoh_to_backend.cancel();
+            match tokio::time::timeout(drain_timeout, &mut zenoh_to_backend_handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    debug!("Zenoh-to-backend drain timeout for client: {}", client_id_for_final);
+                    zenoh_to_backend_handle.abort();
+                    let _ = zenoh_to_backend_handle.await;
+                }
+            }
         },
         _result = &mut zenoh_to_backend_handle => {
             info!("Zenoh closed for client: {}", client_id_for_final);
-            // Abort the other task and wait for it
-            backend_to_zenoh_handle.abort();
-            let _ = backend_to_zenoh_handle.await;
+            cancel_backend_to_zenoh.cancel();
+            match tokio::time::timeout(drain_timeout, &mut backend_to_zenoh_handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    debug!("Backend-to-Zenoh drain timeout for client: {}", client_id_for_final);
+                    backend_to_zenoh_handle.abort();
+                    let _ = backend_to_zenoh_handle.await;
+                }
+            }
         },
         _ = cancel_rx.recv() => {
             info!("Cancellation received for client: {}", client_id_for_final);
-
-            // Stop receiving from Zenoh (client is gone)
-            zenoh_to_backend_handle.abort();
-            let _ = zenoh_to_backend_handle.await;
-
-            // Let backend_to_zenoh drain its current read with a timeout
+            cancel_zenoh_to_backend.cancel();
+            cancel_backend_to_zenoh.cancel();
             match tokio::time::timeout(drain_timeout, &mut backend_to_zenoh_handle).await {
                 Ok(_) => {
                     debug!("Backend-to-Zenoh drained for client: {}", client_id_for_final);
@@ -526,6 +595,16 @@ async fn handle_client_bridge(
                     debug!("Backend-to-Zenoh drain timeout for client: {}", client_id_for_final);
                     backend_to_zenoh_handle.abort();
                     let _ = backend_to_zenoh_handle.await;
+                }
+            }
+            match tokio::time::timeout(drain_timeout, &mut zenoh_to_backend_handle).await {
+                Ok(_) => {
+                    debug!("Zenoh-to-backend drained for client: {}", client_id_for_final);
+                }
+                Err(_) => {
+                    debug!("Zenoh-to-backend drain timeout for client: {}", client_id_for_final);
+                    zenoh_to_backend_handle.abort();
+                    let _ = zenoh_to_backend_handle.await;
                 }
             }
         },
@@ -612,107 +691,18 @@ pub fn parse_ws_export_spec(export_spec: &str) -> Result<(String, String)> {
 pub async fn run_ws_export_mode(
     session: Arc<Session>,
     export_spec: &str,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, ws_url) = parse_ws_export_spec(export_spec)?;
-
-    info!(
-        mode = "ws_export",
-        service = %service_name,
-        ws_url = %ws_url,
-        "Starting WebSocket export bridge"
-    );
-
-    // Monitor client liveliness to create/destroy connections
-    let liveliness_key = format!("{}/clients/*", service_name);
-
-    let liveliness_subscriber = session
-        .liveliness()
-        .declare_subscriber(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
-
-    info!(liveliness_key = %liveliness_key, "WebSocket export bridge ready");
-
-    // Track connection tasks and cancellation senders per client ID
-    let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Query existing clients that connected before this export started
-    let existing_clients = session
-        .liveliness()
-        .get(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to query existing clients: {}", e))?;
-
-    while let Ok(reply) = existing_clients.recv_async().await {
-        if let Ok(sample) = reply.into_result() {
-            let key = sample.key_expr().as_str();
-            if let Some(client_id) = key.rsplit('/').next() {
-                let client_id = client_id.to_string();
-                info!(client_id = %client_id, "Found existing WebSocket client, connecting");
-                handle_ws_client_connect(
-                    &session,
-                    &service_name,
-                    &ws_url,
-                    &client_id,
-                    &cancellation_senders,
-                    drain_timeout,
-                )
-                .await;
-            }
-        }
-    }
-
-    // Main loop: monitor liveliness and create/destroy connections
-    loop {
-        tokio::select! {
-            result = liveliness_subscriber.recv_async() => {
-                match result {
-                    Ok(sample) => {
-                        let key = sample.key_expr().as_str();
-                        if let Some(client_id) = key.rsplit('/').next() {
-                            let client_id = client_id.to_string();
-
-                            match sample.kind() {
-                                zenoh::sample::SampleKind::Put => {
-                                    handle_ws_client_connect(
-                                        &session,
-                                        &service_name,
-                                        &ws_url,
-                                        &client_id,
-                                        &cancellation_senders,
-                                        drain_timeout,
-                                    )
-                                    .await;
-                                }
-                                zenoh::sample::SampleKind::Delete => {
-                                    handle_client_disconnect(&client_id, &cancellation_senders, drain_timeout).await;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Liveliness subscriber error: {:?}", e);
-                        return Err(anyhow::anyhow!("Liveliness subscriber error: {:?}", e));
-                    }
-                }
-            }
-            _ = shutdown_token.cancelled() => {
-                info!(service = %service_name, "WebSocket export bridge shutting down");
-                let senders = cancellation_senders.lock().await;
-                for (client_id, (tx, _)) in senders.iter() {
-                    let _ = tx.send(()).await;
-                    debug!(client_id = %client_id, "Sent shutdown to WS client bridge");
-                }
-                break;
-            }
-        }
-    }
-
-    info!(service = %service_name, "WebSocket export bridge stopped");
-    Ok(())
+    run_export_loop(
+        session,
+        &service_name,
+        ExportBackend::WebSocket(ws_url),
+        config,
+        shutdown_token,
+    )
+    .await
 }
 
 /// Handle a WebSocket client connection event
@@ -722,7 +712,7 @@ async fn handle_ws_client_connect(
     ws_url: &str,
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
-    drain_timeout: Duration,
+    config: &Arc<BridgeConfig>,
 ) {
     info!(client_id = %client_id, "WebSocket client connected, connecting to backend");
 
@@ -756,6 +746,8 @@ async fn handle_ws_client_connect(
             info!(client_id = %client_id, ws_url = %ws_url, "WebSocket backend connection established");
 
             let (ws_sender, ws_receiver) = ws_stream.split();
+            let reader = crate::transport::WsReader::new(ws_receiver);
+            let writer = crate::transport::WsWriter::new(ws_sender);
 
             let session_clone = session.clone();
             let service_name_clone = service_name.to_string();
@@ -773,16 +765,18 @@ async fn handle_ws_client_connect(
             );
 
             // Spawn dedicated task for this client connection
+            let config_clone = config.clone();
             let main_handle = tokio::spawn(
                 async move {
-                    if let Err(e) = handle_ws_client_bridge(
+                    if let Err(e) = handle_client_bridge(
                         session_clone,
                         service_name_clone,
                         client_id_str,
-                        ws_sender,
-                        ws_receiver,
+                        reader,
+                        writer,
                         cancel_rx,
-                        drain_timeout,
+                        None,
+                        config_clone,
                     )
                     .await
                     {
@@ -792,11 +786,16 @@ async fn handle_ws_client_connect(
                 .instrument(span),
             );
 
-            // Store the cancellation sender and task handle
-            cancellation_senders
-                .lock()
-                .await
-                .insert(client_id_for_map, (cancel_tx, main_handle));
+            // Cancel any existing connection for this client ID before storing the new one
+            {
+                let mut senders = cancellation_senders.lock().await;
+                if let Some((old_cancel_tx, old_handle)) = senders.remove(&client_id_for_map) {
+                    warn!(client_id = %client_id, "WS client already has active connection, cancelling old one");
+                    drop(old_cancel_tx);
+                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
+                }
+                senders.insert(client_id_for_map, (cancel_tx, main_handle));
+            }
         }
         Err(e) => {
             error!(
@@ -812,197 +811,6 @@ async fn handle_ws_client_connect(
             info!("Sent backend unavailable signal for client: {}", client_id);
         }
     }
-}
-
-/// Handle the bridge logic for a single WebSocket client connection
-async fn handle_ws_client_bridge(
-    session: Arc<Session>,
-    service_name: String,
-    client_id: String,
-    mut ws_sender: futures_util::stream::SplitSink<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-        Message,
-    >,
-    mut ws_receiver: futures_util::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<TcpStream>>,
-    >,
-    mut cancel_rx: mpsc::Receiver<()>,
-    drain_timeout: Duration,
-) -> Result<()> {
-    // Subscribe to messages from this specific client
-    let sub_key = format!("{}/tx/{}", service_name, client_id);
-    let subscriber = session
-        .declare_subscriber(&sub_key)
-        .history(HistoryConfig::default().detect_late_publishers())
-        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
-        .subscriber_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
-
-    info!(
-        "WebSocket client {} subscribed to {} with late publisher detection",
-        client_id, sub_key
-    );
-
-    // Declare publisher for RX channel
-    let pub_key_str = format!("{}/rx/{}", service_name, client_id);
-    let pub_key: KeyExpr<'static> = pub_key_str
-        .clone()
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
-    let publisher = session
-        .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(64))
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
-        .publisher_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
-
-    debug!(
-        "WebSocket client {}: Declared AdvancedPublisher on {} with cache",
-        client_id, pub_key_str
-    );
-
-    let client_id_for_receiver = client_id.clone();
-    let client_id_for_sender = client_id.clone();
-    let client_id_for_final = client_id.clone();
-
-    // Task: read from WebSocket and publish to Zenoh
-    let mut ws_to_zenoh_handle = tokio::spawn(async move {
-        while let Some(msg_result) = ws_receiver.next().await {
-            match msg_result {
-                Ok(msg) => {
-                    let data = match msg {
-                        Message::Binary(data) => data.to_vec(),
-                        Message::Text(text) => text.as_bytes().to_vec(),
-                        Message::Close(_) => {
-                            info!(
-                                "WebSocket backend closed for client: {}",
-                                client_id_for_receiver
-                            );
-                            // Send empty payload as EOF signal
-                            if let Err(e) = publisher.put(Vec::<u8>::new()).await {
-                                error!(
-                                    "Failed to send EOF signal for client {}: {:?}",
-                                    client_id_for_receiver, e
-                                );
-                            }
-                            break;
-                        }
-                        Message::Ping(_) | Message::Pong(_) => continue,
-                        Message::Frame(_) => continue,
-                    };
-
-                    debug!(
-                        "← {} bytes from WebSocket for client {}",
-                        data.len(),
-                        client_id_for_receiver
-                    );
-                    if let Err(e) = publisher.put(&data).await {
-                        error!(
-                            "Failed to publish for client {}: {:?}",
-                            client_id_for_receiver, e
-                        );
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "WebSocket receive error for client {}: {:?}",
-                        client_id_for_receiver, e
-                    );
-                    break;
-                }
-            }
-        }
-        // Explicitly undeclare publisher before task exits
-        if let Err(e) = publisher.undeclare().await {
-            debug!(
-                "Error undeclaring WS publisher for {}: {:?}",
-                client_id_for_receiver, e
-            );
-        }
-    });
-
-    // Task: receive from Zenoh and write to WebSocket
-    let mut zenoh_to_ws_handle = tokio::spawn(async move {
-        loop {
-            match subscriber.recv_async().await {
-                Ok(sample) => {
-                    let payload = sample.payload().to_bytes();
-                    debug!(
-                        "→ {} bytes to WebSocket for client {}",
-                        payload.len(),
-                        client_id_for_sender
-                    );
-                    if let Err(e) = ws_sender
-                        .send(Message::Binary(payload.to_vec().into()))
-                        .await
-                    {
-                        error!(
-                            "Failed to send to WebSocket for client {}: {:?}",
-                            client_id_for_sender, e
-                        );
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Subscriber error for client {}: {:?}",
-                        client_id_for_sender, e
-                    );
-                    break;
-                }
-            }
-        }
-        // Explicitly undeclare subscriber before task exits
-        if let Err(e) = subscriber.undeclare().await {
-            debug!(
-                "Error undeclaring WS subscriber for {}: {:?}",
-                client_id_for_sender, e
-            );
-        }
-    });
-
-    // Wait for either task to complete or cancellation signal
-    tokio::select! {
-        _result = &mut ws_to_zenoh_handle => {
-            info!("WebSocket closed for client: {}", client_id_for_final);
-            zenoh_to_ws_handle.abort();
-            let _ = zenoh_to_ws_handle.await;
-        },
-        _result = &mut zenoh_to_ws_handle => {
-            info!("Zenoh closed for client: {}", client_id_for_final);
-            ws_to_zenoh_handle.abort();
-            let _ = ws_to_zenoh_handle.await;
-        },
-        _ = cancel_rx.recv() => {
-            info!("Cancellation received for WebSocket client: {}", client_id_for_final);
-
-            // Stop receiving from Zenoh (client is gone)
-            zenoh_to_ws_handle.abort();
-            let _ = zenoh_to_ws_handle.await;
-
-            // Let ws_to_zenoh drain with timeout
-            match tokio::time::timeout(drain_timeout, &mut ws_to_zenoh_handle).await {
-                Ok(_) => {
-                    debug!("WS-to-Zenoh drained for client: {}", client_id_for_final);
-                }
-                Err(_) => {
-                    debug!("WS-to-Zenoh drain timeout for client: {}", client_id_for_final);
-                    ws_to_zenoh_handle.abort();
-                    let _ = ws_to_zenoh_handle.await;
-                }
-            }
-        },
-    }
-
-    info!(
-        "WebSocket connection handler stopped for client: {}",
-        client_id_for_final
-    );
-
-    Ok(())
 }
 
 #[cfg(test)]

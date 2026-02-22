@@ -120,6 +120,37 @@ pub struct Args {
     pub log_format: String,
 }
 
+#[cfg(test)]
+impl Default for Args {
+    fn default() -> Self {
+        Self {
+            config: None,
+            export: Vec::new(),
+            import: Vec::new(),
+            http_export: Vec::new(),
+            http_import: Vec::new(),
+            ws_export: Vec::new(),
+            ws_import: Vec::new(),
+            auto_import: Vec::new(),
+            http_multiroute_import: Vec::new(),
+            #[cfg(feature = "tls-termination")]
+            https_terminate: Vec::new(),
+            #[cfg(feature = "tls-termination")]
+            tls_cert: None,
+            #[cfg(feature = "tls-termination")]
+            tls_key: None,
+            mode: "peer".to_string(),
+            connect: None,
+            listen: None,
+            buffer_size: 65536,
+            read_timeout: 10,
+            drain_timeout: 5,
+            log_level: "info".to_string(),
+            log_format: "pretty".to_string(),
+        }
+    }
+}
+
 impl Args {
     /// Validate that at least one export or import is specified
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -154,5 +185,103 @@ impl Args {
     /// Build a BridgeConfig from command-line arguments
     pub fn bridge_config(&self) -> BridgeConfig {
         BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_no_specs_fails() {
+        let args = Args::default();
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_with_export_passes() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_import_passes() {
+        let args = Args {
+            import: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_http_export_passes() {
+        let args = Args {
+            http_export: vec!["svc/dns.test/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_http_import_passes() {
+        let args = Args {
+            http_import: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_ws_export_passes() {
+        let args = Args {
+            ws_export: vec!["svc/ws://127.0.0.1:9000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_ws_import_passes() {
+        let args = Args {
+            ws_import: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_auto_import_passes() {
+        let args = Args {
+            auto_import: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_with_http_multiroute_import_passes() {
+        let args = Args {
+            http_multiroute_import: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_bridge_config_maps_fields_correctly() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            buffer_size: 1024,
+            read_timeout: 30,
+            drain_timeout: 15,
+            ..Default::default()
+        };
+        let config = args.bridge_config();
+        assert_eq!(config.buffer_size, 1024);
+        assert_eq!(config.read_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(config.drain_timeout, std::time::Duration::from_secs(15));
     }
 }

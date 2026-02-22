@@ -1,546 +1,393 @@
-//! Integration tests for multiple simultaneous import and export operations
+//! Integration tests for multiple simultaneous export and import operations.
 //!
-//! This test suite verifies that a single bridge instance can handle:
-//! - Multiple exports simultaneously
-//! - Multiple imports simultaneously (using client simulation)
-//! - Mixed exports and imports at the same time
-//! - Independent operation of each service
-//! - No interference between different services
-//!
-//! Note: These tests use simulated import clients rather than full TCP listeners
-//! to avoid timing issues and make tests more reliable and faster.
+//! Verifies that the bridge can handle multiple services concurrently
+//! using real library functions (not custom simulations).
 
-use anyhow::Result;
+mod common;
+
+use common::{PortGuard, unique_service_name, wait_for_port};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Barrier;
-use tokio::time::timeout;
-use tracing::{info, warn};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
+use zenoh_bridge_tcp::config::BridgeConfig;
 
-/// Helper function to create a simple echo server for testing
-async fn echo_server(addr: &str) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Echo server listening on {}", addr);
-
-    while let Ok((mut stream, peer)) = listener.accept().await {
-        info!("Echo server: client connected from {}", peer);
-        tokio::spawn(async move {
-            let (mut reader, mut writer) = stream.split();
-            let mut buffer = vec![0u8; 1024];
-
-            while let Ok(n) = reader.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-                info!("Echo server: echoing {} bytes", n);
-                if writer.write_all(&buffer[..n]).await.is_err() {
-                    break;
-                }
+/// Start a simple echo server, returning its address.
+async fn start_echo_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65536];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if stream.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
             }
-            info!("Echo server: client disconnected");
-        });
-    }
-    Ok(())
+        }
+    });
+    addr
 }
 
-/// Helper function to create a counter server that responds with incrementing numbers
-async fn counter_server(addr: &str) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Counter server listening on {}", addr);
-
-    while let Ok((mut stream, peer)) = listener.accept().await {
-        info!("Counter server: client connected from {}", peer);
-        tokio::spawn(async move {
-            let (mut reader, mut writer) = stream.split();
-            let mut buffer = vec![0u8; 1024];
-            let mut counter = 0u32;
-
-            while let Ok(n) = reader.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-                counter += 1;
-                let response = format!("count:{}\n", counter);
-                info!("Counter server: responding with {}", response.trim());
-                if writer.write_all(response.as_bytes()).await.is_err() {
-                    break;
-                }
+/// Start a counter server that responds with "count:N\n" for each message.
+async fn start_counter_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    let mut counter = 0u32;
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_n) => {
+                                counter += 1;
+                                let response = format!("count:{}\n", counter);
+                                if stream.write_all(response.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
             }
-            info!("Counter server: client disconnected");
-        });
-    }
-    Ok(())
+        }
+    });
+    addr
 }
 
-/// Helper function to create a reverse server that reverses input
-async fn reverse_server(addr: &str) -> Result<()> {
-    let listener = TcpListener::bind(addr).await?;
-    info!("Reverse server listening on {}", addr);
-
-    while let Ok((mut stream, peer)) = listener.accept().await {
-        info!("Reverse server: client connected from {}", peer);
-        tokio::spawn(async move {
-            let (mut reader, mut writer) = stream.split();
-            let mut buffer = vec![0u8; 1024];
-
-            while let Ok(n) = reader.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-                let mut reversed = buffer[..n].to_vec();
-                reversed.reverse();
-                info!("Reverse server: reversing {} bytes", n);
-                if writer.write_all(&reversed).await.is_err() {
-                    break;
-                }
+/// Start a reverse server that reverses the input bytes.
+async fn start_reverse_server() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                let mut reversed = buf[..n].to_vec();
+                                reversed.reverse();
+                                if stream.write_all(&reversed).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
             }
-            info!("Reverse server: client disconnected");
-        });
-    }
-    Ok(())
+        }
+    });
+    addr
 }
 
-/// Test multiple exports working simultaneously
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_multiple_exports() -> Result<()> {
+/// Spawn an export+import pair using real library functions.
+/// Returns (shutdown_token, import_addr).
+async fn spawn_bridge_pair(
+    service: &str,
+    backend_addr: SocketAddr,
+    session_export: Arc<zenoh::Session>,
+    session_import: Arc<zenoh::Session>,
+    shutdown_token: &CancellationToken,
+    config: &Arc<BridgeConfig>,
+) -> SocketAddr {
+    // Export
+    let export_spec = format!("{}/{}", service, backend_addr);
+    let s = session_export.clone();
+    let t = shutdown_token.child_token();
+    let c = config.clone();
+    tokio::spawn(async move {
+        let _ = zenoh_bridge_tcp::export::run_export_mode(s, &export_spec, c, t).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Import
+    let import_port = PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("{}/{}", service, import_addr);
+    let import_addr = import_port.release();
+    let s = session_import.clone();
+    let t = shutdown_token.child_token();
+    let c = config.clone();
+    tokio::spawn(async move {
+        let _ = zenoh_bridge_tcp::import::run_import_mode(s, &import_spec, c, t).await;
+    });
+
+    wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start in time");
+
+    import_addr
+}
+
+/// Send a message through the bridge and read the response.
+/// Includes a post-connect delay for Zenoh liveliness propagation between processes.
+async fn send_and_receive(import_addr: SocketAddr, data: &[u8]) -> Vec<u8> {
+    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    // Wait for liveliness propagation: import declares token → export detects → connects to backend
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stream.write_all(data).await.unwrap();
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .expect("Timeout waiting for response")
+        .expect("Read error");
+    buf[..n].to_vec()
+}
+
+/// Test multiple exports working simultaneously (echo + counter).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiple_exports() {
     let _ = tracing_subscriber::fmt::try_init();
 
-    info!("Starting test_multiple_exports");
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    // Start backend servers
-    tokio::spawn(echo_server("127.0.0.1:9001"));
-    tokio::spawn(counter_server("127.0.0.1:9002"));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let echo_addr = start_echo_server().await;
+    let counter_addr = start_counter_server().await;
 
-    // Create Zenoh sessions
-    let mut config = Config::default();
-    config.insert_json5("mode", "\"peer\"").unwrap();
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
 
-    let export_session = Arc::new(
-        zenoh::open(config.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open zenoh session: {:?}", e))?,
-    );
-    let import_session = Arc::new(
-        zenoh::open(config.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open zenoh session: {:?}", e))?,
-    );
+    let svc_echo = unique_service_name("multiexp_echo");
+    let svc_counter = unique_service_name("multiexp_count");
 
-    // Simulate two export bridges
-    let export1_session = export_session.clone();
-    let export1_handle = tokio::spawn(async move {
-        simulate_export_mode(export1_session, "echo_service", "127.0.0.1:9001").await
-    });
+    let import_echo = spawn_bridge_pair(
+        &svc_echo,
+        echo_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    let export2_session = export_session.clone();
-    let export2_handle = tokio::spawn(async move {
-        simulate_export_mode(export2_session, "counter_service", "127.0.0.1:9002").await
-    });
+    let import_counter = spawn_bridge_pair(
+        &svc_counter,
+        counter_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Test echo service
+    let response = send_and_receive(import_echo, b"hello").await;
+    assert_eq!(response, b"hello");
 
-    // Simulate import clients for both services
-    let import1_session = import_session.clone();
-    let client1_handle = tokio::spawn(async move {
-        let result = simulate_import_client(import1_session, "echo_service", b"hello").await;
-        assert!(result.is_ok());
-        let response = result.unwrap();
-        assert_eq!(response, b"hello");
-        info!("✓ Echo service test passed");
-    });
+    // Test counter service
+    let response = send_and_receive(import_counter, b"test").await;
+    assert!(response.starts_with(b"count:"));
 
-    let import2_session = import_session.clone();
-    let client2_handle = tokio::spawn(async move {
-        let result = simulate_import_client(import2_session, "counter_service", b"test").await;
-        assert!(result.is_ok());
-        let response = result.unwrap();
-        assert!(response.starts_with(b"count:"));
-        info!("✓ Counter service test passed");
-    });
-
-    // Wait for clients to complete
-    timeout(Duration::from_secs(10), client1_handle).await??;
-    timeout(Duration::from_secs(10), client2_handle).await??;
-
-    // Cleanup
-    export1_handle.abort();
-    export2_handle.abort();
-
-    info!("✓ test_multiple_exports passed");
-    Ok(())
+    shutdown_token.cancel();
 }
 
-/// Test multiple imports working simultaneously
-/// This test verifies that multiple services can be imported by using
-/// the Zenoh client simulation (liveliness + pub/sub) without full TCP listeners
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_multiple_imports() -> Result<()> {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+/// Test multiple imports from different services.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiple_imports() {
+    let _ = tracing_subscriber::fmt::try_init();
 
-    info!("Starting test_multiple_imports");
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    // Create Zenoh sessions
-    let mut config = Config::default();
-    config.insert_json5("mode", "\"peer\"").unwrap();
+    let echo_addr = start_echo_server().await;
+    let counter_addr = start_counter_server().await;
 
-    let session = Arc::new(
-        zenoh::open(config.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open zenoh session: {:?}", e))?,
-    );
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
 
-    // Start backend servers
-    tokio::spawn(echo_server("127.0.0.1:9101"));
-    tokio::spawn(counter_server("127.0.0.1:9102"));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let svc1 = unique_service_name("multiimp_svc1");
+    let svc2 = unique_service_name("multiimp_svc2");
 
-    // Start export bridges
-    let export1_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export1_session, "service1", "127.0.0.1:9101").await;
-    });
+    let import1 = spawn_bridge_pair(
+        &svc1,
+        echo_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    let export2_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export2_session, "service2", "127.0.0.1:9102").await;
-    });
+    let import2 = spawn_bridge_pair(
+        &svc2,
+        counter_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Both should work independently
+    let resp1 = send_and_receive(import1, b"hello").await;
+    assert_eq!(resp1, b"hello");
 
-    // Test using import client simulation (not full TCP listener)
-    let test1_session = session.clone();
-    let test1 = tokio::spawn(async move {
-        let result = simulate_import_client(test1_session, "service1", b"hello").await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), b"hello");
-        info!("✓ Import service1 test passed");
-    });
+    let resp2 = send_and_receive(import2, b"test").await;
+    assert!(resp2.starts_with(b"count:"));
 
-    let test2_session = session.clone();
-    let test2 = tokio::spawn(async move {
-        let result = simulate_import_client(test2_session, "service2", b"test").await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().starts_with(b"count:"));
-        info!("✓ Import service2 test passed");
-    });
-
-    // Wait for tests
-    timeout(Duration::from_secs(10), test1).await??;
-    timeout(Duration::from_secs(10), test2).await??;
-
-    info!("✓ test_multiple_imports passed");
-    Ok(())
+    shutdown_token.cancel();
 }
 
-/// Test mixed exports and imports simultaneously
-/// This test verifies that a bridge can handle multiple exports at the same time,
-/// all tested via Zenoh client simulation for reliability
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_mixed_export_import() -> Result<()> {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+/// Test three exports simultaneously (echo, counter, reverse).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_mixed_export_import() {
+    let _ = tracing_subscriber::fmt::try_init();
 
-    info!("Starting test_mixed_export_import");
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    // Create Zenoh sessions
-    let mut config = Config::default();
-    config.insert_json5("mode", "\"peer\"").unwrap();
+    let echo_addr = start_echo_server().await;
+    let counter_addr = start_counter_server().await;
+    let reverse_addr = start_reverse_server().await;
 
-    let session = Arc::new(
-        zenoh::open(config.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open zenoh session: {:?}", e))?,
-    );
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
 
-    // Start backend servers
-    tokio::spawn(echo_server("127.0.0.1:9301"));
-    tokio::spawn(counter_server("127.0.0.1:9302"));
-    tokio::spawn(reverse_server("127.0.0.1:9303"));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let svc_echo = unique_service_name("mixed_echo");
+    let svc_counter = unique_service_name("mixed_count");
+    let svc_reverse = unique_service_name("mixed_rev");
 
-    // Start exports (simulating what the bridge would do)
-    let export1_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export1_session, "echo_export", "127.0.0.1:9301").await;
-    });
+    let import_echo = spawn_bridge_pair(
+        &svc_echo,
+        echo_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    let export2_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export2_session, "counter_export", "127.0.0.1:9302").await;
-    });
+    let import_counter = spawn_bridge_pair(
+        &svc_counter,
+        counter_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    let export3_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export3_session, "reverse_export", "127.0.0.1:9303").await;
-    });
+    let import_reverse = spawn_bridge_pair(
+        &svc_reverse,
+        reverse_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let resp = send_and_receive(import_echo, b"hello").await;
+    assert_eq!(resp, b"hello");
 
-    // Test all three exports using import client simulation
-    let test1_session = session.clone();
-    let test1 = tokio::spawn(async move {
-        let result = simulate_import_client(test1_session, "echo_export", b"hello").await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), b"hello");
-        info!("✓ Export echo test passed");
-    });
+    let resp = send_and_receive(import_counter, b"test").await;
+    assert!(resp.starts_with(b"count:"));
 
-    let test2_session = session.clone();
-    let test2 = tokio::spawn(async move {
-        let result = simulate_import_client(test2_session, "counter_export", b"test").await;
-        assert!(result.is_ok());
-        assert!(result.unwrap().starts_with(b"count:"));
-        info!("✓ Export counter test passed");
-    });
+    let resp = send_and_receive(import_reverse, b"ABCD").await;
+    assert_eq!(resp, b"DCBA");
 
-    let test3_session = session.clone();
-    let test3 = tokio::spawn(async move {
-        let result = simulate_import_client(test3_session, "reverse_export", b"ABCD").await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), b"DCBA");
-        info!("✓ Export reverse test passed");
-    });
-
-    // Wait for all tests
-    timeout(Duration::from_secs(10), test1).await??;
-    timeout(Duration::from_secs(10), test2).await??;
-    timeout(Duration::from_secs(10), test3).await??;
-
-    info!("✓ test_mixed_export_import passed");
-    Ok(())
+    shutdown_token.cancel();
 }
 
-/// Test that services don't interfere with each other
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_service_isolation() -> Result<()> {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+/// Test that different services are isolated — messages don't cross.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_service_isolation() {
+    let _ = tracing_subscriber::fmt::try_init();
 
-    info!("Starting test_service_isolation");
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    // Create Zenoh session
-    let mut config = Config::default();
-    config.insert_json5("mode", "\"peer\"").unwrap();
-    let session = Arc::new(
-        zenoh::open(config.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to open zenoh session: {:?}", e))?,
-    );
+    let echo_addr = start_echo_server().await;
+    let reverse_addr = start_reverse_server().await;
 
-    // Start backend servers
-    tokio::spawn(echo_server("127.0.0.1:9401"));
-    tokio::spawn(reverse_server("127.0.0.1:9402"));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
 
-    // Export both services
-    let export1_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export1_session, "isolated_echo", "127.0.0.1:9401").await;
-    });
+    let svc_echo = unique_service_name("iso_echo");
+    let svc_reverse = unique_service_name("iso_rev");
 
-    let export2_session = session.clone();
-    tokio::spawn(async move {
-        let _ = simulate_export_mode(export2_session, "isolated_reverse", "127.0.0.1:9402").await;
-    });
+    let import_echo = spawn_bridge_pair(
+        &svc_echo,
+        echo_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let import_reverse = spawn_bridge_pair(
+        &svc_reverse,
+        reverse_addr,
+        session1.clone(),
+        session2.clone(),
+        &shutdown_token,
+        &config,
+    )
+    .await;
 
-    // Run tests concurrently on both services
-    let barrier = Arc::new(Barrier::new(2));
-
-    let test1_session = session.clone();
-    let barrier1 = barrier.clone();
-    let test1 = tokio::spawn(async move {
-        barrier1.wait().await; // Start at the same time
+    // Open persistent connections and send multiple messages on each.
+    // This tests isolation without the per-connection liveliness delay.
+    let echo_task = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(import_echo).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut buf = [0u8; 1024];
         for i in 0..5 {
             let msg = format!("echo{}", i);
-            let result =
-                simulate_import_client(test1_session.clone(), "isolated_echo", msg.as_bytes())
-                    .await;
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap(), msg.as_bytes());
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            stream.write_all(msg.as_bytes()).await.unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("Echo read timeout")
+                .expect("Echo read error");
+            assert_eq!(&buf[..n], msg.as_bytes(), "Echo service should echo back");
         }
-        info!("✓ Echo service isolation test passed");
     });
 
-    let test2_session = session.clone();
-    let barrier2 = barrier.clone();
-    let test2 = tokio::spawn(async move {
-        barrier2.wait().await; // Start at the same time
+    let reverse_task = tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(import_reverse).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut buf = [0u8; 1024];
         for i in 0..5 {
             let msg = format!("rev{}", i);
-            let result =
-                simulate_import_client(test2_session.clone(), "isolated_reverse", msg.as_bytes())
-                    .await;
-            assert!(result.is_ok());
+            stream.write_all(msg.as_bytes()).await.unwrap();
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("Reverse read timeout")
+                .expect("Reverse read error");
             let expected: Vec<u8> = msg.bytes().rev().collect();
-            assert_eq!(result.unwrap(), expected);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            assert_eq!(&buf[..n], expected, "Reverse service should reverse bytes");
         }
-        info!("✓ Reverse service isolation test passed");
     });
 
-    timeout(Duration::from_secs(15), test1).await??;
-    timeout(Duration::from_secs(15), test2).await??;
-
-    info!("✓ test_service_isolation passed");
-    Ok(())
-}
-
-// Helper functions to simulate bridge behavior
-
-async fn simulate_export_mode(
-    session: Arc<zenoh::Session>,
-    service_name: &str,
-    backend_addr: &str,
-) -> Result<()> {
-    use std::collections::HashMap;
-    use tokio::sync::Mutex;
-
-    let backend_addr: std::net::SocketAddr = backend_addr.parse()?;
-    let liveliness_key = format!("{}/clients/*", service_name);
-
-    let liveliness_subscriber = session
-        .liveliness()
-        .declare_subscriber(&liveliness_key)
+    tokio::time::timeout(Duration::from_secs(30), echo_task)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {:?}", e))?;
-
-    info!("Export simulation: monitoring {}", liveliness_key);
-
-    type CancellationSender = (tokio::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>);
-    let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    while let Ok(sample) = liveliness_subscriber.recv_async().await {
-        let key = sample.key_expr().as_str();
-        if let Some(client_id) = key.rsplit('/').next() {
-            let client_id = client_id.to_string();
-
-            match sample.kind() {
-                zenoh::sample::SampleKind::Put => {
-                    info!("Export simulation: client connected: {}", client_id);
-
-                    match TcpStream::connect(backend_addr).await {
-                        Ok(backend_stream) => {
-                            let (mut backend_reader, mut backend_writer) =
-                                backend_stream.into_split();
-                            let session_clone = session.clone();
-                            let service_name = service_name.to_string();
-                            let client_id_clone = client_id.clone();
-
-                            let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel::<()>(1);
-
-                            let handle = tokio::spawn(async move {
-                                let sub_key = format!("{}/tx/{}", service_name, client_id_clone);
-                                let pub_key = format!("{}/rx/{}", service_name, client_id_clone);
-
-                                let subscriber =
-                                    match session_clone.declare_subscriber(&sub_key).await {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            warn!("Failed to subscribe: {:?}", e);
-                                            return;
-                                        }
-                                    };
-
-                                let session_for_pub = session_clone.clone();
-
-                                let mut backend_to_zenoh = tokio::spawn(async move {
-                                    let mut buffer = vec![0u8; 65536];
-                                    loop {
-                                        match backend_reader.read(&mut buffer).await {
-                                            Ok(0) => break,
-                                            Ok(n) => {
-                                                let _ = session_for_pub
-                                                    .put(&pub_key, &buffer[..n])
-                                                    .await;
-                                            }
-                                            Err(_) => break,
-                                        }
-                                    }
-                                });
-
-                                let mut zenoh_to_backend = tokio::spawn(async move {
-                                    while let Ok(sample) = subscriber.recv_async().await {
-                                        let payload = sample.payload().to_bytes();
-                                        if backend_writer.write_all(&payload).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-
-                                tokio::select! {
-                                    _ = &mut backend_to_zenoh => { zenoh_to_backend.abort(); },
-                                    _ = &mut zenoh_to_backend => { backend_to_zenoh.abort(); },
-                                    _ = cancel_rx.recv() => {
-                                        backend_to_zenoh.abort();
-                                        zenoh_to_backend.abort();
-                                    },
-                                }
-                            });
-
-                            cancellation_senders
-                                .lock()
-                                .await
-                                .insert(client_id, (cancel_tx, handle));
-                        }
-                        Err(e) => {
-                            warn!("Export simulation: failed to connect to backend: {:?}", e);
-                        }
-                    }
-                }
-                zenoh::sample::SampleKind::Delete => {
-                    info!("Export simulation: client disconnected: {}", client_id);
-                    if let Some((cancel_tx, handle)) =
-                        cancellation_senders.lock().await.remove(&client_id)
-                    {
-                        let _ = cancel_tx.send(()).await;
-                        let _ = timeout(Duration::from_secs(2), handle).await;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-async fn simulate_import_client(
-    session: Arc<zenoh::Session>,
-    service_name: &str,
-    data: &[u8],
-) -> Result<Vec<u8>> {
-    let client_id = format!("test_client_{}", rand::random::<u32>());
-
-    let sub_key = format!("{}/rx/{}", service_name, client_id);
-    let subscriber = session
-        .declare_subscriber(&sub_key)
+        .expect("Echo task timeout")
+        .expect("Echo task panicked");
+    tokio::time::timeout(Duration::from_secs(30), reverse_task)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
+        .expect("Reverse task timeout")
+        .expect("Reverse task panicked");
 
-    let liveliness_key = format!("{}/clients/{}", service_name, client_id);
-    let _token = session
-        .liveliness()
-        .declare_token(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {:?}", e))?;
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let pub_key = format!("{}/tx/{}", service_name, client_id);
-    session
-        .put(&pub_key, data)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to put data: {:?}", e))?;
-
-    let sample = timeout(Duration::from_secs(5), subscriber.recv_async())
-        .await?
-        .map_err(|e| anyhow::anyhow!("Failed to receive sample: {:?}", e))?;
-    let response = sample.payload().to_bytes().to_vec();
-
-    Ok(response)
+    shutdown_token.cancel();
 }

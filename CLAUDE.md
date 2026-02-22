@@ -11,6 +11,9 @@ Key features:
 - **Import Mode**: Make Zenoh services accessible via TCP listeners
 - **HTTP/HTTPS Routing**: DNS-based routing using Host header (HTTP) or SNI (HTTPS)
 - **WebSocket Support**: Bridge WebSocket backends with `--ws-export` and `--ws-import`
+- **Auto-Import**: Protocol auto-detection (TLS/HTTP/WebSocket/raw TCP) with `--auto-import`
+- **HTTP Multiroute**: Per-request Host routing on persistent connections with `--http-multiroute-import`
+- **TLS Termination**: Optional HTTPS termination with `--https-terminate` (feature: `tls-termination`)
 - **Liveliness Detection**: Automatic client presence tracking via Zenoh liveliness tokens
 - **Configurable Logging**: `--log-level` and `--log-format` (pretty/compact/json)
 
@@ -19,6 +22,9 @@ Key features:
 ```bash
 # Build (release recommended)
 cargo build --release
+
+# Build with TLS termination feature
+cargo build --release --features tls-termination
 
 # Run the bridge
 cargo run --release -- --export 'service/127.0.0.1:8003' --import 'service/127.0.0.1:8002'
@@ -39,16 +45,12 @@ cargo run --release -- --log-level debug --log-format json --export 'service/127
 # Run all tests (nextest recommended for isolation)
 cargo nextest run
 
-# Run with cargo test (some tests need single-threaded execution)
-cargo test --test export_import_integration -- --test-threads=1
-cargo test --test http_edge_cases -- --test-threads=1
-
 # Run unit tests only
 cargo test --lib
 
 # Run specific integration test suites
-cargo test --test http_routing_integration
-cargo test --test https_routing_integration
+cargo nextest run --test http_routing_integration
+cargo nextest run --test https_routing_integration
 ```
 
 ## Linting and Formatting
@@ -72,7 +74,27 @@ Single crate with library and binary:
 - `src/export.rs` - Export mode: TCP/WebSocket backend -> Zenoh
 - `src/import.rs` - Import mode: Zenoh -> TCP/WebSocket listener
 - `src/http_parser.rs` - HTTP request parsing, Host header extraction
+- `src/http_response_parser.rs` - HTTP response body framing detection
 - `src/tls_parser.rs` - TLS ClientHello parsing, SNI extraction
+- `src/tls_config.rs` - TLS configuration loading (for `tls-termination` feature)
+- `src/protocol_detect.rs` - Protocol auto-detection (TLS/HTTP/WebSocket/TCP)
+
+### CLI Arguments
+
+Core modes:
+- `--export`, `--import` - Raw TCP bridging
+- `--http-export`, `--http-import` - HTTP/HTTPS DNS-based routing
+- `--ws-export`, `--ws-import` - WebSocket bridging
+- `--auto-import` - Auto-detect protocol per connection
+- `--http-multiroute-import` - Per-request HTTP/1.1 routing with keep-alive
+- `--https-terminate` - HTTPS import with TLS termination (requires `--tls-cert` and `--tls-key`)
+
+Configuration:
+- `--buffer-size` (default: 65536), `--read-timeout` (default: 10), `--drain-timeout` (default: 5)
+- `--mode`, `--connect`, `--listen` - Zenoh network config
+- `--log-level`, `--log-format` - Logging
+
+Feature flag: `tls-termination` - Enables `--https-terminate`, `--tls-cert`, `--tls-key`
 
 ### Data Flow
 
@@ -105,6 +127,7 @@ Uses `zenoh-ext` AdvancedPublisher/Subscriber for reliability:
 - `zenoh` 1.6.2 - Zenoh distributed data bus
 - `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
+- `tokio-util` - CancellationToken for graceful shutdown
 - `clap` - CLI parsing
 - `anyhow` / `thiserror` - Error handling
 - `tracing` / `tracing-subscriber` - Structured logging with JSON support
@@ -112,3 +135,5 @@ Uses `zenoh-ext` AdvancedPublisher/Subscriber for reliability:
 - `tls-parser` - TLS ClientHello/SNI parsing
 - `tokio-tungstenite` - WebSocket support
 - `futures-util` - Async stream utilities
+- `backon` - Retry with exponential backoff
+- `uuid` - Unique client ID generation

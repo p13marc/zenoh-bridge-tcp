@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
+use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Response {
@@ -67,6 +68,7 @@ fn unique_service(prefix: &str) -> String {
 async fn test_missing_host_header() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     println!("\nTEST: Missing Host Header");
     println!("============================");
@@ -88,12 +90,12 @@ async fn test_missing_host_header() {
     let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             &export_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -107,12 +109,12 @@ async fn test_missing_host_header() {
     let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &import_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -166,6 +168,7 @@ async fn test_missing_host_header() {
 async fn test_malformed_http_requests() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     println!("\nTEST: Malformed HTTP Requests");
     println!("================================");
@@ -187,12 +190,12 @@ async fn test_malformed_http_requests() {
     let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             &export_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -206,12 +209,12 @@ async fn test_malformed_http_requests() {
     let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &import_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -272,6 +275,7 @@ async fn test_malformed_http_requests() {
 async fn test_very_long_headers() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     println!("\nTEST: Very Long HTTP Headers");
     println!("================================");
@@ -293,12 +297,12 @@ async fn test_very_long_headers() {
     let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             &export_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -312,12 +316,12 @@ async fn test_very_long_headers() {
     let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &import_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -389,6 +393,7 @@ async fn test_very_long_headers() {
 async fn test_special_characters_in_hostname() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     println!("\nTEST: Special Characters in Hostname");
     println!("========================================");
@@ -410,12 +415,12 @@ async fn test_special_characters_in_hostname() {
     let export_spec = format!("{}/my-api.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             &export_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -429,12 +434,12 @@ async fn test_special_characters_in_hostname() {
     let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &import_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -509,6 +514,7 @@ async fn test_special_characters_in_hostname() {
 async fn test_http_methods() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     println!("\nTEST: Various HTTP Methods");
     println!("==============================");
@@ -541,12 +547,12 @@ async fn test_http_methods() {
     let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             &export_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -560,12 +566,12 @@ async fn test_http_methods() {
     let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &import_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -659,6 +665,7 @@ async fn test_http_methods() {
 async fn test_connection_lifecycle() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     println!("\nTEST: Connection Lifecycle");
     println!("==============================");
@@ -680,12 +687,12 @@ async fn test_connection_lifecycle() {
     let export_spec = format!("{}/test.example.com/{}", service, backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
             &export_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -699,12 +706,12 @@ async fn test_connection_lifecycle() {
     let import_spec = format!("{}/{}", service, import_addr);
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
             &import_spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             shutdown_token_clone,
         )
         .await

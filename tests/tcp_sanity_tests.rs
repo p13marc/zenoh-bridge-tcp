@@ -1,7 +1,6 @@
-//! Integration tests for Zenoh TCP Bridge
-//!
-//! These tests validate basic functionality without requiring protoc.
-//! Updated for Zenoh 1.6.2 API
+//! TCP sanity tests validating basic TCP assumptions (echo, connection lifecycle, etc.).
+//! These don't involve Zenoh or the bridge binary — they test raw TCP behavior
+//! that the bridge relies on.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

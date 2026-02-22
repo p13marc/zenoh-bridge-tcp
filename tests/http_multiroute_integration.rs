@@ -12,6 +12,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
+use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Response {
@@ -48,7 +49,7 @@ async fn http_request(stream: &mut tokio::net::TcpStream, host: &str) -> String 
     let request = format!("GET / HTTP/1.1\r\nHost: {}\r\n\r\n", host);
     stream.write_all(request.as_bytes()).await.unwrap();
 
-    // Read response — we expect small JSON responses, read in a loop until we
+    // Read response -- we expect small JSON responses, read in a loop until we
     // have a complete HTTP response (headers + body per Content-Length).
     let mut buf = vec![0u8; 8192];
     let mut response = Vec::new();
@@ -89,6 +90,7 @@ async fn http_request(stream: &mut tokio::net::TcpStream, host: &str) -> String 
 async fn test_multiroute_single_request() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     // Start backend
     let backend_addr = start_backend("backend-a").await;
@@ -100,12 +102,12 @@ async fn test_multiroute_single_request() {
     // Start HTTP export for host-a.test
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             s1,
             &format!("mr-test/host-a.test/{}", backend_addr),
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t1,
         )
         .await
@@ -121,12 +123,12 @@ async fn test_multiroute_single_request() {
 
     let s2 = session2.clone();
     let t2 = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
             s2,
             &format!("mr-test/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t2,
         )
         .await
@@ -163,6 +165,7 @@ async fn test_multiroute_single_request() {
 async fn test_multiroute_persistent_connection_switches_hosts() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     // Start two backends
     let backend_a_addr = start_backend("backend-a").await;
@@ -178,12 +181,12 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
     let spec_a = format!("{}/host-a.test/{}", service, backend_a_addr);
+    let bridge_config = config.clone();
     let export_a = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             s1,
             &spec_a,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t1,
         )
         .await
@@ -193,12 +196,12 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
     let spec_b = format!("{}/host-b.test/{}", service, backend_b_addr);
+    let bridge_config = config.clone();
     let export_b = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             s1,
             &spec_b,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t1,
         )
         .await
@@ -215,12 +218,12 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let s2 = session2.clone();
     let t2 = shutdown_token.child_token();
     let spec_import = format!("{}/{}", service, import_addr);
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
             s2,
             &spec_import,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t2,
         )
         .await
@@ -273,6 +276,7 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
 async fn test_multiroute_unavailable_host_returns_502() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
     // Start one backend only (for host-a)
     let backend_addr = start_backend("backend-a").await;
@@ -286,12 +290,12 @@ async fn test_multiroute_unavailable_host_returns_502() {
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
     let spec = format!("{}/host-a.test/{}", service, backend_addr);
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             s1,
             &spec,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t1,
         )
         .await
@@ -308,12 +312,12 @@ async fn test_multiroute_unavailable_host_returns_502() {
     let s2 = session2.clone();
     let t2 = shutdown_token.child_token();
     let spec_import = format!("{}/{}", service, import_addr);
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
             s2,
             &spec_import,
-            65536,
-            Duration::from_secs(5),
+            bridge_config,
             t2,
         )
         .await
@@ -328,8 +332,8 @@ async fn test_multiroute_unavailable_host_returns_502() {
     // Request to nonexistent host -> should get 502
     let resp1 = http_request(&mut stream, "nonexistent.test").await;
     assert!(
-        resp1.contains("502 Bad Gateway"),
-        "Expected 502, got: {}",
+        resp1.starts_with("HTTP/1.1 502"),
+        "Expected HTTP/1.1 502 status line, got: {}",
         resp1
     );
 

@@ -876,5 +876,3 @@ The HTTP/HTTPS routing feature provides powerful DNS-based service discovery and
 
 For more information:
 - [README.md](../README.md) - General bridge documentation
-- [TODO.md](../TODO.md) - Feature roadmap and implementation status
-- [PHASE_B_SUMMARY.md](../PHASE_B_SUMMARY.md) - Technical implementation details

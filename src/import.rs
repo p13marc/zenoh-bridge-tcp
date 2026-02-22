@@ -5,17 +5,29 @@
 //!
 //! Supports regular TCP mode, HTTP-aware mode with DNS-based routing,
 //! HTTPS/TLS with SNI-based routing, and WebSocket mode.
+//!
+//! ## Error handling strategy
+//!
+//! - **Startup errors** (parse, bind, liveliness): propagated via `?`, fatal to the service.
+//! - **Accept-loop errors**: logged at `error!`, loop continues (temporary failures like EMFILE
+//!   should not crash the listener).
+//! - **Per-connection errors** (read/write, publish, backend unavailable): logged, close that
+//!   connection only; other connections are unaffected.
+//! - **Multiroute mode**: response buffering is bounded by `config.max_response_size`; oversized
+//!   responses get HTTP 502 (or connection close if data was already streamed).
+//! - **Shutdown**: each task direction has a `CancellationToken`; the outer select cancels the
+//!   peer token and waits up to `drain_timeout` before a final `.abort()` fallback.
 
+use crate::config::BridgeConfig;
 use crate::http_parser::{http_400_response, http_502_response, parse_http_request};
 use crate::tls_parser::{is_tls_handshake, parse_tls_client_hello};
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use zenoh::Session;
@@ -51,19 +63,10 @@ pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
 pub async fn run_import_mode(
     session: Arc<Session>,
     import_spec: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(
-        session,
-        import_spec,
-        false,
-        buffer_size,
-        drain_timeout,
-        shutdown_token,
-    )
-    .await
+    run_import_mode_internal(session, import_spec, false, config, shutdown_token).await
 }
 
 /// Run HTTP-aware import mode for a single service
@@ -76,19 +79,10 @@ pub async fn run_import_mode(
 pub async fn run_http_import_mode(
     session: Arc<Session>,
     import_spec: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    run_import_mode_internal(
-        session,
-        import_spec,
-        true,
-        buffer_size,
-        drain_timeout,
-        shutdown_token,
-    )
-    .await
+    run_import_mode_internal(session, import_spec, true, config, shutdown_token).await
 }
 
 /// Internal implementation for both regular and HTTP import modes
@@ -96,8 +90,7 @@ async fn run_import_mode_internal(
     session: Arc<Session>,
     import_spec: &str,
     http_mode: bool,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
@@ -133,6 +126,7 @@ async fn run_import_mode_internal(
                         let session = session.clone();
                         let service_name = service_name.clone();
                         let client_id_clone = client_id.clone();
+                        let config = config.clone();
 
                         let span = info_span!(
                             "connection",
@@ -150,8 +144,7 @@ async fn run_import_mode_internal(
                                     &service_name,
                                     &client_id_clone,
                                     http_mode,
-                                    buffer_size,
-                                    drain_timeout,
+                                    config,
                                 )
                                 .await
                                 {
@@ -192,8 +185,7 @@ async fn handle_import_connection(
     service_name: &str,
     client_id: &str,
     http_mode: bool,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
 ) -> Result<()> {
     // Parse HTTP/HTTPS request if in HTTP mode to extract DNS
     let (dns_suffix, initial_buffer) = if http_mode {
@@ -221,7 +213,7 @@ async fn handle_import_connection(
 
                     // Check if any backend is alive
                     let backend_available =
-                        tokio::time::timeout(Duration::from_millis(1000), async {
+                        tokio::time::timeout(config.availability_timeout, async {
                             liveliness_replies.recv_async().await.is_ok()
                         })
                         .await
@@ -268,7 +260,7 @@ async fn handle_import_connection(
 
                     // Check if any backend is alive
                     let backend_available =
-                        tokio::time::timeout(Duration::from_millis(1000), async {
+                        tokio::time::timeout(config.availability_timeout, async {
                             liveliness_replies.recv_async().await.is_ok()
                         })
                         .await
@@ -300,17 +292,18 @@ async fn handle_import_connection(
     };
 
     let (tcp_reader, tcp_writer) = stream.into_split();
+    let reader = crate::transport::TcpReader::new(tcp_reader, config.buffer_size);
+    let writer = crate::transport::TcpWriter::new(tcp_writer);
 
     bridge_import_connection(
         session,
-        tcp_reader,
-        tcp_writer,
+        reader,
+        writer,
         service_name,
         client_id,
         &dns_suffix,
         initial_buffer,
-        buffer_size,
-        drain_timeout,
+        config,
     )
     .await
 }
@@ -318,7 +311,10 @@ async fn handle_import_connection(
 /// Shared bidirectional bridging logic for import connections.
 ///
 /// This function handles the Zenoh pub/sub setup and bidirectional data bridging
-/// for any import connection, regardless of transport (TCP, TLS-terminated, etc.).
+/// for any import connection, regardless of transport (TCP, TLS-terminated, WebSocket).
+///
+/// Generic over `TransportReader`/`TransportWriter` so the same function serves
+/// TCP, TLS-terminated, and WebSocket import paths.
 #[allow(clippy::too_many_arguments)]
 async fn bridge_import_connection<R, W>(
     session: Arc<Session>,
@@ -328,12 +324,11 @@ async fn bridge_import_connection<R, W>(
     client_id: &str,
     dns_suffix: &str,
     initial_buffer: Option<Vec<u8>>,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
 ) -> Result<()>
 where
-    R: AsyncReadExt + Unpin + Send + 'static,
-    W: AsyncWriteExt + Unpin + Send + 'static,
+    R: crate::transport::TransportReader,
+    W: crate::transport::TransportWriter,
 {
     // IMPORTANT: Subscribe to error channel FIRST, before declaring liveliness
     // This prevents race condition where export bridge publishes error before we're subscribed
@@ -354,7 +349,7 @@ where
     let subscriber = session
         .declare_subscriber(&sub_key)
         .history(HistoryConfig::default().detect_late_publishers())
-        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
+        .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
         .subscriber_detection()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
@@ -374,7 +369,7 @@ where
     let publisher = session
         .declare_publisher(pub_key.clone())
         .cache(CacheConfig::default().max_samples(64))
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
+        .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
         .publisher_detection()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
@@ -420,6 +415,10 @@ where
     let client_id_clone = client_id.to_string();
     let client_id_for_error = client_id.to_string();
 
+    // Cancellation tokens for graceful shutdown of each direction
+    let cancel_zenoh_to_client = CancellationToken::new();
+    let cancel_client_to_zenoh = CancellationToken::new();
+
     // Task: Monitor error signals from export bridge
     let mut error_monitor = tokio::spawn(async move {
         if let Ok(sample) = error_subscriber.recv_async().await {
@@ -434,117 +433,134 @@ where
         false
     });
 
-    let mut zenoh_to_tcp = tokio::spawn(async move {
-        while let Ok(sample) = subscriber.recv_async().await {
-            let payload = sample.payload().to_bytes().to_vec();
+    let z2c_token = cancel_zenoh_to_client.clone();
+    let mut zenoh_to_client = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                result = subscriber.recv_async() => {
+                    let Ok(sample) = result else { break };
+                    let payload = sample.payload().to_bytes().to_vec();
 
-            // Empty payload is EOF signal from export side
-            if payload.is_empty() {
-                debug!("Client {}: Received EOF signal from Zenoh", client_id_clone);
-                break;
-            }
+                    if payload.is_empty() {
+                        debug!("Client {}: Received EOF signal from Zenoh", client_id_clone);
+                        let _ = writer.send_eof().await;
+                        break;
+                    }
 
-            debug!(
-                "Client {}: ← {} bytes from Zenoh",
-                client_id_clone,
-                payload.len()
-            );
+                    debug!("Client {}: ← {} bytes from Zenoh", client_id_clone, payload.len());
 
-            if let Err(e) = writer.write_all(&payload).await {
-                error!(
-                    "Client {}: Failed to write to TCP: {:?}",
-                    client_id_clone, e
-                );
-                break;
-            }
-
-            // Flush to ensure data is sent immediately
-            if let Err(e) = writer.flush().await {
-                error!("Client {}: Failed to flush TCP: {:?}", client_id_clone, e);
-                break;
+                    if let Err(e) = writer.write_data(&payload).await {
+                        error!("Client {}: Failed to write to client: {:?}", client_id_clone, e);
+                        break;
+                    }
+                }
+                _ = z2c_token.cancelled() => {
+                    debug!("Client {}: Zenoh-to-client cancelled", client_id_clone);
+                    break;
+                }
             }
         }
 
-        // Shutdown the write side of the connection to signal EOF to the client
         if let Err(e) = writer.shutdown().await {
-            debug!(
-                "Client {}: Error shutting down write: {:?}",
-                client_id_clone, e
-            );
+            debug!("Client {}: Error shutting down write: {:?}", client_id_clone, e);
         }
 
-        debug!("Client {}: Zenoh to TCP task completed", client_id_clone);
-        // Explicitly undeclare subscriber before task exits
+        debug!("Client {}: Zenoh to client task completed", client_id_clone);
         if let Err(e) = subscriber.undeclare().await {
-            debug!(
-                "Client {}: Error undeclaring subscriber: {:?}",
-                client_id_clone, e
-            );
+            debug!("Client {}: Error undeclaring subscriber: {:?}", client_id_clone, e);
         }
     });
 
     // Task: reader -> Zenoh AdvancedPublisher
     let client_id_clone = client_id.to_string();
-    let mut tcp_to_zenoh = tokio::spawn(async move {
-        let mut buffer = vec![0u8; buffer_size];
+    let buffer_size = config.buffer_size;
+    let drain_timeout = config.drain_timeout;
+    let c2z_token = cancel_client_to_zenoh.clone();
+    let mut client_to_zenoh = tokio::spawn(async move {
         loop {
-            match reader.read(&mut buffer).await {
-                Ok(0) => {
-                    debug!("Client {}: TCP connection closed", client_id_clone);
-                    break;
-                }
-                Ok(n) => {
-                    debug!("Client {}: → {} bytes to Zenoh", client_id_clone, n);
-                    if let Err(e) = publisher.put(&buffer[..n]).await {
-                        error!(
-                            "Client {}: Failed to publish to Zenoh: {:?}",
-                            client_id_clone, e
-                        );
-                        break;
+            tokio::select! {
+                result = reader.read_data(buffer_size) => {
+                    match result {
+                        Ok(data) if data.is_empty() => {
+                            debug!("Client {}: Connection closed", client_id_clone);
+                            break;
+                        }
+                        Ok(data) => {
+                            debug!("Client {}: → {} bytes to Zenoh", client_id_clone, data.len());
+                            if let Err(e) = publisher.put(&data[..]).await {
+                                error!("Client {}: Failed to publish to Zenoh: {:?}", client_id_clone, e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("Client {}: Read error: {:?}", client_id_clone, e);
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("Client {}: TCP read error: {:?}", client_id_clone, e);
+                _ = c2z_token.cancelled() => {
+                    debug!("Client {}: Client-to-Zenoh cancelled", client_id_clone);
                     break;
                 }
             }
         }
-        // Explicitly undeclare publisher before task exits
         if let Err(e) = publisher.undeclare().await {
-            debug!(
-                "Client {}: Error undeclaring publisher: {:?}",
-                client_id_clone, e
-            );
+            debug!("Client {}: Error undeclaring publisher: {:?}", client_id_clone, e);
         }
     });
 
     // Wait for either task to complete or error signal
     tokio::select! {
-        _ = &mut zenoh_to_tcp => {
-            info!("Client {}: Zenoh to TCP task completed", client_id);
-            tcp_to_zenoh.abort();
+        _ = &mut zenoh_to_client => {
+            info!("Client {}: Zenoh to client task completed", client_id);
+            cancel_client_to_zenoh.cancel();
             error_monitor.abort();
+            match tokio::time::timeout(drain_timeout, &mut client_to_zenoh).await {
+                Ok(_) => {}
+                Err(_) => {
+                    debug!("Client {}: Client-to-Zenoh drain timeout", client_id);
+                    client_to_zenoh.abort();
+                    let _ = client_to_zenoh.await;
+                }
+            }
         },
-        _ = &mut tcp_to_zenoh => {
-            info!("Client {}: TCP to Zenoh task completed", client_id);
-            zenoh_to_tcp.abort();
+        _ = &mut client_to_zenoh => {
+            info!("Client {}: Client to Zenoh task completed", client_id);
+            cancel_zenoh_to_client.cancel();
             error_monitor.abort();
+            match tokio::time::timeout(drain_timeout, &mut zenoh_to_client).await {
+                Ok(_) => {}
+                Err(_) => {
+                    debug!("Client {}: Zenoh-to-client drain timeout", client_id);
+                    zenoh_to_client.abort();
+                    let _ = zenoh_to_client.await;
+                }
+            }
         },
         error_result = &mut error_monitor => {
             if let Ok(true) = error_result {
                 warn!("Client {}: Backend unavailable, draining remaining data", client_id);
 
-                // Stop sending to the dead backend
-                tcp_to_zenoh.abort();
+                cancel_client_to_zenoh.cancel();
+                match tokio::time::timeout(drain_timeout, &mut client_to_zenoh).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        debug!("Client {}: Client-to-Zenoh drain timeout after error", client_id);
+                        client_to_zenoh.abort();
+                        let _ = client_to_zenoh.await;
+                    }
+                }
 
-                // Give the zenoh_to_tcp task time to drain buffered samples
-                match tokio::time::timeout(drain_timeout, &mut zenoh_to_tcp).await {
+                // Give the zenoh_to_client task time to drain buffered samples
+                cancel_zenoh_to_client.cancel();
+                match tokio::time::timeout(drain_timeout, &mut zenoh_to_client).await {
                     Ok(_) => {
                         info!("Client {}: Drain completed", client_id);
                     }
                     Err(_) => {
                         warn!("Client {}: Drain timed out after {:?}, aborting", client_id, drain_timeout);
-                        zenoh_to_tcp.abort();
+                        zenoh_to_client.abort();
+                        let _ = zenoh_to_client.await;
                     }
                 }
             }
@@ -570,8 +586,7 @@ where
 pub async fn run_http_multiroute_import_mode(
     session: Arc<Session>,
     import_spec: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
@@ -597,6 +612,7 @@ pub async fn run_http_multiroute_import_mode(
                         let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
                         let session = session.clone();
                         let service_name = service_name.clone();
+                        let config = config.clone();
 
                         let span = info_span!(
                             "http_multiroute",
@@ -608,7 +624,7 @@ pub async fn run_http_multiroute_import_mode(
                         tokio::spawn(async move {
                             if let Err(e) = handle_multiroute_connection(
                                 session, stream, &service_name, &client_id,
-                                buffer_size, drain_timeout,
+                                config,
                             ).await {
                                 error!(error = %e, "Multi-route connection error");
                             }
@@ -638,14 +654,12 @@ pub async fn run_http_multiroute_import_mode(
 /// 4. Forward the request and receive the full response
 /// 5. Detect response completion via Content-Length/chunked/EOF
 /// 6. Loop for the next request (or close on Connection: close)
-#[allow(clippy::too_many_arguments)]
 async fn handle_multiroute_connection(
     session: Arc<Session>,
     mut stream: TcpStream,
     service_name: &str,
     client_id: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
 ) -> Result<()> {
     let mut request_num = 0u64;
 
@@ -723,7 +737,7 @@ async fn handle_multiroute_connection(
             .cache(CacheConfig::default().max_samples(64))
             .publisher_detection()
             .sample_miss_detection(
-                MissDetectionConfig::default().heartbeat(Duration::from_millis(500)),
+                MissDetectionConfig::default().heartbeat(config.heartbeat_interval),
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
@@ -740,12 +754,13 @@ async fn handle_multiroute_connection(
         debug!(request_id = %request_id, "Published request ({} bytes)", parsed.buffer.len());
 
         // 4. Receive response and forward to client
-        let mut response_buf = Vec::with_capacity(buffer_size);
+        let mut response_buf = Vec::with_capacity(config.buffer_size);
         let mut body_framing: Option<crate::http_response_parser::ResponseBodyFraming> = None;
         let mut header_len: usize = 0;
         let mut response_complete = false;
+        let mut bytes_written: usize = 0;
 
-        let timeout_duration = Duration::from_secs(30).max(drain_timeout);
+        let timeout_duration = Duration::from_secs(30).max(config.drain_timeout);
         let response_result = tokio::time::timeout(timeout_duration, async {
             while let Ok(sample) = rx_subscriber.recv_async().await {
                 let payload = sample.payload().to_bytes();
@@ -758,6 +773,15 @@ async fn handle_multiroute_connection(
 
                 response_buf.extend_from_slice(&payload);
 
+                if response_buf.len() > config.max_response_size {
+                    warn!(request_id = %request_id, "Response exceeded max size ({} bytes)", config.max_response_size);
+                    if bytes_written == 0 {
+                        let error_resp = crate::http_parser::http_502_response("Response too large");
+                        let _ = stream.write_all(&error_resp).await;
+                    }
+                    return Err(std::io::Error::other("response too large"));
+                }
+
                 // Parse response headers if not done yet
                 if body_framing.is_none()
                     && let Ok(Some((hlen, framing))) =
@@ -769,6 +793,7 @@ async fn handle_multiroute_connection(
 
                 // Write to client
                 stream.write_all(&payload).await?;
+                bytes_written += payload.len();
 
                 // Check if response is complete
                 if let Some(ref framing) = body_framing {
@@ -872,6 +897,7 @@ async fn check_backend_available(session: &Session, service_key: &str) -> bool {
 pub async fn run_ws_import_mode(
     session: Arc<Session>,
     import_spec: &str,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
@@ -902,6 +928,7 @@ pub async fn run_ws_import_mode(
                         let session = session.clone();
                         let service_name = service_name.clone();
                         let client_id_clone = client_id.clone();
+                        let config = config.clone();
 
                         let span = info_span!(
                             "ws_connection",
@@ -916,11 +943,18 @@ pub async fn run_ws_import_mode(
                                 // Perform WebSocket upgrade
                                 match tokio_tungstenite::accept_async(stream).await {
                                     Ok(ws_stream) => {
-                                        if let Err(e) = handle_ws_import_connection(
+                                        let (ws_sender, ws_receiver) = ws_stream.split();
+                                        let reader = crate::transport::WsReader::new(ws_receiver);
+                                        let writer = crate::transport::WsWriter::new(ws_sender);
+                                        if let Err(e) = bridge_import_connection(
                                             session,
-                                            ws_stream,
+                                            reader,
+                                            writer,
                                             &service_name,
                                             &client_id_clone,
+                                            "",
+                                            None,
+                                            config,
                                         )
                                         .await
                                         {
@@ -952,183 +986,6 @@ pub async fn run_ws_import_mode(
     Ok(())
 }
 
-/// Handle a single WebSocket import connection
-async fn handle_ws_import_connection(
-    session: Arc<Session>,
-    ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>,
-    service_name: &str,
-    client_id: &str,
-) -> Result<()> {
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
-
-    // Subscribe to responses from the service for this specific client
-    let sub_key = format!("{}/rx/{}", service_name, client_id);
-    let subscriber = session
-        .declare_subscriber(&sub_key)
-        .history(HistoryConfig::default().detect_late_publishers())
-        .recovery(RecoveryConfig::default().periodic_queries(Duration::from_millis(500)))
-        .subscriber_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
-
-    debug!(
-        "WebSocket client {}: Subscribed to {} with late publisher detection",
-        client_id, sub_key
-    );
-
-    // Declare publisher for TX channel
-    let pub_key_str = format!("{}/tx/{}", service_name, client_id);
-    let pub_key: KeyExpr<'static> = pub_key_str
-        .clone()
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
-    let publisher = session
-        .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(64))
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(Duration::from_millis(500)))
-        .publisher_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
-
-    debug!(
-        "WebSocket client {}: Declared AdvancedPublisher on {} with cache",
-        client_id, pub_key_str
-    );
-
-    // Declare liveliness token - export bridge will detect this and connect
-    let liveliness_key = format!("{}/clients/{}", service_name, client_id);
-    let liveliness_token = session
-        .liveliness()
-        .declare_token(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
-
-    info!(
-        "WebSocket client {} declared liveliness: {}",
-        client_id, liveliness_key
-    );
-
-    let client_id_clone = client_id.to_string();
-    let client_id_for_sender = client_id.to_string();
-
-    // Task: Zenoh subscriber -> WebSocket sender
-    let mut zenoh_to_ws = tokio::spawn(async move {
-        while let Ok(sample) = subscriber.recv_async().await {
-            let payload = sample.payload().to_bytes().to_vec();
-
-            // Empty payload is EOF signal from export side
-            if payload.is_empty() {
-                debug!(
-                    "WebSocket client {}: Received EOF signal from Zenoh",
-                    client_id_clone
-                );
-                // Send close frame
-                let _ = ws_sender.send(Message::Close(None)).await;
-                break;
-            }
-
-            debug!(
-                "WebSocket client {}: ← {} bytes from Zenoh",
-                client_id_clone,
-                payload.len()
-            );
-
-            if let Err(e) = ws_sender.send(Message::Binary(payload.into())).await {
-                error!(
-                    "WebSocket client {}: Failed to send: {:?}",
-                    client_id_clone, e
-                );
-                break;
-            }
-        }
-
-        debug!(
-            "WebSocket client {}: Zenoh to WebSocket task completed",
-            client_id_clone
-        );
-        // Explicitly undeclare subscriber before task exits
-        if let Err(e) = subscriber.undeclare().await {
-            debug!(
-                "WebSocket client {}: Error undeclaring subscriber: {:?}",
-                client_id_clone, e
-            );
-        }
-    });
-
-    // Task: WebSocket receiver -> Zenoh publisher
-    let mut ws_to_zenoh = tokio::spawn(async move {
-        while let Some(msg_result) = ws_receiver.next().await {
-            match msg_result {
-                Ok(msg) => {
-                    let data = match msg {
-                        Message::Binary(data) => data.to_vec(),
-                        Message::Text(text) => text.as_bytes().to_vec(),
-                        Message::Close(_) => {
-                            debug!(
-                                "WebSocket client {}: Connection closed by client",
-                                client_id_for_sender
-                            );
-                            break;
-                        }
-                        Message::Ping(_) | Message::Pong(_) => continue,
-                        Message::Frame(_) => continue,
-                    };
-
-                    debug!(
-                        "WebSocket client {}: → {} bytes to Zenoh",
-                        client_id_for_sender,
-                        data.len()
-                    );
-
-                    if let Err(e) = publisher.put(&data).await {
-                        error!(
-                            "WebSocket client {}: Failed to publish to Zenoh: {:?}",
-                            client_id_for_sender, e
-                        );
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "WebSocket client {}: Receive error: {:?}",
-                        client_id_for_sender, e
-                    );
-                    break;
-                }
-            }
-        }
-        // Explicitly undeclare publisher before task exits
-        if let Err(e) = publisher.undeclare().await {
-            debug!(
-                "WebSocket client {}: Error undeclaring publisher: {:?}",
-                client_id_for_sender, e
-            );
-        }
-    });
-
-    // Wait for either task to complete
-    tokio::select! {
-        _ = &mut zenoh_to_ws => {
-            info!("WebSocket client {}: Zenoh to WebSocket task completed", client_id);
-            ws_to_zenoh.abort();
-        },
-        _ = &mut ws_to_zenoh => {
-            info!("WebSocket client {}: WebSocket to Zenoh task completed", client_id);
-            zenoh_to_ws.abort();
-        },
-    }
-
-    // Explicitly undeclare liveliness token
-    if let Err(e) = liveliness_token.undeclare().await {
-        debug!(
-            "WebSocket client {}: Error undeclaring liveliness: {:?}",
-            client_id, e
-        );
-    }
-
-    Ok(())
-}
-
 /// Run auto-detecting import mode for a single service.
 ///
 /// This function:
@@ -1138,8 +995,7 @@ async fn handle_ws_import_connection(
 pub async fn run_auto_import_mode(
     session: Arc<Session>,
     import_spec: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let (service_name, listen_addr) = parse_import_spec(import_spec)?;
@@ -1171,6 +1027,7 @@ pub async fn run_auto_import_mode(
 
                         let session = session.clone();
                         let service_name = service_name.clone();
+                        let config = config.clone();
 
                         let span = info_span!(
                             "auto_connection",
@@ -1181,7 +1038,7 @@ pub async fn run_auto_import_mode(
 
                         tokio::spawn(async move {
                             if let Err(e) = handle_auto_import_connection(
-                                session, stream, &service_name, &client_id, buffer_size, drain_timeout,
+                                session, stream, &service_name, &client_id, config,
                             ).await {
                                 error!(error = %e, "Connection error");
                             }
@@ -1210,8 +1067,7 @@ async fn handle_auto_import_connection(
     stream: TcpStream,
     service_name: &str,
     client_id: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
 ) -> Result<()> {
     use crate::protocol_detect::{DetectedProtocol, detect_protocol};
 
@@ -1234,41 +1090,15 @@ async fn handle_auto_import_connection(
         DetectedProtocol::Tls => {
             // Delegate to HTTP mode which already handles TLS detection
             // via is_tls_handshake + parse_tls_client_hello
-            handle_import_connection(
-                session,
-                stream,
-                service_name,
-                client_id,
-                true,
-                buffer_size,
-                drain_timeout,
-            )
-            .await
+            handle_import_connection(session, stream, service_name, client_id, true, config).await
         }
         DetectedProtocol::Http => {
             // Could be regular HTTP or WebSocket upgrade
-            handle_auto_http_connection(
-                session,
-                stream,
-                service_name,
-                client_id,
-                buffer_size,
-                drain_timeout,
-            )
-            .await
+            handle_auto_http_connection(session, stream, service_name, client_id, config).await
         }
         DetectedProtocol::RawTcp => {
             // Raw TCP passthrough — no DNS routing
-            handle_import_connection(
-                session,
-                stream,
-                service_name,
-                client_id,
-                false,
-                buffer_size,
-                drain_timeout,
-            )
-            .await
+            handle_import_connection(session, stream, service_name, client_id, false, config).await
         }
     }
 }
@@ -1279,8 +1109,7 @@ async fn handle_auto_http_connection(
     stream: TcpStream,
     service_name: &str,
     client_id: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
 ) -> Result<()> {
     // Peek enough to detect "Upgrade: websocket" in headers
     let mut peek_buf = vec![0u8; 4096];
@@ -1295,11 +1124,18 @@ async fn handle_auto_http_connection(
             info!(client_id = %client_id, "Detected WebSocket upgrade request");
             match tokio_tungstenite::accept_async(stream).await {
                 Ok(ws_stream) => {
-                    return handle_ws_import_connection(
+                    let (ws_sender, ws_receiver) = ws_stream.split();
+                    let reader = crate::transport::WsReader::new(ws_receiver);
+                    let writer = crate::transport::WsWriter::new(ws_sender);
+                    return bridge_import_connection(
                         session,
-                        ws_stream,
+                        reader,
+                        writer,
                         service_name,
                         client_id,
+                        "",
+                        None,
+                        config,
                     )
                     .await;
                 }
@@ -1311,16 +1147,7 @@ async fn handle_auto_http_connection(
     }
 
     // Regular HTTP — delegate to HTTP import handler
-    handle_import_connection(
-        session,
-        stream,
-        service_name,
-        client_id,
-        true,
-        buffer_size,
-        drain_timeout,
-    )
-    .await
+    handle_import_connection(session, stream, service_name, client_id, true, config).await
 }
 
 /// Run HTTPS import mode with TLS termination.
@@ -1338,8 +1165,7 @@ pub async fn run_https_terminate_import_mode(
     session: Arc<Session>,
     import_spec: &str,
     tls_config: Arc<rustls::ServerConfig>,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     use tokio_rustls::TlsAcceptor;
@@ -1375,6 +1201,7 @@ pub async fn run_https_terminate_import_mode(
                         let session = session.clone();
                         let service_name = service_name.clone();
                         let tls_acceptor = tls_acceptor.clone();
+                        let config = config.clone();
 
                         let span = info_span!(
                             "tls_connection",
@@ -1392,8 +1219,7 @@ pub async fn run_https_terminate_import_mode(
                                         tls_stream,
                                         &service_name,
                                         &client_id,
-                                        buffer_size,
-                                        drain_timeout,
+                                        config,
                                     ).await {
                                         error!(error = %e, "TLS connection error");
                                     }
@@ -1431,8 +1257,7 @@ async fn handle_tls_terminated_connection(
     tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     service_name: &str,
     client_id: &str,
-    buffer_size: usize,
-    drain_timeout: Duration,
+    config: Arc<BridgeConfig>,
 ) -> Result<()> {
     let (mut tls_reader, tls_writer) = tokio::io::split(tls_stream);
 
@@ -1456,7 +1281,7 @@ async fn handle_tls_terminated_connection(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to query liveliness: {}", e))?;
 
-    let backend_available = tokio::time::timeout(Duration::from_millis(1000), async {
+    let backend_available = tokio::time::timeout(config.availability_timeout, async {
         liveliness_replies.recv_async().await.is_ok()
     })
     .await
@@ -1470,17 +1295,19 @@ async fn handle_tls_terminated_connection(
     info!("Client {}: Backend available for DNS: {}", client_id, dns);
 
     // Bridge the decrypted connection through Zenoh
-    // The tls_writer half comes from the split TLS stream
+    // Wrap TLS halves with transport traits (same as TCP — both implement AsyncReadExt/AsyncWriteExt)
+    let reader = crate::transport::TcpReader::new(tls_reader, config.buffer_size);
+    let writer = crate::transport::TcpWriter::new(tls_writer);
+
     bridge_import_connection(
         session,
-        tls_reader,
-        tls_writer,
+        reader,
+        writer,
         service_name,
         client_id,
         &dns_suffix,
         Some(parsed.buffer),
-        buffer_size,
-        drain_timeout,
+        config,
     )
     .await
 }

@@ -138,18 +138,17 @@ async fn main() -> Result<()> {
     let auto_import_count = args.auto_import.len();
     let http_multiroute_import_count = args.http_multiroute_import.len();
 
-    let buffer_size = args.buffer_size;
-    let drain_timeout = std::time::Duration::from_secs(args.drain_timeout);
+    let bridge_config = Arc::new(args.bridge_config());
 
     // TCP export tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(&mut tasks, &args.export, "export", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
-                async move {
-                    export::run_export_mode(session, &spec, buffer_size, drain_timeout, token).await
-                }
+                let config = bridge_config.clone();
+                async move { export::run_export_mode(session, &spec, config, token).await }
             }
         });
     }
@@ -157,12 +156,12 @@ async fn main() -> Result<()> {
     // TCP import tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(&mut tasks, &args.import, "import", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
-                async move {
-                    import::run_import_mode(session, &spec, buffer_size, drain_timeout, token).await
-                }
+                let config = bridge_config.clone();
+                async move { import::run_import_mode(session, &spec, config, token).await }
             }
         });
     }
@@ -170,6 +169,7 @@ async fn main() -> Result<()> {
     // HTTP export tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(
             &mut tasks,
             &args.http_export,
@@ -178,15 +178,9 @@ async fn main() -> Result<()> {
             {
                 move |spec, token| {
                     let session = session.clone();
+                    let config = bridge_config.clone();
                     async move {
-                        export::run_http_export_mode(
-                            session,
-                            &spec,
-                            buffer_size,
-                            drain_timeout,
-                            token,
-                        )
-                        .await
+                        export::run_http_export_mode(session, &spec, config, token).await
                     }
                 }
             },
@@ -196,6 +190,7 @@ async fn main() -> Result<()> {
     // HTTP import tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(
             &mut tasks,
             &args.http_import,
@@ -204,15 +199,9 @@ async fn main() -> Result<()> {
             {
                 move |spec, token| {
                     let session = session.clone();
+                    let config = bridge_config.clone();
                     async move {
-                        import::run_http_import_mode(
-                            session,
-                            &spec,
-                            buffer_size,
-                            drain_timeout,
-                            token,
-                        )
-                        .await
+                        import::run_http_import_mode(session, &spec, config, token).await
                     }
                 }
             },
@@ -222,10 +211,12 @@ async fn main() -> Result<()> {
     // WebSocket export tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(&mut tasks, &args.ws_export, "ws_export", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
-                async move { export::run_ws_export_mode(session, &spec, drain_timeout, token).await }
+                let config = bridge_config.clone();
+                async move { export::run_ws_export_mode(session, &spec, config, token).await }
             }
         });
     }
@@ -233,10 +224,12 @@ async fn main() -> Result<()> {
     // WebSocket import tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(&mut tasks, &args.ws_import, "ws_import", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
-                async move { import::run_ws_import_mode(session, &spec, token).await }
+                let config = bridge_config.clone();
+                async move { import::run_ws_import_mode(session, &spec, config, token).await }
             }
         });
     }
@@ -244,6 +237,7 @@ async fn main() -> Result<()> {
     // Auto-detecting import tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(
             &mut tasks,
             &args.auto_import,
@@ -252,15 +246,9 @@ async fn main() -> Result<()> {
             {
                 move |spec, token| {
                     let session = session.clone();
+                    let config = bridge_config.clone();
                     async move {
-                        import::run_auto_import_mode(
-                            session,
-                            &spec,
-                            buffer_size,
-                            drain_timeout,
-                            token,
-                        )
-                        .await
+                        import::run_auto_import_mode(session, &spec, config, token).await
                     }
                 }
             },
@@ -270,6 +258,7 @@ async fn main() -> Result<()> {
     // HTTP multiroute import tasks
     {
         let session = session.clone();
+        let bridge_config = bridge_config.clone();
         spawn_bridge_tasks(
             &mut tasks,
             &args.http_multiroute_import,
@@ -278,15 +267,10 @@ async fn main() -> Result<()> {
             {
                 move |spec, token| {
                     let session = session.clone();
+                    let config = bridge_config.clone();
                     async move {
-                        import::run_http_multiroute_import_mode(
-                            session,
-                            &spec,
-                            buffer_size,
-                            drain_timeout,
-                            token,
-                        )
-                        .await
+                        import::run_http_multiroute_import_mode(session, &spec, config, token)
+                            .await
                     }
                 }
             },
@@ -310,14 +294,14 @@ async fn main() -> Result<()> {
             let session = session.clone();
             let spec_clone = spec.clone();
             let tls_config = tls_config.clone();
+            let config = bridge_config.clone();
             let token = shutdown_token.child_token();
             tasks.push(tokio::spawn(async move {
                 if let Err(e) = import::run_https_terminate_import_mode(
                     session,
                     &spec_clone,
                     tls_config,
-                    buffer_size,
-                    drain_timeout,
+                    config,
                     token,
                 )
                 .await

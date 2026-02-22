@@ -282,7 +282,84 @@ mod tests {
         assert!(!is_tls_handshake(&wrong));
     }
 
-    // Note: Full ClientHello parsing tests require valid TLS handshake data
-    // which is complex to construct manually. Integration tests with real
-    // TLS connections will validate the full parsing logic.
+    /// Build a minimal TLS 1.2 ClientHello with an SNI extension.
+    fn build_client_hello_with_sni(hostname: &str) -> Vec<u8> {
+        let name_bytes = hostname.as_bytes();
+
+        // SNI extension payload:
+        //   extension_type(2) + extension_length(2) + sni_list_length(2) +
+        //   name_type(1) + name_length(2) + name
+        let sni_ext_len = 2 + 1 + 2 + name_bytes.len();
+        let ext_len = sni_ext_len;
+        let sni_ext: Vec<u8> = [
+            &[0x00, 0x00],                                          // Extension type: SNI
+            &((ext_len as u16).to_be_bytes())[..],                  // Extension data length
+            &(((ext_len - 2) as u16).to_be_bytes())[..],           // SNI list length
+            &[0x00],                                                 // Name type: host_name
+            &((name_bytes.len() as u16).to_be_bytes())[..],        // Name length
+            name_bytes,                                              // The hostname
+        ]
+        .concat();
+
+        let extensions_total_len = sni_ext.len();
+
+        // ClientHello body (after handshake type + length):
+        //   version(2) + random(32) + session_id_len(1)=0 +
+        //   cipher_suites_len(2) + one suite(2) +
+        //   compression_len(1) + null compression(1) +
+        //   extensions_len(2) + extensions
+        let client_hello_body: Vec<u8> = [
+            &[0x03, 0x03],                          // TLS 1.2
+            &[0x00u8; 32][..],                      // Random (32 zero bytes)
+            &[0x00],                                 // Session ID length: 0
+            &[0x00, 0x02],                           // Cipher suites length: 2
+            &[0x00, 0xFF],                           // Cipher suite: TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+            &[0x01, 0x00],                           // Compression methods: 1, null
+            &((extensions_total_len as u16).to_be_bytes())[..],
+            &sni_ext,
+        ]
+        .concat();
+
+        // Handshake message:
+        //   type(1) + length(3) + body
+        let hs_len = client_hello_body.len();
+        let mut handshake = Vec::with_capacity(4 + hs_len);
+        handshake.push(0x01); // ClientHello
+        handshake.extend_from_slice(&[0x00, ((hs_len >> 8) & 0xFF) as u8, (hs_len & 0xFF) as u8]);
+        handshake.extend_from_slice(&client_hello_body);
+
+        // TLS record:
+        //   content_type(1) + version(2) + length(2) + handshake
+        let record_len = handshake.len();
+        [
+            &[0x16, 0x03, 0x01],                                    // Handshake, TLS 1.0 (legacy)
+            &((record_len as u16).to_be_bytes())[..],
+            &handshake,
+        ]
+        .concat()
+    }
+
+    #[test]
+    fn test_extract_sni_from_valid_client_hello() {
+        let record = build_client_hello_with_sni("example.com");
+        let sni = extract_sni_from_client_hello(&record);
+        assert!(sni.is_ok());
+        assert_eq!(sni.unwrap(), "example.com");
+    }
+
+    #[test]
+    fn test_extract_sni_different_hostnames() {
+        for hostname in &["api.test.com", "localhost", "my-service.internal"] {
+            let record = build_client_hello_with_sni(hostname);
+            let sni = extract_sni_from_client_hello(&record).unwrap();
+            assert_eq!(sni, *hostname);
+        }
+    }
+
+    #[test]
+    fn test_extract_sni_from_non_tls_data() {
+        let http = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = extract_sni_from_client_hello(http);
+        assert!(result.is_err());
+    }
 }

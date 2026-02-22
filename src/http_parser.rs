@@ -232,6 +232,12 @@ fn extract_host_from_absolute_uri(path: &str) -> Option<&str> {
 pub fn normalize_dns(host: &str) -> String {
     let host = host.to_lowercase();
 
+    // IPv6 without brackets: multiple colons means it's an IPv6 address, not host:port
+    let colon_count = host.chars().filter(|&c| c == ':').count();
+    if colon_count > 1 && !host.starts_with('[') {
+        return host;
+    }
+
     // Strip default ports using proper port parsing
     if let Some(colon_pos) = host.rfind(':') {
         let port_str = &host[colon_pos + 1..];
@@ -339,6 +345,10 @@ mod tests {
         // IPv6 with port (bracket notation)
         assert_eq!(normalize_dns("[::1]:80"), "[::1]");
         assert_eq!(normalize_dns("[::1]:8080"), "[::1]:8080");
+        // IPv6 without brackets: must not strip address octets as "port"
+        assert_eq!(normalize_dns("::1"), "::1");
+        assert_eq!(normalize_dns("2001:db8::1"), "2001:db8::1");
+        assert_eq!(normalize_dns("::ffff:127.0.0.1"), "::ffff:127.0.0.1");
     }
 
     #[test]

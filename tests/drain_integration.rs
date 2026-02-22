@@ -1,29 +1,10 @@
 mod common;
 
 use anyhow::Result;
-use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
 use tokio::time::timeout;
-
-/// Helper to spawn a bridge process with kill_on_drop for reliable cleanup.
-async fn spawn_bridge(args: &[&str]) -> tokio::process::Child {
-    Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(args)
-        .kill_on_drop(true)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("Failed to spawn bridge")
-}
-
-/// Kill a bridge and wait for it to fully exit.
-async fn kill_bridge(mut child: tokio::process::Child) {
-    let _ = child.kill().await;
-    let _ = timeout(Duration::from_secs(2), child.wait()).await;
-}
 
 /// Test that data sent by backend before it closes is drained to the client.
 ///
@@ -81,31 +62,9 @@ async fn test_drain_on_backend_close() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Start export bridge
     let service = common::unique_service_name("drainclose");
-    let export_spec = format!("{}/{}", service, backend_addr);
-    println!("7. Starting export bridge: --export '{}'", export_spec);
-
-    let export_bridge = spawn_bridge(&["--export", &export_spec]).await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Start import bridge
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
-
-    let import_spec = format!("{}/{}", service, import_addr);
-    println!("8. Starting import bridge: --import '{}'", import_spec);
-
-    let import_bridge = spawn_bridge(&["--import", &import_spec]).await;
-
-    common::wait_for_port(import_addr, Duration::from_secs(10))
-        .await
-        .expect("Import bridge did not start in time");
-    println!("9. Import bridge started");
+    let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
+    let import_addr = pair.import_addr;
 
     // Connect client — use retry loop for resilience against Zenoh timing
     let mut got_response = false;
@@ -184,8 +143,7 @@ async fn test_drain_on_backend_close() -> Result<()> {
     println!("13. TEST PASSED: Backend data drained to client before close");
 
     // Cleanup
-    kill_bridge(export_bridge).await;
-    kill_bridge(import_bridge).await;
+    pair.kill_and_wait().await;
     backend_task.abort();
     println!("14. TEST COMPLETED\n");
 
@@ -211,27 +169,10 @@ async fn test_drain_on_backend_error() -> Result<()> {
 
     // Start export bridge pointing to non-existent backend
     let service = common::unique_service_name("drainerr");
-    let export_spec = format!("{}/{}", service, backend_addr);
-    println!("2. Starting export bridge: --export '{}'", export_spec);
+    println!("2. Starting bridges for service '{}'", service);
 
-    let export_bridge = spawn_bridge(&["--export", &export_spec]).await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Start import bridge
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
-
-    let import_spec = format!("{}/{}", service, import_addr);
-    println!("3. Starting import bridge: --import '{}'", import_spec);
-
-    let import_bridge = spawn_bridge(&["--import", &import_spec]).await;
-
-    common::wait_for_port(import_addr, Duration::from_secs(10))
-        .await
-        .expect("Import bridge did not start in time");
-    println!("4. Import bridge started");
+    let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
+    let import_addr = pair.import_addr;
 
     // Connect client
     println!("5. Client: Connecting...");
@@ -271,8 +212,7 @@ async fn test_drain_on_backend_error() -> Result<()> {
 
     // Cleanup
     drop(client);
-    kill_bridge(export_bridge).await;
-    kill_bridge(import_bridge).await;
+    pair.kill_and_wait().await;
     println!("8. TEST COMPLETED\n");
 
     Ok(())
@@ -295,29 +235,18 @@ async fn test_drain_timeout_enforced() -> Result<()> {
         backend_addr
     );
 
-    // Start export bridge with short drain timeout
+    // Start bridges with short drain timeout
     let service = common::unique_service_name("draintimeout");
-    let export_spec = format!("{}/{}", service, backend_addr);
-    println!("2. Starting export bridge with --drain-timeout 2");
+    println!("2. Starting bridges with --drain-timeout 2");
 
-    let export_bridge = spawn_bridge(&["--export", &export_spec, "--drain-timeout", "2"]).await;
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Start import bridge with same drain timeout
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
-
-    let import_spec = format!("{}/{}", service, import_addr);
-    println!("3. Starting import bridge with --drain-timeout 2");
-
-    let import_bridge = spawn_bridge(&["--import", &import_spec, "--drain-timeout", "2"]).await;
-
-    common::wait_for_port(import_addr, Duration::from_secs(10))
-        .await
-        .expect("Import bridge did not start in time");
-    println!("4. Import bridge started");
+    let mut pair = common::BridgePair::tcp_with_args(
+        &service,
+        backend_addr,
+        &["--drain-timeout", "2"],
+        &["--drain-timeout", "2"],
+    )
+    .await;
+    let import_addr = pair.import_addr;
 
     // Connect client
     println!("5. Client: Connecting...");
@@ -362,8 +291,7 @@ async fn test_drain_timeout_enforced() -> Result<()> {
 
     // Cleanup
     drop(client);
-    kill_bridge(export_bridge).await;
-    kill_bridge(import_bridge).await;
+    pair.kill_and_wait().await;
     println!("10. TEST COMPLETED\n");
 
     Ok(())

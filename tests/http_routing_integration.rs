@@ -3,6 +3,8 @@
 //! This test suite validates DNS-based routing with multiple HTTP backends.
 //! Tests the complete flow: HTTP client -> Import bridge -> Zenoh -> Export bridge -> Backend
 
+mod common;
+
 use axum::{Router, extract::Path as AxumPath, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -11,6 +13,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use zenoh::config::Config;
+use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Response {
@@ -57,17 +60,20 @@ fn create_http_server(backend_id: &str) -> Router {
         )
 }
 
-/// Start an HTTP server on the given address
-async fn start_http_backend(addr: SocketAddr, backend_id: &str) {
+/// Start an HTTP server on a dynamically allocated port.
+/// Returns the address the server is listening on.
+async fn start_http_backend(backend_id: &str) -> SocketAddr {
     let app = create_http_server(backend_id);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    println!("🔧 Backend '{}' listening on {}", backend_id, addr);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    println!("Backend '{}' listening on {}", backend_id, addr);
 
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
 
     sleep(Duration::from_millis(200)).await;
+    addr
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -75,8 +81,9 @@ async fn test_http_routing_multiple_backends() {
     // Initialize tracing for debugging
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    println!("\n🧪 TEST: HTTP Routing with Multiple Backends");
+    println!("\nTEST: HTTP Routing with Multiple Backends");
     println!("===========================================");
 
     // Create Zenoh sessions
@@ -86,40 +93,39 @@ async fn test_http_routing_multiple_backends() {
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
-    println!("✓ Zenoh sessions created");
+    println!("Zenoh sessions created");
 
-    // Start HTTP backend servers
-    let api_backend_addr: SocketAddr = "127.0.0.1:19001".parse().unwrap();
-    let web_backend_addr: SocketAddr = "127.0.0.1:19002".parse().unwrap();
+    // Start HTTP backend servers (dynamic ports)
+    let api_backend_addr = start_http_backend("api-backend").await;
+    let web_backend_addr = start_http_backend("web-backend").await;
 
-    start_http_backend(api_backend_addr, "api-backend").await;
-    start_http_backend(web_backend_addr, "web-backend").await;
-
-    println!("✓ HTTP backends started");
+    println!("HTTP backends started");
 
     // Start HTTP export bridges (one per DNS)
+    let api_export_spec = format!("http-service/api.example.com/{}", api_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_api_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/api.example.com/127.0.0.1:19001",
-            65536,
-            Duration::from_secs(5),
+            &api_export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
         .unwrap();
     });
 
+    let web_export_spec = format!("http-service/web.example.com/{}", web_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_web_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/web.example.com/127.0.0.1:19002",
-            65536,
-            Duration::from_secs(5),
+            &web_export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -127,18 +133,21 @@ async fn test_http_routing_multiple_backends() {
     });
 
     sleep(Duration::from_millis(500)).await;
-    println!("✓ HTTP export bridges started");
+    println!("HTTP export bridges started");
 
-    // Start HTTP import bridge (single listener for all DNS)
-    let import_addr: SocketAddr = "127.0.0.1:18080".parse().unwrap();
+    // Start HTTP import bridge (single listener for all DNS, dynamic port)
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("http-service/{}", import_addr);
+    let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            &import_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -146,13 +155,13 @@ async fn test_http_routing_multiple_backends() {
     });
 
     sleep(Duration::from_millis(500)).await;
-    println!("✓ HTTP import bridge started on {}", import_addr);
+    println!("HTTP import bridge started on {}", import_addr);
 
     // Give everything time to settle
     sleep(Duration::from_secs(1)).await;
 
     // Test 1: Request to api.example.com should reach api-backend
-    println!("\n📡 Test 1: Request to api.example.com");
+    println!("\nTest 1: Request to api.example.com");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -170,10 +179,10 @@ async fn test_http_routing_multiple_backends() {
     println!("   Response: backend={}, path={}", body.backend, body.path);
     assert_eq!(body.backend, "api-backend");
     assert_eq!(body.path, "/");
-    println!("   ✓ Routed to correct backend (api-backend)");
+    println!("   Routed to correct backend (api-backend)");
 
     // Test 2: Request to web.example.com should reach web-backend
-    println!("\n📡 Test 2: Request to web.example.com");
+    println!("\nTest 2: Request to web.example.com");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -191,10 +200,10 @@ async fn test_http_routing_multiple_backends() {
     println!("   Response: backend={}, path={}", body.backend, body.path);
     assert_eq!(body.backend, "web-backend");
     assert_eq!(body.path, "/");
-    println!("   ✓ Routed to correct backend (web-backend)");
+    println!("   Routed to correct backend (web-backend)");
 
     // Test 3: Multiple requests to different backends using reqwest with separate clients
-    println!("\n📡 Test 3: Multiple requests to different hosts");
+    println!("\nTest 3: Multiple requests to different hosts");
     for _ in 0..3 {
         // Request to API - create new client to force new connection
         let client_api = reqwest::Client::builder()
@@ -228,10 +237,13 @@ async fn test_http_routing_multiple_backends() {
         assert_eq!(body.backend, "web-backend");
         assert_eq!(body.path, "/api/test");
     }
-    println!("   ✓ Multiple requests routed correctly");
+    println!("   Multiple requests routed correctly");
 
-    // Test 4: DNS normalization - uppercase host should work
-    println!("\n📡 Test 4: DNS normalization (uppercase)");
+    // Test 4: DNS normalization - uppercase host should work.
+    // The export is registered as "api.example.com" (lowercase). Sending "API.EXAMPLE.COM"
+    // must be normalized by the import bridge to match. If normalization fails, we'd get a
+    // 502 instead of reaching api-backend.
+    println!("\nTest 4: DNS normalization (uppercase)");
     let client_norm = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -247,10 +259,13 @@ async fn test_http_routing_multiple_backends() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
     assert_eq!(body.backend, "api-backend");
-    println!("   ✓ Uppercase host normalized correctly");
+    println!("   Uppercase host normalized correctly");
 
-    // Test 5: DNS normalization - port 80 should be stripped
-    println!("\n📡 Test 5: DNS normalization (port 80)");
+    // Test 5: DNS normalization - port 80 should be stripped.
+    // The export is registered as "api.example.com" (no port). Sending "api.example.com:80"
+    // must have the default HTTP port stripped by the import bridge. If port stripping fails,
+    // we'd get a 502 instead of reaching api-backend.
+    println!("\nTest 5: DNS normalization (port 80)");
     let client_port = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -266,10 +281,10 @@ async fn test_http_routing_multiple_backends() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
     assert_eq!(body.backend, "api-backend");
-    println!("   ✓ Port 80 stripped correctly");
+    println!("   Port 80 stripped correctly");
 
     // Test 6: Unknown DNS should return 502
-    println!("\n📡 Test 6: Unknown DNS (should return 502)");
+    println!("\nTest 6: Unknown DNS (should return 502)");
     let client_unknown = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
@@ -286,10 +301,10 @@ async fn test_http_routing_multiple_backends() {
     let body_text = response.text().await.unwrap();
     assert!(body_text.contains("502 Bad Gateway"));
     assert!(body_text.contains("unknown.example.com"));
-    println!("   ✓ Unknown DNS returned 502 Bad Gateway");
+    println!("   Unknown DNS returned 502 Bad Gateway");
 
     // Test 7: Missing Host header should return 400
-    println!("\n📡 Test 7: Missing Host header (should return 400)");
+    println!("\nTest 7: Missing Host header (should return 400)");
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut tcp_stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
@@ -304,9 +319,9 @@ async fn test_http_routing_multiple_backends() {
 
     assert!(response.contains("400 Bad Request"));
     assert!(response.contains("Missing Host header"));
-    println!("   ✓ Missing Host header returned 400 Bad Request");
+    println!("   Missing Host header returned 400 Bad Request");
 
-    println!("\n✅ All HTTP routing tests passed!");
+    println!("\nAll HTTP routing tests passed!");
 
     // Cleanup
     export_api_task.abort();
@@ -320,8 +335,9 @@ async fn test_http_routing_multiple_backends() {
 async fn test_http_routing_concurrent_clients() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    println!("\n🧪 TEST: Concurrent HTTP Clients");
+    println!("\nTEST: Concurrent HTTP Clients");
     println!("================================");
 
     // Setup
@@ -330,19 +346,19 @@ async fn test_http_routing_concurrent_clients() {
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
-    // Start backend
-    let backend_addr: SocketAddr = "127.0.0.1:19003".parse().unwrap();
-    start_http_backend(backend_addr, "concurrent-backend").await;
+    // Start backend (dynamic port)
+    let backend_addr = start_http_backend("concurrent-backend").await;
 
     // Start export
+    let export_spec = format!("http-service/concurrent.example.com/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/concurrent.example.com/127.0.0.1:19003",
-            65536,
-            Duration::from_secs(5),
+            &export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -351,16 +367,19 @@ async fn test_http_routing_concurrent_clients() {
 
     sleep(Duration::from_millis(500)).await;
 
-    // Start import
-    let import_addr: SocketAddr = "127.0.0.1:18081".parse().unwrap();
+    // Start import (dynamic port)
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("http-service/{}", import_addr);
+    let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            &import_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -368,10 +387,10 @@ async fn test_http_routing_concurrent_clients() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Setup complete");
+    println!("Setup complete");
 
     // Spawn 10 concurrent clients
-    println!("\n📡 Sending 10 concurrent requests...");
+    println!("\nSending 10 concurrent requests...");
     let mut tasks = vec![];
     for i in 0..10 {
         let client = reqwest::Client::new();
@@ -399,14 +418,14 @@ async fn test_http_routing_concurrent_clients() {
         .collect();
 
     assert_eq!(results.len(), 10);
-    println!("   ✓ All 10 concurrent requests completed successfully");
+    println!("   All 10 concurrent requests completed successfully");
 
     // Verify all went to the same backend
     for result in results {
         assert_eq!(result.backend, "concurrent-backend");
     }
 
-    println!("\n✅ Concurrent client test passed!");
+    println!("\nConcurrent client test passed!");
 
     // Cleanup
     export_task.abort();
@@ -419,8 +438,9 @@ async fn test_http_routing_concurrent_clients() {
 async fn test_http_routing_backend_becomes_available() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
 
-    println!("\n🧪 TEST: Backend Becomes Available After Import");
+    println!("\nTEST: Backend Becomes Available After Import");
     println!("===============================================");
 
     let config1 = Config::default();
@@ -428,16 +448,19 @@ async fn test_http_routing_backend_becomes_available() {
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
-    // Start import FIRST (backend doesn't exist yet)
-    let import_addr: SocketAddr = "127.0.0.1:18082".parse().unwrap();
+    // Start import FIRST (backend doesn't exist yet, dynamic port)
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("http-service/{}", import_addr);
+    let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let import_task = tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_import_mode(
             session2_clone,
-            &format!("http-service/{}", import_addr),
-            65536,
-            Duration::from_secs(5),
+            &import_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -445,10 +468,10 @@ async fn test_http_routing_backend_becomes_available() {
     });
 
     sleep(Duration::from_millis(500)).await;
-    println!("✓ Import bridge started (no backend yet)");
+    println!("Import bridge started (no backend yet)");
 
     // Try to connect - should get 502
-    println!("\n📡 Test 1: Request before backend exists");
+    println!("\nTest 1: Request before backend exists");
     let client = reqwest::Client::new();
     let response = client
         .get(format!("http://{}/", import_addr))
@@ -458,20 +481,20 @@ async fn test_http_routing_backend_becomes_available() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    println!("   ✓ Got 502 as expected (no backend)");
+    println!("   Got 502 as expected (no backend)");
 
-    // NOW start the backend and export
-    let backend_addr: SocketAddr = "127.0.0.1:19004".parse().unwrap();
-    start_http_backend(backend_addr, "delayed-backend").await;
+    // NOW start the backend and export (dynamic port)
+    let backend_addr = start_http_backend("delayed-backend").await;
 
+    let export_spec = format!("http-service/delayed.example.com/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
     let export_task = tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(
             session1_clone,
-            "http-service/delayed.example.com/127.0.0.1:19004",
-            65536,
-            Duration::from_secs(5),
+            &export_spec,
+            bridge_config,
             shutdown_token_clone,
         )
         .await
@@ -479,10 +502,10 @@ async fn test_http_routing_backend_becomes_available() {
     });
 
     sleep(Duration::from_secs(1)).await;
-    println!("✓ Backend and export started");
+    println!("Backend and export started");
 
     // Now request should succeed
-    println!("\n📡 Test 2: Request after backend starts");
+    println!("\nTest 2: Request after backend starts");
     let response = client
         .get(format!("http://{}/", import_addr))
         .header("Host", "delayed.example.com")
@@ -493,9 +516,9 @@ async fn test_http_routing_backend_becomes_available() {
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
     assert_eq!(body.backend, "delayed-backend");
-    println!("   ✓ Request succeeded after backend became available");
+    println!("   Request succeeded after backend became available");
 
-    println!("\n✅ Backend availability test passed!");
+    println!("\nBackend availability test passed!");
 
     // Cleanup
     export_task.abort();

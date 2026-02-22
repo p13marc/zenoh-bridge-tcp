@@ -28,6 +28,10 @@ pub struct BridgeConfig {
 
     /// Timeout for draining buffered data during connection close (default: 5 seconds).
     pub drain_timeout: Duration,
+
+    /// Maximum response size for multiroute HTTP mode (default: 10 MiB).
+    /// Responses exceeding this limit receive HTTP 502.
+    pub max_response_size: usize,
 }
 
 impl Default for BridgeConfig {
@@ -39,6 +43,7 @@ impl Default for BridgeConfig {
             heartbeat_interval: Duration::from_millis(500),
             availability_timeout: Duration::from_millis(1000),
             drain_timeout: Duration::from_secs(5),
+            max_response_size: 10 * 1024 * 1024, // 10 MiB
         }
     }
 }
@@ -183,6 +188,7 @@ mod tests {
         assert_eq!(config.heartbeat_interval, Duration::from_millis(500));
         assert_eq!(config.availability_timeout, Duration::from_millis(1000));
         assert_eq!(config.drain_timeout, Duration::from_secs(5));
+        assert_eq!(config.max_response_size, 10 * 1024 * 1024);
     }
 
     #[test]

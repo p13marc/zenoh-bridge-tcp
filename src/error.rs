@@ -113,4 +113,79 @@ mod tests {
         let bridge_err: BridgeError = io_err.into();
         assert!(matches!(bridge_err, BridgeError::Io(_)));
     }
+
+    #[test]
+    fn test_invalid_import_spec_display() {
+        let err = BridgeError::InvalidImportSpec {
+            spec: "bad".to_string(),
+            reason: "missing address".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid import spec 'bad': missing address"
+        );
+    }
+
+    #[test]
+    fn test_invalid_ws_export_spec_display() {
+        let err = BridgeError::InvalidWsExportSpec {
+            spec: "bad".to_string(),
+            reason: "not a ws:// URL".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "invalid WebSocket export spec 'bad': not a ws:// URL"
+        );
+    }
+
+    #[test]
+    fn test_backend_connection_display() {
+        let err = BridgeError::BackendConnection {
+            addr: "127.0.0.1:9999".parse().unwrap(),
+            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "failed to connect to backend 127.0.0.1:9999"
+        );
+    }
+
+    #[test]
+    fn test_bind_failed_display() {
+        let err = BridgeError::BindFailed {
+            addr: "0.0.0.0:80".parse().unwrap(),
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"),
+        };
+        assert_eq!(err.to_string(), "failed to bind to 0.0.0.0:80");
+    }
+
+    #[test]
+    fn test_zenoh_error_display() {
+        let err = BridgeError::Zenoh("session closed".to_string());
+        assert_eq!(err.to_string(), "zenoh error: session closed");
+    }
+
+    #[test]
+    fn test_http_parse_display() {
+        let err = BridgeError::HttpParse("invalid method".to_string());
+        assert_eq!(err.to_string(), "HTTP parse error: invalid method");
+    }
+
+    #[test]
+    fn test_tls_parse_display() {
+        let err = BridgeError::TlsParse("no SNI".to_string());
+        assert_eq!(err.to_string(), "TLS/SNI parse error: no SNI");
+    }
+
+    #[test]
+    fn test_timeout_display() {
+        let err = BridgeError::Timeout("reading headers".to_string());
+        assert_eq!(err.to_string(), "timeout: reading headers");
+    }
+
+    #[test]
+    fn test_websocket_display() {
+        let err = BridgeError::WebSocket("handshake failed".to_string());
+        assert_eq!(err.to_string(), "WebSocket error: handshake failed");
+    }
 }
