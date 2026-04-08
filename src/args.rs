@@ -425,7 +425,11 @@ mod tests {
                 log_format: fmt.to_string(),
                 ..Default::default()
             };
-            assert!(args.validate().is_ok(), "log_format '{}' should be valid", fmt);
+            assert!(
+                args.validate().is_ok(),
+                "log_format '{}' should be valid",
+                fmt
+            );
         }
     }
 
@@ -451,7 +455,11 @@ mod tests {
                 log_level: level.to_string(),
                 ..Default::default()
             };
-            assert!(args.validate().is_ok(), "log_level '{}' should be valid", level);
+            assert!(
+                args.validate().is_ok(),
+                "log_level '{}' should be valid",
+                level
+            );
         }
     }
 
@@ -538,10 +546,7 @@ mod tests {
     #[test]
     fn test_validate_mixed_good_and_bad_specs() {
         let args = Args {
-            export: vec![
-                "good/127.0.0.1:8001".into(),
-                "bad-no-slash".into(),
-            ],
+            export: vec!["good/127.0.0.1:8001".into(), "bad-no-slash".into()],
             ..Default::default()
         };
         assert!(args.validate().is_err());

@@ -524,7 +524,10 @@ mod tests {
 
     #[test]
     fn test_validate_sni_numeric_labels() {
-        assert_eq!(validate_sni_hostname(b"123.456.789").unwrap(), "123.456.789");
+        assert_eq!(
+            validate_sni_hostname(b"123.456.789").unwrap(),
+            "123.456.789"
+        );
     }
 
     #[test]
@@ -641,9 +644,7 @@ mod tests {
             err
         );
 
-        let err = validate_sni_hostname(b"-bad.com")
-            .unwrap_err()
-            .to_string();
+        let err = validate_sni_hostname(b"-bad.com").unwrap_err().to_string();
         assert!(
             err.contains("hyphen"),
             "Error should mention hyphen: {}",

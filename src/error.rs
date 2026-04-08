@@ -266,9 +266,18 @@ mod tests {
     #[test]
     fn test_all_variants_debug() {
         let variants: Vec<BridgeError> = vec![
-            BridgeError::InvalidExportSpec { spec: "s".into(), reason: "r".into() },
-            BridgeError::InvalidImportSpec { spec: "s".into(), reason: "r".into() },
-            BridgeError::InvalidWsExportSpec { spec: "s".into(), reason: "r".into() },
+            BridgeError::InvalidExportSpec {
+                spec: "s".into(),
+                reason: "r".into(),
+            },
+            BridgeError::InvalidImportSpec {
+                spec: "s".into(),
+                reason: "r".into(),
+            },
+            BridgeError::InvalidWsExportSpec {
+                spec: "s".into(),
+                reason: "r".into(),
+            },
             BridgeError::Zenoh("z".into()),
             BridgeError::HttpParse("h".into()),
             BridgeError::TlsParse("t".into()),

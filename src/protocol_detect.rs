@@ -247,7 +247,8 @@ mod tests {
 
     #[test]
     fn test_detect_http_with_full_request() {
-        let request = b"POST /api/v2/data HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 42\r\n\r\n";
+        let request =
+            b"POST /api/v2/data HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 42\r\n\r\n";
         assert_eq!(detect_protocol(request), DetectedProtocol::Http);
     }
 

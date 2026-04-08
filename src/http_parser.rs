@@ -742,12 +742,7 @@ mod tests {
             let cl_start = s.find("Content-Length: ").unwrap() + 16;
             let cl_end = s[cl_start..].find("\r\n").unwrap() + cl_start;
             let cl: usize = s[cl_start..cl_end].parse().unwrap();
-            assert_eq!(
-                cl,
-                body.len(),
-                "Content-Length mismatch for dns='{}'",
-                dns
-            );
+            assert_eq!(cl, body.len(), "Content-Length mismatch for dns='{}'", dns);
         }
     }
 
@@ -771,7 +766,10 @@ mod tests {
 
     #[test]
     fn test_extract_host_from_absolute_uri_not_http() {
-        assert_eq!(extract_host_from_absolute_uri("ftp://example.com/file"), None);
+        assert_eq!(
+            extract_host_from_absolute_uri("ftp://example.com/file"),
+            None
+        );
         assert_eq!(extract_host_from_absolute_uri("ws://example.com"), None);
     }
 

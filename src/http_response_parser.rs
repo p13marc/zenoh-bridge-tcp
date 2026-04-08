@@ -413,7 +413,8 @@ mod tests {
 
     #[test]
     fn test_parse_301_redirect_with_body() {
-        let response = b"HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: /new\r\n\r\n";
+        let response =
+            b"HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: /new\r\n\r\n";
         let (_, framing) = parse_response_headers(response).unwrap().unwrap();
         assert_eq!(framing, ResponseBodyFraming::ContentLength(0));
     }
