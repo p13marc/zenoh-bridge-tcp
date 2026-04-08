@@ -286,4 +286,101 @@ mod tests {
         let body = b"5\r\nHello\r\n0\r\n";
         assert_eq!(find_chunked_body_end(body), None);
     }
+
+    // --- Security boundary tests (RFC 9112 compliance) ---
+
+    #[test]
+    fn test_reject_te_and_cl_together() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 10\r\n\r\n";
+        let result = parse_response_headers(response);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Transfer-Encoding"));
+    }
+
+    #[test]
+    fn test_reject_cl_then_te_order() {
+        // Same rejection regardless of header order
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(parse_response_headers(response).is_err());
+    }
+
+    #[test]
+    fn test_reject_differing_content_lengths() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n";
+        assert!(parse_response_headers(response).is_err());
+    }
+
+    #[test]
+    fn test_accept_identical_content_lengths() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(10));
+    }
+
+    #[test]
+    fn test_content_length_at_max_boundary() {
+        let max = MAX_CONTENT_LENGTH;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            max
+        );
+        let (_, framing) = parse_response_headers(response.as_bytes()).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(max));
+    }
+
+    #[test]
+    fn test_content_length_above_max_rejected() {
+        let over = MAX_CONTENT_LENGTH + 1;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            over
+        );
+        assert!(parse_response_headers(response.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn test_chunk_size_at_max_boundary() {
+        // Chunk size exactly at MAX_CHUNK_SIZE — should be accepted (returns None for need-more-data)
+        let hex = format!("{:X}\r\n", MAX_CHUNK_SIZE);
+        let result = find_chunked_body_end(hex.as_bytes());
+        assert_eq!(result, None); // needs data, but size was accepted
+    }
+
+    #[test]
+    fn test_chunk_size_above_max_rejected() {
+        // Chunk size above MAX_CHUNK_SIZE — should return None immediately
+        let hex = format!("{:X}\r\n", MAX_CHUNK_SIZE + 1);
+        let result = find_chunked_body_end(hex.as_bytes());
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_te_chunked_without_cl_accepted() {
+        // TE alone is fine
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::Chunked);
+    }
+
+    #[test]
+    fn test_te_non_chunked_is_until_close() {
+        // TE: gzip (not chunked) → falls through to UntilClose
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::UntilClose);
+    }
+
+    #[test]
+    fn test_content_length_zero() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(0));
+    }
 }

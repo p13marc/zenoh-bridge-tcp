@@ -653,4 +653,80 @@ mod tests {
         let content_length: usize = s[cl_start..cl_end].parse().unwrap();
         assert_eq!(content_length, body.len());
     }
+
+    // --- Additional edge case tests ---
+
+    #[test]
+    fn test_try_parse_request_partial_returns_none() {
+        // Incomplete request → None (need more data)
+        let buffer = b"GET / HTTP/1.1\r\nHost: exam";
+        let result = try_parse_request(buffer);
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_try_parse_request_empty_host_header() {
+        let buffer = b"GET / HTTP/1.1\r\nHost: \r\n\r\n";
+        let result = try_parse_request(buffer);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Host"));
+    }
+
+    #[test]
+    fn test_try_parse_request_all_http_methods() {
+        for method in &["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"] {
+            let request = format!("{} / HTTP/1.1\r\nHost: example.com\r\n\r\n", method);
+            let result = try_parse_request(request.as_bytes());
+            assert!(
+                result.is_ok(),
+                "Method {} should parse successfully",
+                method
+            );
+            assert!(result.unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_try_parse_request_invalid_http() {
+        let buffer = b"NOT_HTTP garbage data\r\n\r\n";
+        let result = try_parse_request(buffer);
+        // httparse may reject this
+        assert!(result.is_err() || result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_normalize_dns_empty_string() {
+        assert_eq!(normalize_dns(""), "");
+    }
+
+    #[test]
+    fn test_normalize_dns_port_only() {
+        assert_eq!(normalize_dns(":80"), "");
+        assert_eq!(normalize_dns(":8080"), ":8080");
+    }
+
+    #[test]
+    fn test_find_host_header_empty_value() {
+        let mut headers = [httparse::EMPTY_HEADER; 1];
+        headers[0] = httparse::Header {
+            name: "Host",
+            value: b"   ",
+        };
+        let mut req = httparse::Request::new(&mut headers);
+        req.method = Some("GET");
+        req.path = Some("/");
+        req.version = Some(1);
+        // Whitespace-only host → empty after trim → None
+        assert_eq!(find_host_header(&req), None);
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_connect_method() {
+        let request = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(request);
+        let result = parse_http_request(&mut cursor).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().dns, "example.com");
+    }
 }

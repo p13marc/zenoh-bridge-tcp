@@ -226,4 +226,90 @@ mod tests {
         let n = server.read(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
     }
+
+    #[tokio::test]
+    async fn test_tcp_reader_large_data_multi_read() {
+        // Data larger than reader buffer requires multiple reads.
+        // Use a large duplex buffer to avoid write backpressure.
+        let (mut client, server) = duplex(256 * 1024);
+        let data = vec![0xABu8; 100_000]; // 100KB
+        client.write_all(&data).await.unwrap();
+        drop(client);
+
+        let mut reader = TcpReader::new(server, 4096); // 4KB buffer
+        let mut received = Vec::new();
+        loop {
+            let chunk = reader.read_data(4096).await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            received.extend_from_slice(&chunk);
+        }
+        assert_eq!(received.len(), 100_000);
+        assert!(received.iter().all(|&b| b == 0xAB));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_reader_exact_buffer_size() {
+        // Data exactly fills the buffer
+        let (mut client, server) = duplex(1024);
+        let data = vec![0xCD; 1024];
+        client.write_all(&data).await.unwrap();
+        drop(client);
+
+        let mut reader = TcpReader::new(server, 1024);
+        let chunk = reader.read_data(1024).await.unwrap();
+        assert_eq!(chunk.len(), 1024);
+        assert!(chunk.iter().all(|&b| b == 0xCD));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_writer_multiple_writes() {
+        let (client, mut server) = duplex(1024);
+        let mut writer = TcpWriter::new(client);
+
+        writer.write_data(b"hello ").await.unwrap();
+        writer.write_data(b"world").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_writer_empty_write() {
+        let (client, mut server) = duplex(1024);
+        let mut writer = TcpWriter::new(client);
+
+        writer.write_data(b"").await.unwrap();
+        writer.write_data(b"data").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        let mut buf = Vec::new();
+        server.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"data");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_reader_writer_bidirectional() {
+        let (left, right) = duplex(1024);
+        let (left_read, left_write) = tokio::io::split(left);
+        let (right_read, right_write) = tokio::io::split(right);
+
+        let mut left_reader = TcpReader::new(left_read, 1024);
+        let mut left_writer = TcpWriter::new(left_write);
+        let mut right_reader = TcpReader::new(right_read, 1024);
+        let mut right_writer = TcpWriter::new(right_write);
+
+        // Left writes, right reads
+        left_writer.write_data(b"ping").await.unwrap();
+        let data = right_reader.read_data(1024).await.unwrap();
+        assert_eq!(data, b"ping");
+
+        // Right writes, left reads
+        right_writer.write_data(b"pong").await.unwrap();
+        let data = left_reader.read_data(1024).await.unwrap();
+        assert_eq!(data, b"pong");
+    }
 }
