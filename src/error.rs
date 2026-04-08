@@ -188,4 +188,98 @@ mod tests {
         let err = BridgeError::WebSocket("handshake failed".to_string());
         assert_eq!(err.to_string(), "WebSocket error: handshake failed");
     }
+
+    // --- Source chain tests ---
+
+    #[test]
+    fn test_backend_connection_has_source() {
+        use std::error::Error;
+        let err = BridgeError::BackendConnection {
+            addr: "127.0.0.1:9999".parse().unwrap(),
+            source: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+        };
+        let source = err.source().expect("should have source");
+        assert!(source.to_string().contains("refused"));
+    }
+
+    #[test]
+    fn test_bind_failed_has_source() {
+        use std::error::Error;
+        let err = BridgeError::BindFailed {
+            addr: "0.0.0.0:80".parse().unwrap(),
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+        };
+        let source = err.source().expect("should have source");
+        assert!(source.to_string().contains("address in use"));
+    }
+
+    #[test]
+    fn test_io_error_has_source() {
+        use std::error::Error;
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let bridge_err: BridgeError = io_err.into();
+        let source = bridge_err.source().expect("Io variant should have source");
+        assert!(source.to_string().contains("broken pipe"));
+    }
+
+    #[test]
+    fn test_simple_variants_have_no_source() {
+        use std::error::Error;
+        let cases: Vec<BridgeError> = vec![
+            BridgeError::Zenoh("test".into()),
+            BridgeError::HttpParse("test".into()),
+            BridgeError::TlsParse("test".into()),
+            BridgeError::Timeout("test".into()),
+            BridgeError::NoBackend { dns: "test".into() },
+            BridgeError::WebSocket("test".into()),
+        ];
+        for err in cases {
+            assert!(err.source().is_none(), "{} should have no source", err);
+        }
+    }
+
+    // --- From<io::Error> conversion ---
+
+    #[test]
+    fn test_io_error_kind_preserved() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
+        let bridge_err: BridgeError = io_err.into();
+        match bridge_err {
+            BridgeError::Io(ref e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            _ => panic!("expected Io variant"),
+        }
+    }
+
+    // --- anyhow conversion ---
+
+    #[test]
+    fn test_bridge_error_into_anyhow() {
+        let bridge_err = BridgeError::NoBackend {
+            dns: "test.com".into(),
+        };
+        let anyhow_err: anyhow::Error = bridge_err.into();
+        assert!(anyhow_err.to_string().contains("test.com"));
+    }
+
+    // --- Debug formatting ---
+
+    #[test]
+    fn test_all_variants_debug() {
+        let variants: Vec<BridgeError> = vec![
+            BridgeError::InvalidExportSpec { spec: "s".into(), reason: "r".into() },
+            BridgeError::InvalidImportSpec { spec: "s".into(), reason: "r".into() },
+            BridgeError::InvalidWsExportSpec { spec: "s".into(), reason: "r".into() },
+            BridgeError::Zenoh("z".into()),
+            BridgeError::HttpParse("h".into()),
+            BridgeError::TlsParse("t".into()),
+            BridgeError::Timeout("t".into()),
+            BridgeError::NoBackend { dns: "d".into() },
+            BridgeError::WebSocket("w".into()),
+            BridgeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "e")),
+        ];
+        for err in variants {
+            let debug = format!("{:?}", err);
+            assert!(!debug.is_empty());
+        }
+    }
 }

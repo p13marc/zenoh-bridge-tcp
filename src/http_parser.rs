@@ -729,4 +729,142 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().dns, "example.com");
     }
+
+    // --- HTTP response Content-Length accuracy ---
+
+    #[test]
+    fn test_http_502_response_various_dns() {
+        for dns in &["a.com", "very-long-subdomain.deep.nested.example.com", "x"] {
+            let response = http_502_response(dns);
+            let s = String::from_utf8_lossy(&response);
+            let header_end = s.find("\r\n\r\n").unwrap() + 4;
+            let body = &s[header_end..];
+            let cl_start = s.find("Content-Length: ").unwrap() + 16;
+            let cl_end = s[cl_start..].find("\r\n").unwrap() + cl_start;
+            let cl: usize = s[cl_start..cl_end].parse().unwrap();
+            assert_eq!(
+                cl,
+                body.len(),
+                "Content-Length mismatch for dns='{}'",
+                dns
+            );
+        }
+    }
+
+    // --- Absolute URI with port ---
+
+    #[test]
+    fn test_extract_host_from_absolute_uri_with_port() {
+        assert_eq!(
+            extract_host_from_absolute_uri("http://example.com:9090/api/v1"),
+            Some("example.com:9090")
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_absolute_uri_https_no_path() {
+        assert_eq!(
+            extract_host_from_absolute_uri("https://secure.example.com"),
+            Some("secure.example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_absolute_uri_not_http() {
+        assert_eq!(extract_host_from_absolute_uri("ftp://example.com/file"), None);
+        assert_eq!(extract_host_from_absolute_uri("ws://example.com"), None);
+    }
+
+    // --- normalize_dns with unusual inputs ---
+
+    #[test]
+    fn test_normalize_dns_unicode_passthrough() {
+        // Unicode is lowercased but otherwise passed through
+        assert_eq!(normalize_dns("MÜNCHEN.de"), "münchen.de");
+    }
+
+    #[test]
+    fn test_normalize_dns_only_port() {
+        assert_eq!(normalize_dns(":443"), "");
+    }
+
+    #[test]
+    fn test_normalize_dns_ipv6_bracket_port_443() {
+        assert_eq!(normalize_dns("[::1]:443"), "[::1]");
+    }
+
+    #[test]
+    fn test_normalize_dns_ipv6_bracket_custom_port() {
+        assert_eq!(normalize_dns("[2001:db8::1]:9090"), "[2001:db8::1]:9090");
+    }
+
+    // --- try_parse_request edge cases ---
+
+    #[test]
+    fn test_try_parse_request_empty_buffer() {
+        let result = try_parse_request(b"");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_try_parse_request_only_method() {
+        let result = try_parse_request(b"GET ");
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_try_parse_request_multiple_headers() {
+        let buffer = b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\nUser-Agent: test/1.0\r\nX-Custom: value\r\n\r\n";
+        let result = try_parse_request(buffer);
+        assert!(result.is_ok());
+        let parsed = result.unwrap().unwrap();
+        assert_eq!(parsed.dns, "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_absolute_uri_with_port_80() {
+        let request = b"GET http://example.com:80/path HTTP/1.0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(request);
+        let result = parse_http_request(&mut cursor).await;
+        assert!(result.is_ok());
+        // Port 80 should be stripped by normalize_dns
+        assert_eq!(result.unwrap().dns, "example.com");
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_absolute_uri_with_custom_port() {
+        let request = b"GET http://example.com:8080/path HTTP/1.0\r\n\r\n";
+        let mut cursor = std::io::Cursor::new(request);
+        let result = parse_http_request(&mut cursor).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().dns, "example.com:8080");
+    }
+
+    #[tokio::test]
+    async fn test_parse_http_request_empty_stream() {
+        let mut cursor = std::io::Cursor::new(b"");
+        let result = parse_http_request(&mut cursor).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("closed"));
+    }
+
+    // --- WebSocket detection edge cases ---
+
+    #[test]
+    fn test_websocket_upgrade_with_extra_headers() {
+        let buffer = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        let result = try_parse_request(buffer);
+        let parsed = result.unwrap().unwrap();
+        assert!(parsed.is_websocket_upgrade);
+    }
+
+    #[test]
+    fn test_upgrade_not_websocket_ignored() {
+        let buffer = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\n\r\n";
+        let result = try_parse_request(buffer);
+        let parsed = result.unwrap().unwrap();
+        assert!(!parsed.is_websocket_upgrade);
+    }
 }

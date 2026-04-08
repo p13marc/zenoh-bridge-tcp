@@ -147,4 +147,130 @@ mod tests {
         assert_eq!(detect_protocol(b"GET"), DetectedProtocol::RawTcp);
         assert_eq!(detect_protocol(b"GET "), DetectedProtocol::Http);
     }
+
+    // --- Case sensitivity: HTTP methods must be uppercase ---
+
+    #[test]
+    fn test_detect_lowercase_http_methods_as_raw_tcp() {
+        assert_eq!(detect_protocol(b"get / HTTP/1.1"), DetectedProtocol::RawTcp);
+        assert_eq!(detect_protocol(b"post /api"), DetectedProtocol::RawTcp);
+        assert_eq!(detect_protocol(b"Put /data"), DetectedProtocol::RawTcp);
+    }
+
+    // --- TLS version variants ---
+
+    #[test]
+    fn test_detect_tls_version_variants() {
+        // TLS 1.0
+        assert_eq!(
+            detect_protocol(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x01]),
+            DetectedProtocol::Tls
+        );
+        // TLS 1.1
+        assert_eq!(
+            detect_protocol(&[0x16, 0x03, 0x02, 0x00, 0x05, 0x01]),
+            DetectedProtocol::Tls
+        );
+        // TLS 1.2
+        assert_eq!(
+            detect_protocol(&[0x16, 0x03, 0x03, 0x00, 0x05, 0x01]),
+            DetectedProtocol::Tls
+        );
+    }
+
+    // --- Not TLS: wrong record type or version ---
+
+    #[test]
+    fn test_detect_not_tls_wrong_record_type() {
+        // 0x17 is application data, not handshake
+        assert_eq!(
+            detect_protocol(&[0x17, 0x03, 0x03, 0x00, 0x05, 0x01]),
+            DetectedProtocol::RawTcp
+        );
+    }
+
+    #[test]
+    fn test_detect_not_tls_wrong_major_version() {
+        // Major version 0x04 is not TLS
+        assert_eq!(
+            detect_protocol(&[0x16, 0x04, 0x03, 0x00, 0x05, 0x01]),
+            DetectedProtocol::RawTcp
+        );
+    }
+
+    #[test]
+    fn test_detect_not_tls_not_client_hello() {
+        // Record type 0x16, TLS 1.2, but msg type 0x02 (ServerHello) not ClientHello
+        assert_eq!(
+            detect_protocol(&[0x16, 0x03, 0x03, 0x00, 0x05, 0x02]),
+            DetectedProtocol::RawTcp
+        );
+    }
+
+    // --- Binary data that could be confused ---
+
+    #[test]
+    fn test_detect_binary_starting_with_0x16() {
+        // Only 2 bytes — not enough for TLS detection
+        assert_eq!(detect_protocol(&[0x16, 0x03]), DetectedProtocol::RawTcp);
+    }
+
+    // --- Protocol enum properties ---
+
+    #[test]
+    fn test_detected_protocol_debug_and_clone() {
+        let p = DetectedProtocol::Http;
+        let cloned = p.clone();
+        assert_eq!(p, cloned);
+        assert_eq!(format!("{:?}", p), "Http");
+    }
+
+    #[test]
+    fn test_detected_protocol_all_variants() {
+        let variants = [
+            DetectedProtocol::Tls,
+            DetectedProtocol::Http,
+            DetectedProtocol::RawTcp,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+
+    // --- Real-world-like payloads ---
+
+    #[test]
+    fn test_detect_http_with_full_request() {
+        let request = b"POST /api/v2/data HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 42\r\n\r\n";
+        assert_eq!(detect_protocol(request), DetectedProtocol::Http);
+    }
+
+    #[test]
+    fn test_detect_ssh_protocol() {
+        assert_eq!(
+            detect_protocol(b"SSH-2.0-OpenSSH_8.9"),
+            DetectedProtocol::RawTcp
+        );
+    }
+
+    #[test]
+    fn test_detect_smtp_greeting() {
+        assert_eq!(
+            detect_protocol(b"220 mail.example.com ESMTP"),
+            DetectedProtocol::RawTcp
+        );
+    }
+
+    #[test]
+    fn test_detect_single_byte() {
+        assert_eq!(detect_protocol(&[0x00]), DetectedProtocol::RawTcp);
+        assert_eq!(detect_protocol(&[0xFF]), DetectedProtocol::RawTcp);
+        assert_eq!(detect_protocol(&[b'G']), DetectedProtocol::RawTcp);
+    }
 }

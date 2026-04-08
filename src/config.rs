@@ -218,4 +218,76 @@ mod tests {
         let config = create_zenoh_config_from_file("/nonexistent/path.json5");
         assert!(config.is_err(), "Missing config file should fail");
     }
+
+    // --- BridgeConfig::new preserves defaults for unset fields ---
+
+    #[test]
+    fn test_bridge_config_new_preserves_defaults() {
+        let config = BridgeConfig::new(2048, 20, 3);
+        // Custom fields
+        assert_eq!(config.buffer_size, 2048);
+        assert_eq!(config.read_timeout, Duration::from_secs(20));
+        assert_eq!(config.drain_timeout, Duration::from_secs(3));
+        // Default fields preserved
+        assert_eq!(config.max_header_size, 16 * 1024);
+        assert_eq!(config.heartbeat_interval, Duration::from_millis(500));
+        assert_eq!(config.availability_timeout, Duration::from_millis(1000));
+        assert_eq!(config.max_response_size, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_bridge_config_clone_equality() {
+        let config = BridgeConfig::new(4096, 15, 7);
+        let cloned = config.clone();
+        assert_eq!(config.buffer_size, cloned.buffer_size);
+        assert_eq!(config.read_timeout, cloned.read_timeout);
+        assert_eq!(config.drain_timeout, cloned.drain_timeout);
+        assert_eq!(config.max_header_size, cloned.max_header_size);
+    }
+
+    #[test]
+    fn test_bridge_config_debug_format() {
+        let config = BridgeConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("BridgeConfig"));
+        assert!(debug_str.contains("buffer_size"));
+    }
+
+    // --- Zenoh config mode+endpoint combinations ---
+
+    #[test]
+    fn test_zenoh_config_client_with_connect() {
+        let endpoint = "tcp/router.example.com:7447".to_string();
+        let config = create_zenoh_config("client", Some(&endpoint), None);
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_zenoh_config_router_with_listen() {
+        let endpoint = "tcp/0.0.0.0:7447".to_string();
+        let config = create_zenoh_config("router", None, Some(&endpoint));
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_zenoh_config_with_both_connect_and_listen() {
+        let connect = "tcp/peer1:7447".to_string();
+        let listen = "tcp/0.0.0.0:7448".to_string();
+        let config = create_zenoh_config("peer", Some(&connect), Some(&listen));
+        assert!(config.is_ok());
+    }
+
+    #[test]
+    fn test_zenoh_config_invalid_mode_message() {
+        let err = create_zenoh_config("mesh", None, None).unwrap_err();
+        assert!(err.to_string().contains("mesh"));
+        assert!(err.to_string().contains("Invalid mode"));
+    }
+
+    #[test]
+    fn test_config_from_json5_complex() {
+        let json5 = r#"{ "mode": "client", "connect": { "endpoints": ["tcp/localhost:7447"] } }"#;
+        let config = create_zenoh_config_from_json5(json5);
+        assert!(config.is_ok());
+    }
 }

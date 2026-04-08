@@ -519,4 +519,135 @@ mod tests {
                 .contains("invalid characters")
         );
     }
+
+    // --- Additional SNI validation tests ---
+
+    #[test]
+    fn test_validate_sni_numeric_labels() {
+        assert_eq!(validate_sni_hostname(b"123.456.789").unwrap(), "123.456.789");
+    }
+
+    #[test]
+    fn test_validate_sni_single_character_hostname() {
+        assert_eq!(validate_sni_hostname(b"x").unwrap(), "x");
+    }
+
+    #[test]
+    fn test_validate_sni_max_label_length_boundary() {
+        // Exactly 63 chars = OK
+        let label = "a".repeat(63);
+        assert!(validate_sni_hostname(label.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sni_hyphen_only_label() {
+        // A label that is just "-" should fail (leading and trailing hyphen)
+        assert!(validate_sni_hostname(b"-.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_sni_leading_dot() {
+        assert!(validate_sni_hostname(b".example.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_sni_multiple_hyphens_ok() {
+        assert_eq!(
+            validate_sni_hostname(b"a--b.example.com").unwrap(),
+            "a--b.example.com"
+        );
+    }
+
+    // --- is_tls_handshake edge cases ---
+
+    #[test]
+    fn test_is_tls_handshake_exact_minimum_bytes() {
+        // Exactly 6 bytes: handshake record type, TLS 1.2, length, ClientHello
+        assert!(is_tls_handshake(&[0x16, 0x03, 0x03, 0x00, 0x01, 0x01]));
+    }
+
+    #[test]
+    fn test_is_tls_handshake_five_bytes_not_enough() {
+        assert!(!is_tls_handshake(&[0x16, 0x03, 0x03, 0x00, 0x01]));
+    }
+
+    #[test]
+    fn test_is_tls_handshake_ssl30() {
+        // SSL 3.0 (version 0x03, 0x00) — still detected
+        assert!(is_tls_handshake(&[0x16, 0x03, 0x00, 0x00, 0x01, 0x01]));
+    }
+
+    #[test]
+    fn test_is_tls_handshake_alert_record_rejected() {
+        // Record type 0x15 is TLS Alert, not handshake
+        assert!(!is_tls_handshake(&[0x15, 0x03, 0x03, 0x00, 0x01, 0x01]));
+    }
+
+    // --- extract_sni_from_client_hello with various hostnames ---
+
+    #[test]
+    fn test_extract_sni_deeply_nested_hostname() {
+        let hostname = "a.b.c.d.e.f.g.h.example.com";
+        let record = build_client_hello_with_sni(hostname);
+        let sni = extract_sni_from_client_hello(&record).unwrap();
+        assert_eq!(sni, hostname);
+    }
+
+    #[test]
+    fn test_extract_sni_short_hostname() {
+        let record = build_client_hello_with_sni("a");
+        let sni = extract_sni_from_client_hello(&record).unwrap();
+        assert_eq!(sni, "a");
+    }
+
+    #[test]
+    fn test_extract_sni_truncated_record_fails() {
+        let record = build_client_hello_with_sni("example.com");
+        // Truncate to just the TLS header
+        let truncated = &record[..10];
+        let result = extract_sni_from_client_hello(truncated);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_sni_empty_data() {
+        let result = extract_sni_from_client_hello(b"");
+        assert!(result.is_err());
+    }
+
+    // --- Validate error messages are informative ---
+
+    #[test]
+    fn test_validate_sni_error_messages() {
+        let err = validate_sni_hostname(b"").unwrap_err().to_string();
+        assert!(err.contains("empty"), "Error should mention empty: {}", err);
+
+        let long = "a".repeat(254);
+        let err = validate_sni_hostname(long.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("253"),
+            "Error should mention 253 limit: {}",
+            err
+        );
+
+        let err = validate_sni_hostname(b"example.com.")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("trailing dot"),
+            "Error should mention trailing dot: {}",
+            err
+        );
+
+        let err = validate_sni_hostname(b"-bad.com")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("hyphen"),
+            "Error should mention hyphen: {}",
+            err
+        );
+    }
 }

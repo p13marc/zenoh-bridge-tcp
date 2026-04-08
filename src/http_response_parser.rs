@@ -377,4 +377,151 @@ mod tests {
         let (_, framing) = parse_response_headers(response).unwrap().unwrap();
         assert_eq!(framing, ResponseBodyFraming::ContentLength(0));
     }
+
+    // --- Content-Length edge cases ---
+
+    #[test]
+    fn test_content_length_with_leading_whitespace() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length:  42 \r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(42));
+    }
+
+    #[test]
+    fn test_content_length_non_numeric_ignored() {
+        // Non-numeric CL is not parseable, falls through to UntilClose
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::UntilClose);
+    }
+
+    #[test]
+    fn test_content_length_negative_not_parsed() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::UntilClose);
+    }
+
+    // --- Status code variants ---
+
+    #[test]
+    fn test_parse_101_switching_protocols_no_body() {
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::NoBody);
+    }
+
+    #[test]
+    fn test_parse_301_redirect_with_body() {
+        let response = b"HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: /new\r\n\r\n";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(0));
+    }
+
+    #[test]
+    fn test_parse_500_internal_server_error() {
+        let response = b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n\r\nInternal Server Error";
+        let (header_len, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(21));
+        assert!(header_len < response.len());
+    }
+
+    // --- Chunked encoding edge cases ---
+
+    #[test]
+    fn test_find_chunked_end_hex_uppercase() {
+        let body = b"A\r\n0123456789\r\n0\r\n\r\n";
+        assert_eq!(find_chunked_body_end(body), Some(body.len()));
+    }
+
+    #[test]
+    fn test_find_chunked_end_hex_lowercase() {
+        let body = b"a\r\n0123456789\r\n0\r\n\r\n";
+        assert_eq!(find_chunked_body_end(body), Some(body.len()));
+    }
+
+    #[test]
+    fn test_find_chunked_end_multiple_extensions() {
+        let body = b"5;name=val;other=1\r\nHello\r\n0;trailer\r\n\r\n";
+        assert_eq!(find_chunked_body_end(body), Some(body.len()));
+    }
+
+    #[test]
+    fn test_find_chunked_end_empty_body() {
+        let body = b"";
+        assert_eq!(find_chunked_body_end(body), None);
+    }
+
+    #[test]
+    fn test_find_chunked_end_garbage_hex() {
+        let body = b"ZZZZ\r\n";
+        assert_eq!(find_chunked_body_end(body), None);
+    }
+
+    // --- is_connection_close edge cases ---
+
+    #[test]
+    fn test_connection_close_with_multiple_values() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\nContent-Length: 0\r\n\r\n";
+        assert!(is_connection_close(response));
+    }
+
+    #[test]
+    fn test_no_connection_header() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        assert!(!is_connection_close(response));
+    }
+
+    #[test]
+    fn test_connection_upgrade_not_close() {
+        let response = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n";
+        assert!(!is_connection_close(response));
+    }
+
+    // --- Partial and malformed responses ---
+
+    #[test]
+    fn test_parse_response_empty_buffer() {
+        assert!(parse_response_headers(b"").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_response_garbage() {
+        let result = parse_response_headers(b"not http at all\r\n\r\n");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_response_http10() {
+        let response = b"HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nOK";
+        let (_, framing) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(framing, ResponseBodyFraming::ContentLength(2));
+    }
+
+    // --- Header length return value ---
+
+    #[test]
+    fn test_header_len_matches_header_boundary() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
+        let (header_len, _) = parse_response_headers(response).unwrap().unwrap();
+        assert_eq!(&response[header_len..], b"Hello");
+    }
+
+    // --- ResponseBodyFraming properties ---
+
+    #[test]
+    fn test_response_body_framing_debug_and_clone() {
+        let variants = vec![
+            ResponseBodyFraming::ContentLength(42),
+            ResponseBodyFraming::Chunked,
+            ResponseBodyFraming::NoBody,
+            ResponseBodyFraming::UntilClose,
+        ];
+        for v in &variants {
+            let cloned = v.clone();
+            assert_eq!(v, &cloned);
+            assert!(!format!("{:?}", v).is_empty());
+        }
+    }
 }

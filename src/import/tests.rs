@@ -68,3 +68,78 @@ fn test_client_ids_are_unique() {
     assert!(!id1.contains('*'));
     assert!(!id1.contains('?'));
 }
+
+// --- IPv6 import specs ---
+
+#[test]
+fn test_parse_import_spec_ipv6_loopback() {
+    let result = parse_import_spec("svc/[::1]:8080");
+    assert!(result.is_ok());
+    let (_, addr) = result.unwrap();
+    assert_eq!(addr.to_string(), "[::1]:8080");
+}
+
+#[test]
+fn test_parse_import_spec_ipv6_all_interfaces() {
+    let result = parse_import_spec("svc/[::]:8080");
+    assert!(result.is_ok());
+    let (_, addr) = result.unwrap();
+    assert_eq!(addr.to_string(), "[::]:8080");
+}
+
+// --- Edge cases ---
+
+#[test]
+fn test_parse_import_spec_high_port() {
+    let result = parse_import_spec("svc/127.0.0.1:65535");
+    assert!(result.is_ok());
+    let (_, addr) = result.unwrap();
+    assert_eq!(addr.port(), 65535);
+}
+
+#[test]
+fn test_parse_import_spec_port_zero() {
+    let result = parse_import_spec("svc/127.0.0.1:0");
+    assert!(result.is_ok());
+    let (_, addr) = result.unwrap();
+    assert_eq!(addr.port(), 0);
+}
+
+#[test]
+fn test_parse_import_spec_slash_only() {
+    let result = parse_import_spec("/");
+    // Second part is empty -> invalid address
+    assert!(result.is_err());
+}
+
+// --- drain_tasks tests ---
+
+#[tokio::test]
+async fn test_drain_tasks_empty_set() {
+    let mut tasks = JoinSet::new();
+    drain_tasks(&mut tasks, "test-svc", Duration::from_secs(1)).await;
+    assert!(tasks.is_empty());
+}
+
+#[tokio::test]
+async fn test_drain_tasks_all_complete() {
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async {});
+    tasks.spawn(async {});
+    drain_tasks(&mut tasks, "test-svc", Duration::from_secs(1)).await;
+    assert!(tasks.is_empty());
+}
+
+#[tokio::test]
+async fn test_drain_tasks_timeout_aborts() {
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async {
+        // Task that never completes on its own
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    });
+    // Very short timeout
+    drain_tasks(&mut tasks, "test-svc", Duration::from_millis(50)).await;
+    // After abort_all, we need to reap the aborted tasks
+    while tasks.join_next().await.is_some() {}
+    assert!(tasks.is_empty());
+}

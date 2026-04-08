@@ -188,3 +188,72 @@ async fn test_cancellation_token_propagation() {
     assert!(result.is_ok());
     assert!(result.unwrap().unwrap());
 }
+
+// --- IPv6 address tests ---
+
+#[test]
+fn test_parse_export_spec_ipv6_loopback() {
+    let result = parse_export_spec("svc/[::1]:8080");
+    assert!(result.is_ok());
+    let (service, addr) = result.unwrap();
+    assert_eq!(service, "svc");
+    assert_eq!(addr.to_string(), "[::1]:8080");
+}
+
+#[test]
+fn test_parse_export_spec_ipv6_all_interfaces() {
+    let result = parse_export_spec("svc/[::]:8080");
+    assert!(result.is_ok());
+    let (_, addr) = result.unwrap();
+    assert_eq!(addr.to_string(), "[::]:8080");
+}
+
+#[test]
+fn test_parse_http_export_spec_ipv6_backend() {
+    let result = parse_http_export_spec("svc/api.example.com/[::1]:8080");
+    assert!(result.is_ok());
+    let (_, dns, addr) = result.unwrap();
+    assert_eq!(dns, "api.example.com");
+    assert_eq!(addr.to_string(), "[::1]:8080");
+}
+
+// --- WebSocket spec edge cases ---
+
+#[test]
+fn test_parse_ws_export_spec_wss_with_path() {
+    let result = parse_ws_export_spec("myws/wss://example.com:443/ws/v2");
+    assert!(result.is_ok());
+    let (service, url) = result.unwrap();
+    assert_eq!(service, "myws");
+    assert_eq!(url, "wss://example.com:443/ws/v2");
+}
+
+#[test]
+fn test_parse_ws_export_spec_plain_url_rejected() {
+    let result = parse_ws_export_spec("svc/tcp://127.0.0.1:9000");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_parse_ws_export_spec_ftp_rejected() {
+    let result = parse_ws_export_spec("svc/ftp://127.0.0.1:21");
+    assert!(result.is_err());
+}
+
+// --- DNS normalization in HTTP export ---
+
+#[test]
+fn test_parse_http_export_spec_dns_mixed_case() {
+    let result = parse_http_export_spec("svc/API.Example.COM/127.0.0.1:8080");
+    assert!(result.is_ok());
+    let (_, dns, _) = result.unwrap();
+    assert_eq!(dns, "api.example.com");
+}
+
+#[test]
+fn test_parse_http_export_spec_dns_with_subdomain() {
+    let result = parse_http_export_spec("svc/deep.sub.domain.example.com/127.0.0.1:8080");
+    assert!(result.is_ok());
+    let (_, dns, _) = result.unwrap();
+    assert_eq!(dns, "deep.sub.domain.example.com");
+}

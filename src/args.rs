@@ -348,4 +348,202 @@ mod tests {
         assert_eq!(config.read_timeout, std::time::Duration::from_secs(30));
         assert_eq!(config.drain_timeout, std::time::Duration::from_secs(15));
     }
+
+    // --- Buffer size validation ---
+
+    #[test]
+    fn test_validate_buffer_size_minimum_boundary() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            buffer_size: 1024,
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_buffer_size_below_minimum() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            buffer_size: 1023,
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("1024"));
+    }
+
+    #[test]
+    fn test_validate_buffer_size_zero() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            buffer_size: 0,
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_buffer_size_large() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            buffer_size: 10 * 1024 * 1024, // 10 MiB
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    // --- Drain timeout validation ---
+
+    #[test]
+    fn test_validate_drain_timeout_minimum() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            drain_timeout: 1,
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_drain_timeout_zero() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            drain_timeout: 0,
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("drain-timeout"));
+    }
+
+    // --- Log format validation ---
+
+    #[test]
+    fn test_validate_all_log_formats() {
+        for fmt in &["pretty", "compact", "json"] {
+            let args = Args {
+                export: vec!["svc/127.0.0.1:8000".into()],
+                log_format: fmt.to_string(),
+                ..Default::default()
+            };
+            assert!(args.validate().is_ok(), "log_format '{}' should be valid", fmt);
+        }
+    }
+
+    #[test]
+    fn test_validate_invalid_log_format() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            log_format: "xml".into(),
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("log-format"));
+        assert!(err.contains("xml"));
+    }
+
+    // --- Log level validation ---
+
+    #[test]
+    fn test_validate_all_log_levels() {
+        for level in &["trace", "debug", "info", "warn", "error", "off"] {
+            let args = Args {
+                export: vec!["svc/127.0.0.1:8000".into()],
+                log_level: level.to_string(),
+                ..Default::default()
+            };
+            assert!(args.validate().is_ok(), "log_level '{}' should be valid", level);
+        }
+    }
+
+    #[test]
+    fn test_validate_invalid_log_level() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8000".into()],
+            log_level: "verbose".into(),
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("log-level"));
+        assert!(err.contains("verbose"));
+    }
+
+    // --- Spec format validation through validate() ---
+
+    #[test]
+    fn test_validate_rejects_bad_export_spec() {
+        let args = Args {
+            export: vec!["invalid-no-slash".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_import_spec() {
+        let args = Args {
+            import: vec!["invalid-no-slash".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_http_export_spec() {
+        let args = Args {
+            http_export: vec!["only/two-parts".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_ws_export_spec() {
+        let args = Args {
+            ws_export: vec!["svc/http://not-ws".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
+
+    // --- Multiple spec combinations ---
+
+    #[test]
+    fn test_validate_mixed_export_import() {
+        let args = Args {
+            export: vec!["svc1/127.0.0.1:8001".into()],
+            import: vec!["svc2/127.0.0.1:8002".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_all_spec_types_at_once() {
+        let args = Args {
+            export: vec!["svc/127.0.0.1:8001".into()],
+            import: vec!["svc/127.0.0.1:8002".into()],
+            http_export: vec!["http/dns.test/127.0.0.1:8003".into()],
+            http_import: vec!["http/127.0.0.1:8004".into()],
+            ws_export: vec!["ws/ws://127.0.0.1:9000".into()],
+            ws_import: vec!["ws/127.0.0.1:8005".into()],
+            auto_import: vec!["auto/127.0.0.1:8006".into()],
+            http_multiroute_import: vec!["mr/127.0.0.1:8007".into()],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    // --- First bad spec in list fails validation ---
+
+    #[test]
+    fn test_validate_mixed_good_and_bad_specs() {
+        let args = Args {
+            export: vec![
+                "good/127.0.0.1:8001".into(),
+                "bad-no-slash".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+    }
 }
