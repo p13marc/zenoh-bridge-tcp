@@ -400,6 +400,26 @@ cargo test --lib
 cargo nextest run --test http_routing_integration
 ```
 
+### Network Topology Tests (nlink-lab)
+
+End-to-end tests using [nlink-lab](https://github.com/p13marc/nlink-lab) to create isolated network namespaces with realistic WAN conditions. These require Linux with network namespace support and `nlink-lab` installed on the host.
+
+```bash
+# Raw TCP multi-hop: client -> import bridge -> zenoh -> export bridge -> backend
+./tests/nlink/run-multi-hop-test.sh
+
+# HTTP host-header routing multi-hop: multiple backends, single import listener
+./tests/nlink/run-multi-hop-http-test.sh
+
+# With WAN simulation
+./tests/nlink/run-multi-hop-test.sh --wan-delay 100ms --wan-loss 1%
+
+# Skip cargo build if already built
+./tests/nlink/run-multi-hop-test.sh --skip-build
+```
+
+See [tests/nlink/README.md](tests/nlink/README.md) for debugging tips and topology details.
+
 See [tests/README.md](tests/README.md) for detailed testing documentation and [docs/HTTP_ROUTING_GUIDE.md](docs/HTTP_ROUTING_GUIDE.md) for the HTTP/HTTPS routing guide.
 
 ## Zenoh Key Expression Design

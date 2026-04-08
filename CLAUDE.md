@@ -57,6 +57,11 @@ cargo nextest run --test bug_demonstrations
 
 # Run coverage/resilience tests
 cargo nextest run --test coverage_integration
+
+# Network topology tests (require nlink-lab on the host, not in containers)
+./tests/nlink/run-multi-hop-test.sh
+./tests/nlink/run-multi-hop-http-test.sh
+./tests/nlink/run-multi-hop-test.sh --wan-delay 100ms --wan-loss 1%
 ```
 
 ## Linting and Formatting
@@ -97,6 +102,10 @@ Single crate with library and binary:
 - `src/tls_parser.rs` - TLS ClientHello parsing, SNI extraction with RFC 6066/1035 validation
 - `src/tls_config.rs` - TLS configuration loading (for `tls-termination` feature)
 - `src/protocol_detect.rs` - Protocol auto-detection (TLS/HTTP/WebSocket/TCP)
+- `tests/nlink/` - Network topology tests using nlink-lab (network namespaces with WAN simulation)
+  - `*.nll` - nlink-lab topology definitions
+  - `run-multi-hop-test.sh` - Raw TCP multi-hop end-to-end test
+  - `run-multi-hop-http-test.sh` - HTTP host-header routing multi-hop test
 
 ### Validation and Safety
 

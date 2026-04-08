@@ -1,0 +1,128 @@
+# Multi-hop HTTP routing bridge test.
+#
+# Topology:
+#
+#   [backend-api] --\                       /-- [client]
+#                    [site-a] ===WAN=== [site-b]
+#   [backend-web] --/                       \-- (single import listener)
+#
+# Two HTTP backends (api.example.com, web.example.com) are exported from
+# site-a. A single import listener at site-b routes requests by Host header
+# to the correct backend through Zenoh over a WAN link.
+#
+# Usage:
+#   nlink-lab validate tests/nlink/multi-hop-http-bridge.nll
+#   nlink-lab test tests/nlink/multi-hop-http-bridge.nll
+#   nlink-lab deploy tests/nlink/multi-hop-http-bridge.nll
+
+param wan_delay default 30ms
+param wan_loss default 0%
+param bridge_bin default "/var/home/mpardo/git/zenoh-bridge-tcp/target/release/zenoh-bridge-tcp"
+
+lab "multi-hop-http" {
+    description "Multi-hop HTTP routing: two backends, one import listener, Host-header routing"
+    mgmt 172.20.0.0/24 host-reachable
+    dns hosts
+    routing auto
+}
+
+profile router { forward ipv4 }
+
+# --- Nodes ---
+
+node router-a : router
+node router-b : router
+
+# Backend: api.example.com on port 8001
+node backend-api {
+    depends-on [router-a]
+    run ["python3", "-m", "http.server", "8001"] background
+    healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8001'"
+    healthcheck-interval 500ms
+    healthcheck-timeout 10s
+    route default via ${router-a.eth0}
+}
+
+# Backend: web.example.com on port 8002
+node backend-web {
+    depends-on [router-a]
+    run ["python3", "-m", "http.server", "8002"] background
+    healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8002'"
+    healthcheck-interval 500ms
+    healthcheck-timeout 10s
+    route default via 10.0.3.1
+}
+
+# Export bridges at site A
+node exporter {
+    depends-on [backend-api, backend-web]
+    startup-delay 1s
+    run ["${bridge_bin}", "--http-export", "http-svc/api.example.com/10.0.1.10:8001", "--http-export", "http-svc/web.example.com/10.0.3.20:8002", "--mode", "peer", "--log-level", "debug"] background
+    healthcheck "bash -c 'true'"
+    healthcheck-timeout 15s
+    route default via 10.0.5.1
+}
+
+# Import bridge at site B — single listener, routes by Host header
+node importer {
+    depends-on [exporter]
+    startup-delay 2s
+    run ["${bridge_bin}", "--http-import", "http-svc/0.0.0.0:8080", "--mode", "peer", "--log-level", "debug"] background
+    healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"
+    healthcheck-interval 500ms
+    healthcheck-timeout 15s
+    route default via 10.0.4.1
+}
+
+# Client at site B
+node client {
+    depends-on [importer]
+    startup-delay 3s
+    route default via ${router-b.eth0}
+}
+
+# --- LAN Links (site A) ---
+
+link router-a:eth0 -- backend-api:eth0 {
+    10.0.1.1/24 -- 10.0.1.10/24
+}
+
+link router-a:eth1 -- backend-web:eth0 {
+    10.0.3.1/24 -- 10.0.3.20/24
+}
+
+link router-a:eth2 -- exporter:eth0 {
+    10.0.5.1/24 -- 10.0.5.30/24
+}
+
+# --- LAN Links (site B) ---
+
+link router-b:eth0 -- client:eth0 {
+    10.0.2.1/24 -- 10.0.2.10/24
+}
+
+link router-b:eth1 -- importer:eth0 {
+    10.0.4.1/24 -- 10.0.4.20/24
+}
+
+# --- WAN Link ---
+
+link router-a:wan0 -- router-b:wan0 {
+    172.16.0.1/30 -- 172.16.0.2/30
+    delay ${wan_delay} loss ${wan_loss}
+}
+
+# --- Validation ---
+
+validate {
+    reach client backend-api
+    reach client backend-web
+    reach exporter importer
+
+    # Backend HTTP servers are up
+    tcp-connect exporter backend-api 8001 timeout 3s retries 5 interval 1s
+    tcp-connect exporter backend-web 8002 timeout 3s retries 5 interval 1s
+
+    # Import HTTP listener is up
+    tcp-connect client importer 8080 timeout 15s retries 30 interval 1s
+}

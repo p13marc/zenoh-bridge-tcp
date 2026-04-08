@@ -1,0 +1,130 @@
+# Multi-hop zenoh-bridge-tcp topology test.
+#
+# Topology:
+#
+#   [backend] --- [site-a] ===WAN=== [site-b] --- [client]
+#
+#   backend:  runs a TCP echo server (nc -lk)
+#   site-a:   runs zenoh-bridge-tcp --export (connects to backend)
+#   site-b:   runs zenoh-bridge-tcp --import (listens for clients)
+#   client:   connects to site-b import listener and sends data through
+#             the full chain: client -> import bridge -> zenoh -> export bridge -> backend
+#
+# The WAN link between site-a and site-b has configurable delay and loss
+# to simulate realistic network conditions.
+#
+# Usage:
+#   # Validate syntax
+#   nlink-lab validate tests/nlink/multi-hop-bridge.nll
+#
+#   # Deploy and test (requires + bridge binary built)
+#   nlink-lab test tests/nlink/multi-hop-bridge.nll
+#
+#   # Deploy with custom WAN impairment
+#   nlink-lab deploy tests/nlink/multi-hop-bridge.nll --set wan_delay=100ms --set wan_loss=1%
+#
+#   # Interactive debugging
+#   nlink-lab shell multi-hop-bridge client
+#   nlink-lab exec multi-hop-bridge client -- curl http://10.0.2.10:8002
+
+param wan_delay default 30ms
+param wan_loss default 0%
+param bridge_bin default "/var/home/mpardo/git/zenoh-bridge-tcp/target/release/zenoh-bridge-tcp"
+
+lab "multi-hop-bridge" {
+    description "Multi-hop zenoh-bridge-tcp test: client -> import -> zenoh -> export -> backend"
+    mgmt 172.20.0.0/24 host-reachable
+    dns hosts
+    routing auto
+}
+
+profile router { forward ipv4 }
+
+# --- Nodes ---
+
+# Router at site A (export side)
+node router-a : router
+
+# Router at site B (import side)
+node router-b : router
+
+# Backend TCP echo server at site A
+node backend {
+    depends-on [router-a]
+    run "bash -c 'while true; do echo hello | nc -l 8003; done'" background
+    healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8003'"
+    healthcheck-interval 500ms
+    healthcheck-timeout 10s
+    route default via ${router-a.eth0}
+}
+
+# Export bridge at site A — connects to backend, publishes over Zenoh
+node exporter {
+    depends-on [backend]
+    startup-delay 1s
+    run ["${bridge_bin}", "--export", "echo/10.0.1.10:8003", "--mode", "peer", "--log-level", "debug"] background
+    healthcheck "bash -c 'true'"
+    healthcheck-timeout 15s
+    route default via 10.0.3.1
+}
+
+# Import bridge at site B — listens for TCP clients, subscribes over Zenoh
+node importer {
+    depends-on [exporter]
+    startup-delay 2s
+    run ["${bridge_bin}", "--import", "echo/0.0.0.0:8002", "--mode", "peer", "--log-level", "debug"] background
+    healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8002'"
+    healthcheck-interval 500ms
+    healthcheck-timeout 15s
+    route default via 10.0.4.1
+}
+
+# Client at site B
+node client {
+    depends-on [importer]
+    startup-delay 3s
+    route default via ${router-b.eth0}
+}
+
+# --- LAN Links (site-local, no impairment) ---
+
+# Site A: backend subnet
+link router-a:eth0 -- backend:eth0 {
+    10.0.1.1/24 -- 10.0.1.10/24
+}
+
+# Site A: exporter subnet
+link router-a:eth1 -- exporter:eth0 {
+    10.0.3.1/24 -- 10.0.3.20/24
+}
+
+# Site B: client subnet
+link router-b:eth0 -- client:eth0 {
+    10.0.2.1/24 -- 10.0.2.10/24
+}
+
+# Site B: importer subnet
+link router-b:eth1 -- importer:eth0 {
+    10.0.4.1/24 -- 10.0.4.20/24
+}
+
+# --- WAN Link (inter-site, with impairment) ---
+
+link router-a:wan0 -- router-b:wan0 {
+    172.16.0.1/30 -- 172.16.0.2/30
+    delay ${wan_delay} loss ${wan_loss}
+}
+
+# --- Validation ---
+
+validate {
+    # Layer 3 reachability
+    reach client backend
+    reach exporter importer
+
+    # Backend echo server is up
+    tcp-connect exporter backend 8003 timeout 3s retries 5 interval 1s
+
+    # Import bridge listener is up (bridge fully started and healthy)
+    tcp-connect client importer 8002 timeout 15s retries 30 interval 1s
+}
