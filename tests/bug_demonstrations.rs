@@ -20,7 +20,10 @@ fn fix_001_transfer_encoding_and_content_length_rejected() {
     let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
 
     // FIXED: Parser now rejects responses with both TE and CL
-    assert!(result.is_err(), "Should reject response with both TE and CL");
+    assert!(
+        result.is_err(),
+        "Should reject response with both TE and CL"
+    );
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("Transfer-Encoding") && err_msg.contains("Content-Length"),
@@ -66,7 +69,10 @@ fn fix_002b_multiple_identical_content_length_accepted() {
                      \r\n";
 
     let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
-    assert!(result.is_ok(), "Identical Content-Length values should be accepted");
+    assert!(
+        result.is_ok(),
+        "Identical Content-Length values should be accepted"
+    );
     let (_, framing) = result.unwrap().unwrap();
     assert_eq!(
         framing,
@@ -109,7 +115,10 @@ fn fix_003b_reasonable_content_length_accepted() {
                      \r\n";
 
     let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
-    assert!(result.is_ok(), "Reasonable Content-Length should be accepted");
+    assert!(
+        result.is_ok(),
+        "Reasonable Content-Length should be accepted"
+    );
     let (_, framing) = result.unwrap().unwrap();
     assert_eq!(
         framing,
@@ -258,8 +267,8 @@ fn fix_008_main_drain_timeout_uses_config() {
 
 #[tokio::test]
 async fn fix_009_shutdown_awaits_task_handles() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::mpsc;
 
     let flushed = Arc::new(AtomicBool::new(false));
@@ -295,8 +304,8 @@ async fn fix_009_shutdown_awaits_task_handles() {
 
 #[tokio::test]
 async fn fix_010_reconnect_cancels_old_before_spawning_new() {
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     let active_count = Arc::new(AtomicU32::new(0));
 

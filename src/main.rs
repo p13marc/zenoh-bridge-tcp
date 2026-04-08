@@ -100,7 +100,9 @@ async fn main() -> Result<()> {
     // Configure Zenoh session
     let config = if let Some(config_file) = &args.config {
         if args.mode != "peer" || args.connect.is_some() || args.listen.is_some() {
-            warn!("Config file provided; --mode, --connect, and --listen CLI arguments will be ignored");
+            warn!(
+                "Config file provided; --mode, --connect, and --listen CLI arguments will be ignored"
+            );
         }
         info!(config_file = %config_file, "Loading Zenoh configuration from file");
         config::create_zenoh_config_from_file(config_file)?
@@ -324,7 +326,10 @@ async fn main() -> Result<()> {
     shutdown_token.cancelled().await;
 
     let drain_timeout = tokio::time::Duration::from_secs(args.drain_timeout);
-    info!("Waiting for tasks to drain (max {} seconds)...", args.drain_timeout);
+    info!(
+        "Waiting for tasks to drain (max {} seconds)...",
+        args.drain_timeout
+    );
 
     // Wait for all tasks to finish with timeout
     let _ = tokio::time::timeout(drain_timeout, async {

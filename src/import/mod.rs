@@ -69,7 +69,9 @@ async fn drain_tasks(tasks: &mut JoinSet<()>, service_name: &str, drain_timeout:
     while !tasks.is_empty() {
         match tokio::time::timeout_at(deadline, tasks.join_next()).await {
             Ok(Some(Ok(()))) => {}
-            Ok(Some(Err(e))) => warn!(service = %service_name, error = %e, "Connection task error during drain"),
+            Ok(Some(Err(e))) => {
+                warn!(service = %service_name, error = %e, "Connection task error during drain")
+            }
             Ok(None) => break,
             Err(_) => {
                 warn!(service = %service_name, remaining = tasks.len(), "Drain timeout, aborting remaining connections");

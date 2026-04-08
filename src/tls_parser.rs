@@ -90,7 +90,6 @@ where
         }
 
         while buffer.len() < total_size {
-
             let n = stream.read(&mut temp_buf).await?;
             if n == 0 {
                 return Err(BridgeError::TlsParse(
@@ -156,9 +155,7 @@ fn validate_sni_hostname(raw: &[u8]) -> Result<String> {
         .map_err(|_| BridgeError::TlsParse("SNI hostname is not valid UTF-8".to_string()))?;
 
     if hostname.is_empty() {
-        return Err(BridgeError::TlsParse(
-            "SNI hostname is empty".to_string(),
-        ));
+        return Err(BridgeError::TlsParse("SNI hostname is empty".to_string()));
     }
 
     if hostname.len() > 253 {
@@ -181,7 +178,10 @@ fn validate_sni_hostname(raw: &[u8]) -> Result<String> {
                 label
             )));
         }
-        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
             return Err(BridgeError::TlsParse(format!(
                 "SNI hostname label contains invalid characters: '{}'",
                 label
@@ -422,12 +422,24 @@ mod tests {
 
     #[test]
     fn test_validate_sni_valid_hostnames() {
-        assert_eq!(validate_sni_hostname(b"example.com").unwrap(), "example.com");
-        assert_eq!(validate_sni_hostname(b"api.test.com").unwrap(), "api.test.com");
-        assert_eq!(validate_sni_hostname(b"my-service.internal").unwrap(), "my-service.internal");
+        assert_eq!(
+            validate_sni_hostname(b"example.com").unwrap(),
+            "example.com"
+        );
+        assert_eq!(
+            validate_sni_hostname(b"api.test.com").unwrap(),
+            "api.test.com"
+        );
+        assert_eq!(
+            validate_sni_hostname(b"my-service.internal").unwrap(),
+            "my-service.internal"
+        );
         assert_eq!(validate_sni_hostname(b"localhost").unwrap(), "localhost");
         // Punycode A-label (internationalized domain)
-        assert_eq!(validate_sni_hostname(b"xn--nxasmq6b.com").unwrap(), "xn--nxasmq6b.com");
+        assert_eq!(
+            validate_sni_hostname(b"xn--nxasmq6b.com").unwrap(),
+            "xn--nxasmq6b.com"
+        );
         // Single-char labels
         assert_eq!(validate_sni_hostname(b"a.b.c").unwrap(), "a.b.c");
     }
@@ -440,12 +452,14 @@ mod tests {
     #[test]
     fn test_validate_sni_too_long() {
         // 254 bytes = too long (max 253)
-        let long = "a".repeat(63) + "." + &"b".repeat(63) + "." + &"c".repeat(63) + "." + &"d".repeat(62);
+        let long =
+            "a".repeat(63) + "." + &"b".repeat(63) + "." + &"c".repeat(63) + "." + &"d".repeat(62);
         assert_eq!(long.len(), 254);
         assert!(validate_sni_hostname(long.as_bytes()).is_err());
 
         // 253 bytes = OK
-        let ok = "a".repeat(63) + "." + &"b".repeat(63) + "." + &"c".repeat(63) + "." + &"d".repeat(61);
+        let ok =
+            "a".repeat(63) + "." + &"b".repeat(63) + "." + &"c".repeat(63) + "." + &"d".repeat(61);
         assert_eq!(ok.len(), 253);
         assert!(validate_sni_hostname(ok.as_bytes()).is_ok());
     }
@@ -498,6 +512,11 @@ mod tests {
         let record = build_client_hello_with_sni("exam ple.com");
         let result = extract_sni_from_client_hello(&record);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid characters"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid characters")
+        );
     }
 }

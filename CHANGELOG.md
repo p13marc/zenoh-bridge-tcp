@@ -27,7 +27,7 @@
 
 ### Changed
 
-- **Zenoh upgraded to 1.7.2** (from 1.6.2)
+- **Zenoh upgraded to 1.8.0** (from 1.6.2)
 - Export shutdown drains task handle map, releases mutex, sends cancellation signals, then awaits with drain timeout
 - Import shutdown stops accept loop on cancellation, then drains active connections up to drain timeout
 

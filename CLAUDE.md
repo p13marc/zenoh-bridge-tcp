@@ -151,7 +151,7 @@ Uses `zenoh-ext` AdvancedPublisher/Subscriber for reliability:
 
 ## Dependencies
 
-- `zenoh` 1.7.2 - Zenoh distributed data bus
+- `zenoh` 1.8.0 - Zenoh distributed data bus
 - `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
 - `tokio-util` - CancellationToken for graceful shutdown

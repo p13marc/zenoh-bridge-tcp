@@ -71,9 +71,7 @@ pub fn parse_response_headers(buffer: &[u8]) -> Result<Option<(usize, ResponseBo
             }
 
             // RFC 7230 §3.3.3: reject multiple Content-Length with differing values
-            if content_lengths.len() > 1
-                && !content_lengths.windows(2).all(|w| w[0] == w[1])
-            {
+            if content_lengths.len() > 1 && !content_lengths.windows(2).all(|w| w[0] == w[1]) {
                 return Err(BridgeError::HttpParse(
                     "Invalid response: multiple Content-Length headers with differing values"
                         .to_string(),
@@ -295,10 +293,12 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 10\r\n\r\n";
         let result = parse_response_headers(response);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Transfer-Encoding"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Transfer-Encoding")
+        );
     }
 
     #[test]
@@ -311,15 +311,13 @@ mod tests {
 
     #[test]
     fn test_reject_differing_content_lengths() {
-        let response =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 20\r\n\r\n";
         assert!(parse_response_headers(response).is_err());
     }
 
     #[test]
     fn test_accept_identical_content_lengths() {
-        let response =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Length: 10\r\n\r\n";
         let (_, framing) = parse_response_headers(response).unwrap().unwrap();
         assert_eq!(framing, ResponseBodyFraming::ContentLength(10));
     }
@@ -327,21 +325,17 @@ mod tests {
     #[test]
     fn test_content_length_at_max_boundary() {
         let max = MAX_CONTENT_LENGTH;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-            max
-        );
-        let (_, framing) = parse_response_headers(response.as_bytes()).unwrap().unwrap();
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", max);
+        let (_, framing) = parse_response_headers(response.as_bytes())
+            .unwrap()
+            .unwrap();
         assert_eq!(framing, ResponseBodyFraming::ContentLength(max));
     }
 
     #[test]
     fn test_content_length_above_max_rejected() {
         let over = MAX_CONTENT_LENGTH + 1;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-            over
-        );
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", over);
         assert!(parse_response_headers(response.as_bytes()).is_err());
     }
 

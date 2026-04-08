@@ -161,8 +161,7 @@ async fn handle_auto_http_connection(
     let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
 
     if peek_len > 0 {
-        let looks_like_ws =
-            matches!(crate::http_parser::try_parse_request(&peek_buf[..peek_len]),
+        let looks_like_ws = matches!(crate::http_parser::try_parse_request(&peek_buf[..peek_len]),
                 Ok(Some(parsed)) if parsed.is_websocket_upgrade);
 
         if looks_like_ws {

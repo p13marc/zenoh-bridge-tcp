@@ -15,8 +15,8 @@ name = "zenoh-bridge-tcp"
 path = "src/main.rs"
 
 [dependencies]
-zenoh = "~1.7.2"
-zenoh-ext = { version = "~1.7.2", features = ["unstable"] }
+zenoh = "~1.8.0"
+zenoh-ext = { version = "~1.8.0", features = ["unstable"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"

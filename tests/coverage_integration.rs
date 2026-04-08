@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{start_echo_server, unique_service_name, BridgePair};
+use common::{BridgePair, start_echo_server, unique_service_name};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -32,8 +32,8 @@ async fn test_large_message_exceeds_buffer_size() {
     let mut received = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while received.len() < payload.len() {
-        let remaining = Duration::from_secs(1)
-            .min(deadline.duration_since(tokio::time::Instant::now()));
+        let remaining =
+            Duration::from_secs(1).min(deadline.duration_since(tokio::time::Instant::now()));
         let mut buf = vec![0u8; 65536];
         match tokio::time::timeout(remaining, client.read(&mut buf)).await {
             Ok(Ok(0)) => break,
@@ -96,7 +96,11 @@ async fn test_partial_transfer_client_closes_mid_send() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(&buf[..n], b"world", "Bridge should still work after client disconnect");
+    assert_eq!(
+        &buf[..n],
+        b"world",
+        "Bridge should still work after client disconnect"
+    );
 
     pair.kill_and_wait().await;
 }
