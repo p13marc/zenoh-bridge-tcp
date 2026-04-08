@@ -3,6 +3,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, info_span};
 use zenoh::Session;
@@ -35,6 +36,8 @@ pub(super) async fn run_ws_import_mode(
 
     info!(listen_addr = %listen_addr, service = %service_name, "WebSocket import bridge ready");
 
+    let mut tasks = JoinSet::new();
+
     // Accept connections
     loop {
         tokio::select! {
@@ -57,7 +60,7 @@ pub(super) async fn run_ws_import_mode(
                             mode = "websocket"
                         );
 
-                        tokio::spawn(
+                        tasks.spawn(
                             async move {
                                 // Perform WebSocket upgrade
                                 match tokio_tungstenite::accept_async(stream).await {
@@ -99,7 +102,12 @@ pub(super) async fn run_ws_import_mode(
                 break;
             }
         }
+
+        // Reap completed tasks
+        while tasks.try_join_next().is_some() {}
     }
+
+    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
 
     info!(service = %service_name, "WebSocket import bridge stopped");
     Ok(())

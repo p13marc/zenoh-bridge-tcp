@@ -220,13 +220,16 @@ where
         }
     });
 
-    // Wait for either task to complete or error signal
+    // Wait for either task to complete or error signal.
+    // Use a single deadline so both drain waits share the same budget.
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+
     tokio::select! {
         _ = &mut zenoh_to_client => {
             info!("Client {}: Zenoh to client task completed", client_id);
             cancel_client_to_zenoh.cancel();
             error_monitor.abort();
-            match tokio::time::timeout(drain_timeout, &mut client_to_zenoh).await {
+            match tokio::time::timeout_at(deadline, &mut client_to_zenoh).await {
                 Ok(_) => {}
                 Err(_) => {
                     debug!("Client {}: Client-to-Zenoh drain timeout", client_id);
@@ -239,7 +242,7 @@ where
             info!("Client {}: Client to Zenoh task completed", client_id);
             cancel_zenoh_to_client.cancel();
             error_monitor.abort();
-            match tokio::time::timeout(drain_timeout, &mut zenoh_to_client).await {
+            match tokio::time::timeout_at(deadline, &mut zenoh_to_client).await {
                 Ok(_) => {}
                 Err(_) => {
                     debug!("Client {}: Zenoh-to-client drain timeout", client_id);
@@ -253,7 +256,7 @@ where
                 warn!("Client {}: Backend unavailable, draining remaining data", client_id);
 
                 cancel_client_to_zenoh.cancel();
-                match tokio::time::timeout(drain_timeout, &mut client_to_zenoh).await {
+                match tokio::time::timeout_at(deadline, &mut client_to_zenoh).await {
                     Ok(_) => {}
                     Err(_) => {
                         debug!("Client {}: Client-to-Zenoh drain timeout after error", client_id);
@@ -262,14 +265,13 @@ where
                     }
                 }
 
-                // Give the zenoh_to_client task time to drain buffered samples
                 cancel_zenoh_to_client.cancel();
-                match tokio::time::timeout(drain_timeout, &mut zenoh_to_client).await {
+                match tokio::time::timeout_at(deadline, &mut zenoh_to_client).await {
                     Ok(_) => {
                         info!("Client {}: Drain completed", client_id);
                     }
                     Err(_) => {
-                        warn!("Client {}: Drain timed out after {:?}, aborting", client_id, drain_timeout);
+                        warn!("Client {}: Drain timed out, aborting", client_id);
                         zenoh_to_client.abort();
                         let _ = zenoh_to_client.await;
                     }

@@ -100,7 +100,7 @@ where
 /// Returns `Ok(Some(ParsedHttpRequest))` if parsing succeeds,
 /// `Ok(None)` if more data is needed,
 /// or `Err` if parsing fails definitively.
-fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
+pub(crate) fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpRequest>> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
 

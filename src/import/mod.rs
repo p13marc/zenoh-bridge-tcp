@@ -34,7 +34,10 @@ use crate::config::BridgeConfig;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
 use zenoh::Session;
 
 /// Parse import specification in format 'service_name/listen_addr'
@@ -52,6 +55,29 @@ pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
         .map_err(|e| anyhow::anyhow!("Invalid listen address: {}", e))?;
 
     Ok((service_name, listen_addr))
+}
+
+/// Drain active connection tasks on shutdown.
+///
+/// Waits up to `drain_timeout` for all tasks to complete, then aborts any remaining.
+async fn drain_tasks(tasks: &mut JoinSet<()>, service_name: &str, drain_timeout: Duration) {
+    if tasks.is_empty() {
+        return;
+    }
+    info!(service = %service_name, count = tasks.len(), "Draining active connections");
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    while !tasks.is_empty() {
+        match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(e))) => warn!(service = %service_name, error = %e, "Connection task error during drain"),
+            Ok(None) => break,
+            Err(_) => {
+                warn!(service = %service_name, remaining = tasks.len(), "Drain timeout, aborting remaining connections");
+                tasks.abort_all();
+                break;
+            }
+        }
+    }
 }
 
 /// Run import mode for a single service

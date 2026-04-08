@@ -167,6 +167,11 @@ pub(super) async fn run_export_loop(
         }
     }
 
+    // Explicitly undeclare liveliness subscriber
+    if let Err(e) = liveliness_subscriber.undeclare().await {
+        debug!(service = %service_name, "Error undeclaring liveliness subscriber: {:?}", e);
+    }
+
     info!(service = %service_name, "Export bridge stopped");
     Ok(())
 }
@@ -275,6 +280,7 @@ where
     let buffer_size = config.buffer_size;
     let drain_timeout = config.drain_timeout;
     let b2z_token = cancel_backend_to_zenoh.clone();
+    let signal_peer_z2b = cancel_zenoh_to_backend.clone();
     let mut backend_to_zenoh_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -306,6 +312,8 @@ where
                 }
             }
         }
+        // Signal the writer direction to stop
+        signal_peer_z2b.cancel();
         if let Err(e) = publisher.undeclare().await {
             debug!(
                 "Error undeclaring publisher for {}: {:?}",
@@ -316,6 +324,7 @@ where
 
     // Task: receive from Zenoh and write to backend
     let z2b_token = cancel_zenoh_to_backend.clone();
+    let signal_peer_b2z = cancel_backend_to_zenoh.clone();
     let mut zenoh_to_backend_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -341,6 +350,8 @@ where
                 }
             }
         }
+        // Signal the reader direction to stop
+        signal_peer_b2z.cancel();
         if let Err(e) = subscriber.undeclare().await {
             debug!(
                 "Error undeclaring subscriber for {}: {:?}",
@@ -349,12 +360,15 @@ where
         }
     });
 
-    // Wait for either task to complete or cancellation signal
+    // Wait for either task to complete or cancellation signal.
+    // Use a single deadline so both drain waits share the same budget.
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+
     tokio::select! {
         _result = &mut backend_to_zenoh_handle => {
             info!("Backend closed for client: {}", client_id_for_final);
             cancel_zenoh_to_backend.cancel();
-            match tokio::time::timeout(drain_timeout, &mut zenoh_to_backend_handle).await {
+            match tokio::time::timeout_at(deadline, &mut zenoh_to_backend_handle).await {
                 Ok(_) => {}
                 Err(_) => {
                     debug!("Zenoh-to-backend drain timeout for client: {}", client_id_for_final);
@@ -366,7 +380,7 @@ where
         _result = &mut zenoh_to_backend_handle => {
             info!("Zenoh closed for client: {}", client_id_for_final);
             cancel_backend_to_zenoh.cancel();
-            match tokio::time::timeout(drain_timeout, &mut backend_to_zenoh_handle).await {
+            match tokio::time::timeout_at(deadline, &mut backend_to_zenoh_handle).await {
                 Ok(_) => {}
                 Err(_) => {
                     debug!("Backend-to-Zenoh drain timeout for client: {}", client_id_for_final);
@@ -379,7 +393,7 @@ where
             info!("Cancellation received for client: {}", client_id_for_final);
             cancel_zenoh_to_backend.cancel();
             cancel_backend_to_zenoh.cancel();
-            match tokio::time::timeout(drain_timeout, &mut backend_to_zenoh_handle).await {
+            match tokio::time::timeout_at(deadline, &mut backend_to_zenoh_handle).await {
                 Ok(_) => {
                     debug!("Backend-to-Zenoh drained for client: {}", client_id_for_final);
                 }
@@ -389,7 +403,7 @@ where
                     let _ = backend_to_zenoh_handle.await;
                 }
             }
-            match tokio::time::timeout(drain_timeout, &mut zenoh_to_backend_handle).await {
+            match tokio::time::timeout_at(deadline, &mut zenoh_to_backend_handle).await {
                 Ok(_) => {
                     debug!("Zenoh-to-backend drained for client: {}", client_id_for_final);
                 }

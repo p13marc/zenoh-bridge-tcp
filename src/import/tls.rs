@@ -3,6 +3,7 @@ use crate::http_parser::parse_http_request;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, info_span, warn};
 use zenoh::Session;
@@ -42,6 +43,8 @@ pub(super) async fn run_https_terminate_import_mode(
 
     info!(listen_addr = %listen_addr, service = %service_name, "HTTPS termination import bridge ready");
 
+    let mut tasks = JoinSet::new();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -66,7 +69,7 @@ pub(super) async fn run_https_terminate_import_mode(
                             remote_addr = %addr,
                         );
 
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
                             // Perform TLS handshake
                             match tls_acceptor.accept(tcp_stream).await {
                                 Ok(tls_stream) => {
@@ -97,7 +100,12 @@ pub(super) async fn run_https_terminate_import_mode(
                 break;
             }
         }
+
+        // Reap completed tasks
+        while tasks.try_join_next().is_some() {}
     }
+
+    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
 
     info!(service = %service_name, "HTTPS terminate bridge stopped");
     Ok(())

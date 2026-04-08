@@ -99,11 +99,12 @@ async fn main() -> Result<()> {
 
     // Configure Zenoh session
     let config = if let Some(config_file) = &args.config {
-        // Load configuration from file
+        if args.mode != "peer" || args.connect.is_some() || args.listen.is_some() {
+            warn!("Config file provided; --mode, --connect, and --listen CLI arguments will be ignored");
+        }
         info!(config_file = %config_file, "Loading Zenoh configuration from file");
         config::create_zenoh_config_from_file(config_file)?
     } else {
-        // Create configuration from command-line arguments
         config::create_zenoh_config(&args.mode, args.connect.as_ref(), args.listen.as_ref())?
     };
 

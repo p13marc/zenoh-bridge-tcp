@@ -3,6 +3,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, info_span};
 use zenoh::Session;
@@ -34,6 +35,8 @@ pub(super) async fn run_auto_import_mode(
 
     info!(listen_addr = %listen_addr, service = %service_name, "Auto-detect import bridge ready");
 
+    let mut tasks = JoinSet::new();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -57,7 +60,7 @@ pub(super) async fn run_auto_import_mode(
                             remote_addr = %addr,
                         );
 
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
                             if let Err(e) = handle_auto_import_connection(
                                 session, stream, &service_name, &client_id, config,
                             ).await {
@@ -76,7 +79,12 @@ pub(super) async fn run_auto_import_mode(
                 break;
             }
         }
+
+        // Reap completed tasks
+        while tasks.try_join_next().is_some() {}
     }
+
+    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
 
     info!(service = %service_name, "Auto-detect import bridge stopped");
     Ok(())
@@ -148,14 +156,14 @@ async fn handle_auto_http_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
-    // Peek enough to detect "Upgrade: websocket" in headers
+    // Peek enough to detect WebSocket upgrade via proper HTTP parsing
     let mut peek_buf = vec![0u8; 4096];
     let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
 
     if peek_len > 0 {
-        let peek_lower = String::from_utf8_lossy(&peek_buf[..peek_len]).to_lowercase();
         let looks_like_ws =
-            peek_lower.contains("upgrade: websocket") || peek_lower.contains("upgrade:websocket");
+            matches!(crate::http_parser::try_parse_request(&peek_buf[..peek_len]),
+                Ok(Some(parsed)) if parsed.is_websocket_upgrade);
 
         if looks_like_ws {
             info!(client_id = %client_id, "Detected WebSocket upgrade request");

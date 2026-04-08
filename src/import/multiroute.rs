@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 use zenoh::Session;
@@ -40,6 +41,8 @@ pub(super) async fn run_http_multiroute_import_mode(
 
     info!(listen_addr = %listen_addr, service = %service_name, "Multi-route HTTP import bridge ready");
 
+    let mut tasks = JoinSet::new();
+
     loop {
         tokio::select! {
             result = listener.accept() => {
@@ -57,7 +60,7 @@ pub(super) async fn run_http_multiroute_import_mode(
                             remote_addr = %addr,
                         );
 
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
                             if let Err(e) = handle_multiroute_connection(
                                 session, stream, &service_name, &client_id,
                                 config,
@@ -75,7 +78,12 @@ pub(super) async fn run_http_multiroute_import_mode(
                 break;
             }
         }
+
+        // Reap completed tasks
+        while tasks.try_join_next().is_some() {}
     }
+
+    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
 
     info!(service = %service_name, "Multi-route HTTP import bridge stopped");
     Ok(())
@@ -266,6 +274,9 @@ async fn handle_multiroute_connection(
             Ok::<(), std::io::Error>(())
         })
         .await;
+
+        // Publish EOF so export side knows to clean up before we undeclare
+        let _ = tx_publisher.put(Vec::<u8>::new()).await;
 
         // Undeclare liveliness to signal export side to disconnect
         if let Err(e) = liveliness_token.undeclare().await {

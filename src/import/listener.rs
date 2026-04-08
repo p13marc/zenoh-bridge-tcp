@@ -2,6 +2,7 @@ use crate::config::BridgeConfig;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, error, info, info_span};
 use zenoh::Session;
@@ -31,6 +32,8 @@ pub(super) async fn run_import_mode_internal(
 
     info!(listen_addr = %listen_addr, service = %service_name, "Import bridge ready");
 
+    let mut tasks = JoinSet::new();
+
     // Accept connections
     loop {
         tokio::select! {
@@ -57,7 +60,7 @@ pub(super) async fn run_import_mode_internal(
                             mode = if http_mode { "http" } else { "tcp" }
                         );
 
-                        tokio::spawn(
+                        tasks.spawn(
                             async move {
                                 if let Err(e) = super::connection::handle_import_connection(
                                     session,
@@ -86,7 +89,12 @@ pub(super) async fn run_import_mode_internal(
                 break;
             }
         }
+
+        // Reap completed tasks to prevent unbounded growth
+        while tasks.try_join_next().is_some() {}
     }
+
+    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
 
     info!(service = %service_name, "Import bridge stopped");
     Ok(())

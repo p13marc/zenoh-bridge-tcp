@@ -138,6 +138,66 @@ where
     parse_tls_client_hello_with_config(stream, &BridgeConfig::default()).await
 }
 
+/// Validate an SNI hostname per RFC 6066 §3 and RFC 1035.
+///
+/// Requirements:
+/// - Must be valid ASCII (RFC 6066: "byte string using ASCII encoding")
+/// - Max 253 bytes (DNS hostname limit, RFC 1035)
+/// - No trailing dot (RFC 6066)
+/// - Each label: 1-63 bytes, alphanumeric + hyphens, no leading/trailing hyphen
+fn validate_sni_hostname(raw: &[u8]) -> Result<String> {
+    if !raw.is_ascii() {
+        return Err(BridgeError::TlsParse(
+            "SNI hostname contains non-ASCII bytes".to_string(),
+        ));
+    }
+
+    let hostname = std::str::from_utf8(raw)
+        .map_err(|_| BridgeError::TlsParse("SNI hostname is not valid UTF-8".to_string()))?;
+
+    if hostname.is_empty() {
+        return Err(BridgeError::TlsParse(
+            "SNI hostname is empty".to_string(),
+        ));
+    }
+
+    if hostname.len() > 253 {
+        return Err(BridgeError::TlsParse(format!(
+            "SNI hostname too long: {} bytes (max 253)",
+            hostname.len()
+        )));
+    }
+
+    if hostname.ends_with('.') {
+        return Err(BridgeError::TlsParse(
+            "SNI hostname must not have trailing dot".to_string(),
+        ));
+    }
+
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(BridgeError::TlsParse(format!(
+                "SNI hostname label invalid length: '{}'",
+                label
+            )));
+        }
+        if !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return Err(BridgeError::TlsParse(format!(
+                "SNI hostname label contains invalid characters: '{}'",
+                label
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(BridgeError::TlsParse(format!(
+                "SNI hostname label must not start/end with hyphen: '{}'",
+                label
+            )));
+        }
+    }
+
+    Ok(hostname.to_string())
+}
+
 /// Extract SNI hostname from TLS ClientHello buffer
 ///
 /// Uses the tls-parser crate to parse the TLS handshake and extract SNI
@@ -163,7 +223,7 @@ fn extract_sni_from_client_hello(buffer: &[u8]) -> Result<String> {
                                 // Get the first hostname from SNI
                                 for sni in sni_list {
                                     if let (tls_parser::SNIType::HostName, name) = sni {
-                                        let hostname = String::from_utf8_lossy(name).to_string();
+                                        let hostname = validate_sni_hostname(name)?;
                                         debug!("Found SNI hostname: {}", hostname);
                                         return Ok(hostname);
                                     }
@@ -356,5 +416,88 @@ mod tests {
         let http = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let result = extract_sni_from_client_hello(http);
         assert!(result.is_err());
+    }
+
+    // --- SNI hostname validation tests ---
+
+    #[test]
+    fn test_validate_sni_valid_hostnames() {
+        assert_eq!(validate_sni_hostname(b"example.com").unwrap(), "example.com");
+        assert_eq!(validate_sni_hostname(b"api.test.com").unwrap(), "api.test.com");
+        assert_eq!(validate_sni_hostname(b"my-service.internal").unwrap(), "my-service.internal");
+        assert_eq!(validate_sni_hostname(b"localhost").unwrap(), "localhost");
+        // Punycode A-label (internationalized domain)
+        assert_eq!(validate_sni_hostname(b"xn--nxasmq6b.com").unwrap(), "xn--nxasmq6b.com");
+        // Single-char labels
+        assert_eq!(validate_sni_hostname(b"a.b.c").unwrap(), "a.b.c");
+    }
+
+    #[test]
+    fn test_validate_sni_empty() {
+        assert!(validate_sni_hostname(b"").is_err());
+    }
+
+    #[test]
+    fn test_validate_sni_too_long() {
+        // 254 bytes = too long (max 253)
+        let long = "a".repeat(63) + "." + &"b".repeat(63) + "." + &"c".repeat(63) + "." + &"d".repeat(62);
+        assert_eq!(long.len(), 254);
+        assert!(validate_sni_hostname(long.as_bytes()).is_err());
+
+        // 253 bytes = OK
+        let ok = "a".repeat(63) + "." + &"b".repeat(63) + "." + &"c".repeat(63) + "." + &"d".repeat(61);
+        assert_eq!(ok.len(), 253);
+        assert!(validate_sni_hostname(ok.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sni_trailing_dot() {
+        assert!(validate_sni_hostname(b"example.com.").is_err());
+    }
+
+    #[test]
+    fn test_validate_sni_label_too_long() {
+        let long_label = "a".repeat(64) + ".com";
+        assert!(validate_sni_hostname(long_label.as_bytes()).is_err());
+
+        let ok_label = "a".repeat(63) + ".com";
+        assert!(validate_sni_hostname(ok_label.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_sni_empty_label() {
+        // Double dot = empty label
+        assert!(validate_sni_hostname(b"example..com").is_err());
+    }
+
+    #[test]
+    fn test_validate_sni_hyphen_boundaries() {
+        assert!(validate_sni_hostname(b"-example.com").is_err());
+        assert!(validate_sni_hostname(b"example-.com").is_err());
+        assert!(validate_sni_hostname(b"exam-ple.com").is_ok());
+    }
+
+    #[test]
+    fn test_validate_sni_invalid_characters() {
+        assert!(validate_sni_hostname(b"example.com:443").is_err()); // port
+        assert!(validate_sni_hostname(b"example.com/path").is_err()); // path
+        assert!(validate_sni_hostname(b"exam ple.com").is_err()); // space
+        assert!(validate_sni_hostname(b"example_host.com").is_err()); // underscore
+    }
+
+    #[test]
+    fn test_validate_sni_non_ascii() {
+        assert!(validate_sni_hostname(&[0xC3, 0xA9, 0x2E, 0x63, 0x6F, 0x6D]).is_err()); // "é.com" in UTF-8
+        assert!(validate_sni_hostname(b"example\x00.com").is_err()); // null byte
+        assert!(validate_sni_hostname(&[0xFF, 0xFE]).is_err()); // garbage bytes
+    }
+
+    #[test]
+    fn test_extract_sni_rejects_invalid_hostname_in_client_hello() {
+        // Build a ClientHello with a hostname containing invalid characters
+        let record = build_client_hello_with_sni("exam ple.com");
+        let result = extract_sni_from_client_hello(&record);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("invalid characters"));
     }
 }
