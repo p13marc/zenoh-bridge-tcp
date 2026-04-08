@@ -58,7 +58,7 @@ The shutdown drain timeout was hardcoded to 10 seconds, ignoring the user's `--d
 
 The parser accepted responses with both Transfer-Encoding and Content-Length headers, and silently took the first of multiple differing Content-Length values.
 
-**Fix applied**: Single-pass header scan now rejects responses with both TE and CL (RFC 7230 §3.3.3), and rejects multiple Content-Length headers with differing values.
+**Fix applied**: Single-pass header scan now rejects responses with both TE and CL, and rejects multiple Content-Length headers with differing values. Per RFC 9112 §6.3 (successor to RFC 7230 §3.3.3): "If a message is received with both a Transfer-Encoding and a Content-Length header field, the Transfer-Encoding overrides the Content-Length. Such a message might indicate an attempt to perform request smuggling or response splitting and **ought to be handled as an error**." Note: "ought to" is weaker than "MUST" — the RFC also allows intermediaries to strip Content-Length and forward. Our implementation takes the stricter approach (reject outright) which is appropriate for a bridge that cannot safely strip headers from an opaque byte stream. For differing Content-Length values: "the message framing is invalid and the recipient **MUST** treat it as an unrecoverable error" — this is a hard requirement.
 
 ---
 
@@ -68,9 +68,9 @@ The parser accepted responses with both Transfer-Encoding and Content-Length hea
 
 **File**: `src/http_response_parser.rs`
 
-`find_chunked_body_end()` trusted chunk size headers without bounds checking. `pos + chunk_size + 2` could overflow on 32-bit.
+`find_chunked_body_end()` trusted chunk size headers without bounds checking. `pos + chunk_size + 2` could overflow on 32-bit. RFC 9112 does not define a maximum chunk size — it is expressed as a variable-length hex value with no upper bound. However, real-world servers (nginx, Apache) rely on body-size limits, and accepting multi-gigabyte chunk declarations is a DoS vector.
 
-**Fix applied**: Added `MAX_CHUNK_SIZE` (256 MiB) limit. Arithmetic now uses `checked_add()` to prevent overflow.
+**Fix applied**: Added `MAX_CHUNK_SIZE` (256 MiB) limit — generous enough for any legitimate traffic while preventing pathological memory allocation. Arithmetic now uses `checked_add()` to prevent overflow on any platform.
 
 ---
 
@@ -78,9 +78,9 @@ The parser accepted responses with both Transfer-Encoding and Content-Length hea
 
 **File**: `src/http_response_parser.rs`
 
-Content-Length was parsed as `usize` without any maximum.
+Content-Length was parsed as `usize` without any maximum. While the multiroute path has a `max_response_size` (10 MiB) that catches oversized responses at the buffering layer, the parser itself should reject obviously absurd values as defense-in-depth.
 
-**Fix applied**: Added `MAX_CONTENT_LENGTH` (1 GiB) limit. Values exceeding it are rejected with a clear error.
+**Fix applied**: Added `MAX_CONTENT_LENGTH` (1 GiB) limit at the parsing layer. Values exceeding it are rejected with a clear error before any buffering occurs.
 
 ---
 
@@ -95,11 +95,11 @@ SNI hostnames are accepted without length or character validation:
 let hostname = String::from_utf8_lossy(name).to_string();
 ```
 
-- No maximum length check (SNI allows up to 65535 bytes)
-- `from_utf8_lossy` silently replaces invalid bytes with U+FFFD
+- No maximum length check — the SNI wire format (`HostName<1..2^16-1>`, RFC 6066 §3) allows up to 65535 bytes, but RFC 6066 states "currently, the only server names supported are DNS hostnames" and "literal IPv4 and IPv6 addresses are not permitted". Valid DNS hostnames are limited to 253 bytes (RFC 1035).
+- `from_utf8_lossy` silently replaces invalid bytes with U+FFFD — RFC 6066 specifies "the hostname is represented as a byte string using ASCII encoding without a trailing dot"
 - A hostname like `"example.com\x00admin.com"` becomes `"example.com<FFFD>admin.com"`, potentially bypassing DNS routing
 
-**Suggested fix**: Validate hostname is ASCII, <= 255 bytes, and contains only valid DNS characters.
+**Suggested fix**: Validate hostname is ASCII-only, <= 253 bytes, no trailing dot, and contains only valid DNS characters (letters, digits, hyphens, dots). Internationalized names must be A-labels (Punycode, per RFC 5890).
 
 ---
 
@@ -246,7 +246,7 @@ All listener modes use fire-and-forget `tokio::spawn()`. When the shutdown signa
 
 **File**: `Cargo.toml:4`
 
-Rust edition 2024 was stabilized in Rust 1.85 (Feb 2025). This is valid with recent toolchains.
+Rust edition 2024 was stabilized in Rust 1.85.0, released 2025-02-20 (confirmed via the official Rust blog announcement: "We are excited to announce that the Rust 2024 Edition is now stable!"). The project's `edition = "2024"` is valid as long as the toolchain is >= 1.85.0.
 
 ---
 
@@ -296,9 +296,11 @@ When `--config` is provided, `--mode`/`--connect`/`--listen` arguments are silen
 **Status**: OPEN (maintenance)
 **File**: `Cargo.toml:18-19`
 
-Specified `zenoh = "1.6.2"` but semver resolves to 1.7.x. If API changes occurred between versions, this could cause subtle issues.
+Cargo.toml specifies `zenoh = "1.6.2"` which Cargo interprets as `^1.6.2` (any version `>=1.6.2, <2.0.0`). The lock file resolves to **1.7.2**, and the latest available on crates.io is **1.8.0** (released 2026-03-13). Recent zenoh versions: 1.8.0, 1.7.2, 1.7.1, 1.7.0, 1.6.2.
 
-**Suggested fix**: Either pin exactly (`=1.6.2`) or update the spec to match reality.
+Since zenoh 1.x follows semver, public stable APIs should not break between 1.6 and 1.7. However, this project uses `zenoh-ext` with the `unstable` feature, and unstable APIs are explicitly not covered by semver guarantees.
+
+**Suggested fix**: Either use `~1.7.2` (tilde, locks to 1.7.x) to prevent unexpected jumps to 1.8, or update to `1.8.0` explicitly and test.
 
 ---
 
