@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.5.0] - 2026-04-08
+
+### Added
+
+- **Deep audit and 16 bug fixes**: Comprehensive code audit identified and resolved 16 bugs across HTTP parsing, TLS handling, shutdown correctness, and CLI validation
+- **Strict SNI validation**: TLS ClientHello SNI parsing now enforces RFC 6066 and RFC 1035 hostname rules (253-byte limit, 63-byte labels, no leading/trailing hyphens, ASCII-only, no trailing dots)
+- **CLI argument validation**: Early validation of `--buffer-size` (minimum 1024), `--drain-timeout` (minimum 1s), `--log-format`, `--log-level`, and all spec formats before starting the bridge
+- **Import task tracking**: Import listener uses `JoinSet` for per-connection task tracking with graceful drain on shutdown
+- **29 new tests**: Coverage integration tests (large messages up to 200KB, partial transfers, concurrent clients, rapid connect/disconnect cycles) and 16 bug fix verification tests
+- **Bug demonstration test suite**: `tests/bug_demonstrations.rs` with 16 tests verifying each audit fix
+
+### Fixed
+
+- HTTP response smuggling: reject requests with both Transfer-Encoding and Content-Length headers
+- Duplicate Content-Length header validation
+- Content-Length bounds checking (max 1GB)
+- Chunked transfer encoding overflow safety
+- Empty client ID rejection
+- Export reconnect ordering: cancel old connection before spawning new one
+- Explicit cancellation signal send instead of relying on drop
+- Mutex release before await in export shutdown path
+- Multiroute 504 response guard for unavailable backends
+- TLS handshake size consistency validation (max 16KB)
+- Main process drain timeout now uses configured value instead of hardcoded default
+
+### Changed
+
+- **Zenoh upgraded to 1.7.2** (from 1.6.2)
+- Export shutdown drains task handle map, releases mutex, sends cancellation signals, then awaits with drain timeout
+- Import shutdown stops accept loop on cancellation, then drains active connections up to drain timeout
+
 ## [0.4.0] - 2026-02-22
 
 ### Changed

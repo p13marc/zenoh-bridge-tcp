@@ -18,8 +18,10 @@ This bridge enables:
 - **Concurrent Services**: Handle multiple services in one bridge process
 - **Flexible Configuration**: Command-line arguments or Zenoh config files
 - **WebSocket Support**: Bridge WebSocket backends alongside TCP services
-- **Graceful Shutdown**: Clean shutdown via CancellationToken with connection draining
+- **Graceful Shutdown**: Clean shutdown via CancellationToken with per-task tracking and connection draining
 - **Backend Reconnection**: Exponential backoff retry when backends become unavailable
+- **Input Validation**: Early CLI validation (buffer size, timeouts, spec formats, log options) with clear error messages
+- **Strict TLS Parsing**: RFC 6066/1035-compliant SNI validation with size bounds checking
 
 ### HTTP/HTTPS Routing
 - **DNS-Based Routing**: Route HTTP requests by Host header to different backends
@@ -382,6 +384,8 @@ The project includes comprehensive integration tests. Use `cargo nextest run` fo
 - **`tests/auto_import_integration.rs`** - Protocol auto-detection
 - **`tests/https_termination_integration.rs`** - TLS termination
 - **`tests/stress_test.rs`** - Load and stress testing
+- **`tests/bug_demonstrations.rs`** - Verification tests for 16 audit bug fixes
+- **`tests/coverage_integration.rs`** - Large messages, partial transfers, concurrent clients, rapid connect/disconnect
 
 Run tests:
 
@@ -474,7 +478,7 @@ RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --export 'service/12
 ## Dependencies
 
 Core dependencies:
-- `zenoh` 1.6.2 - Zenoh distributed data bus
+- `zenoh` 1.7.2 - Zenoh distributed data bus
 - `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
 - `tokio-util` - CancellationToken for graceful shutdown
@@ -492,8 +496,8 @@ Development/test dependencies include: `axum`, `hyper`, `rustls`, `reqwest`, `fu
 
 ## Version Information
 
-- **Current Version**: 0.4.0
-- **Zenoh Version**: 1.6.2
+- **Current Version**: 0.5.0
+- **Zenoh Version**: 1.7.2
 - **Rust Edition**: 2024
 - **MSRV**: 1.85 (required by edition 2024)
 

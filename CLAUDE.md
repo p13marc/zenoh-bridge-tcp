@@ -51,6 +51,12 @@ cargo test --lib
 # Run specific integration test suites
 cargo nextest run --test http_routing_integration
 cargo nextest run --test https_routing_integration
+
+# Run bug fix verification tests
+cargo nextest run --test bug_demonstrations
+
+# Run coverage/resilience tests
+cargo nextest run --test coverage_integration
 ```
 
 ## Linting and Formatting
@@ -88,9 +94,17 @@ Single crate with library and binary:
   - `tls.rs` - TLS termination (feature-gated: `tls-termination`)
 - `src/http_parser.rs` - HTTP request parsing, Host header extraction
 - `src/http_response_parser.rs` - HTTP response body framing detection
-- `src/tls_parser.rs` - TLS ClientHello parsing, SNI extraction
+- `src/tls_parser.rs` - TLS ClientHello parsing, SNI extraction with RFC 6066/1035 validation
 - `src/tls_config.rs` - TLS configuration loading (for `tls-termination` feature)
 - `src/protocol_detect.rs` - Protocol auto-detection (TLS/HTTP/WebSocket/TCP)
+
+### Validation and Safety
+
+- `src/args.rs` validates all CLI arguments early: buffer_size >= 1024, drain_timeout >= 1s, log format/level, and all spec formats
+- `src/tls_parser.rs` enforces RFC 6066/1035 SNI hostname rules (253-byte limit, 63-byte labels, ASCII-only, no trailing dots)
+- `src/http_response_parser.rs` rejects smuggling attempts (TE+CL, duplicate CL), bounds Content-Length to 1GB
+- `src/import/listener.rs` tracks per-connection tasks via `JoinSet` with graceful drain on shutdown
+- `src/export/bridge.rs` cancels old connections before spawning replacements, releases mutex before await
 
 ### CLI Arguments
 
@@ -137,7 +151,7 @@ Uses `zenoh-ext` AdvancedPublisher/Subscriber for reliability:
 
 ## Dependencies
 
-- `zenoh` 1.6.2 - Zenoh distributed data bus
+- `zenoh` 1.7.2 - Zenoh distributed data bus
 - `zenoh-ext` - Extended pub/sub with reliability features
 - `tokio` - Async runtime
 - `tokio-util` - CancellationToken for graceful shutdown

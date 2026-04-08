@@ -4671,7 +4671,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-bridge-tcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
