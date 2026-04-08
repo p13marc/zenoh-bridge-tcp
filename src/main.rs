@@ -322,8 +322,8 @@ async fn main() -> Result<()> {
     // Wait for shutdown signal
     shutdown_token.cancelled().await;
 
-    info!("Waiting for tasks to drain (max 10 seconds)...");
-    let drain_timeout = tokio::time::Duration::from_secs(10);
+    let drain_timeout = tokio::time::Duration::from_secs(args.drain_timeout);
+    info!("Waiting for tasks to drain (max {} seconds)...", args.drain_timeout);
 
     // Wait for all tasks to finish with timeout
     let _ = tokio::time::timeout(drain_timeout, async {

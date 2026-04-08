@@ -88,7 +88,9 @@ pub(super) async fn run_export_loop(
     while let Ok(reply) = existing_clients.recv_async().await {
         if let Ok(sample) = reply.into_result() {
             let key = sample.key_expr().as_str();
-            if let Some(client_id) = key.rsplit('/').next() {
+            if let Some(client_id) = key.rsplit('/').next()
+                && !client_id.is_empty()
+            {
                 let client_id = client_id.to_string();
                 info!(client_id = %client_id, "Found existing client, connecting");
                 dispatch_client_connect(
@@ -111,7 +113,9 @@ pub(super) async fn run_export_loop(
                 match result {
                     Ok(sample) => {
                         let key = sample.key_expr().as_str();
-                        if let Some(client_id) = key.rsplit('/').next() {
+                        if let Some(client_id) = key.rsplit('/').next()
+                            && !client_id.is_empty()
+                        {
                             let client_id = client_id.to_string();
 
                             match sample.kind() {
@@ -140,10 +144,23 @@ pub(super) async fn run_export_loop(
             }
             _ = shutdown_token.cancelled() => {
                 info!(service = %service_name, "Export bridge shutting down");
-                let senders = cancellation_senders.lock().await;
-                for (client_id, (tx, _)) in senders.iter() {
+                // Collect senders and handles, then release the lock before awaiting
+                let entries: Vec<(String, CancellationSender)> =
+                    cancellation_senders.lock().await.drain().collect();
+
+                // Send cancellation signals
+                for (client_id, (tx, _)) in &entries {
                     let _ = tx.send(()).await;
                     debug!(client_id = %client_id, "Sent shutdown to client bridge");
+                }
+
+                // Wait for all task handles to drain
+                for (client_id, (_, handle)) in entries {
+                    match tokio::time::timeout(config.drain_timeout, handle).await {
+                        Ok(Ok(())) => debug!(client_id = %client_id, "Client bridge drained"),
+                        Ok(Err(e)) => warn!(client_id = %client_id, error = %e, "Client bridge task error during drain"),
+                        Err(_) => warn!(client_id = %client_id, "Client bridge drain timeout"),
+                    }
                 }
                 break;
             }

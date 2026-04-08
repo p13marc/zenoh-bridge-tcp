@@ -23,6 +23,10 @@ pub enum ResponseBodyFraming {
 ///
 /// Returns the header size (bytes consumed) and the body framing mode.
 /// Returns `Ok(None)` if the headers are incomplete (need more data).
+/// Maximum Content-Length value accepted (1 GiB).
+/// Responses claiming to be larger are rejected at the parsing layer.
+const MAX_CONTENT_LENGTH: usize = 1024 * 1024 * 1024;
+
 pub fn parse_response_headers(buffer: &[u8]) -> Result<Option<(usize, ResponseBodyFraming)>> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut response = httparse::Response::new(&mut headers);
@@ -36,24 +40,54 @@ pub fn parse_response_headers(buffer: &[u8]) -> Result<Option<(usize, ResponseBo
                 return Ok(Some((header_len, ResponseBodyFraming::NoBody)));
             }
 
-            // Check Transfer-Encoding
+            // Scan for Transfer-Encoding and Content-Length in a single pass
+            let mut has_chunked = false;
+            let mut content_lengths: Vec<usize> = Vec::new();
+
             for header in response.headers.iter() {
                 if header.name.eq_ignore_ascii_case("transfer-encoding")
                     && let Ok(value) = std::str::from_utf8(header.value)
                     && value.to_lowercase().contains("chunked")
                 {
-                    return Ok(Some((header_len, ResponseBodyFraming::Chunked)));
-                }
-            }
-
-            // Check Content-Length
-            for header in response.headers.iter() {
-                if header.name.eq_ignore_ascii_case("content-length")
+                    has_chunked = true;
+                } else if header.name.eq_ignore_ascii_case("content-length")
                     && let Ok(value) = std::str::from_utf8(header.value)
                     && let Ok(len) = value.trim().parse::<usize>()
                 {
-                    return Ok(Some((header_len, ResponseBodyFraming::ContentLength(len))));
+                    content_lengths.push(len);
                 }
+            }
+
+            // RFC 7230 §3.3.3: reject if both Transfer-Encoding and Content-Length present
+            if has_chunked && !content_lengths.is_empty() {
+                return Err(BridgeError::HttpParse(
+                    "Invalid response: both Transfer-Encoding and Content-Length present"
+                        .to_string(),
+                ));
+            }
+
+            if has_chunked {
+                return Ok(Some((header_len, ResponseBodyFraming::Chunked)));
+            }
+
+            // RFC 7230 §3.3.3: reject multiple Content-Length with differing values
+            if content_lengths.len() > 1
+                && !content_lengths.windows(2).all(|w| w[0] == w[1])
+            {
+                return Err(BridgeError::HttpParse(
+                    "Invalid response: multiple Content-Length headers with differing values"
+                        .to_string(),
+                ));
+            }
+
+            if let Some(&len) = content_lengths.first() {
+                if len > MAX_CONTENT_LENGTH {
+                    return Err(BridgeError::HttpParse(format!(
+                        "Content-Length {} exceeds maximum allowed ({})",
+                        len, MAX_CONTENT_LENGTH
+                    )));
+                }
+                return Ok(Some((header_len, ResponseBodyFraming::ContentLength(len))));
             }
 
             // No Content-Length and not chunked: body until close
@@ -89,6 +123,10 @@ pub fn is_connection_close(buffer: &[u8]) -> bool {
 ///
 /// Returns `Some(total_bytes_consumed)` if the final chunk (`0\r\n\r\n`) is found,
 /// `None` if more data is needed.
+/// Maximum single chunk size accepted (256 MiB).
+/// Chunks claiming to be larger are rejected to prevent overflow and DoS.
+const MAX_CHUNK_SIZE: usize = 256 * 1024 * 1024;
+
 pub fn find_chunked_body_end(body: &[u8]) -> Option<usize> {
     let mut pos = 0;
 
@@ -101,6 +139,11 @@ pub fn find_chunked_body_end(body: &[u8]) -> Option<usize> {
         let size_part = chunk_size_str.split(';').next()?;
         let chunk_size = usize::from_str_radix(size_part.trim(), 16).ok()?;
 
+        // Reject absurdly large chunk sizes to prevent overflow and DoS
+        if chunk_size > MAX_CHUNK_SIZE {
+            return None;
+        }
+
         pos += line_end + 2; // Skip past chunk-size line and CRLF
 
         if chunk_size == 0 {
@@ -111,8 +154,8 @@ pub fn find_chunked_body_end(body: &[u8]) -> Option<usize> {
             return None; // Need more data for trailing CRLF
         }
 
-        // Skip chunk data + trailing CRLF
-        let chunk_end = pos + chunk_size + 2;
+        // Skip chunk data + trailing CRLF (overflow-safe)
+        let chunk_end = pos.checked_add(chunk_size)?.checked_add(2)?;
         if body.len() < chunk_end {
             return None; // Need more data
         }

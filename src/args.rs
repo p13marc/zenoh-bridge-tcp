@@ -152,7 +152,7 @@ impl Default for Args {
 }
 
 impl Args {
-    /// Validate that at least one export or import is specified
+    /// Validate command-line arguments
     pub fn validate(&self) -> anyhow::Result<()> {
         let has_spec = !self.export.is_empty()
             || !self.import.is_empty()
@@ -177,6 +177,70 @@ impl Args {
             return Err(anyhow::anyhow!(
                 "--https-terminate requires both --tls-cert and --tls-key"
             ));
+        }
+
+        // Validate buffer_size
+        if self.buffer_size < 1024 {
+            return Err(anyhow::anyhow!(
+                "--buffer-size must be at least 1024 (got {})",
+                self.buffer_size
+            ));
+        }
+
+        // Validate drain_timeout
+        if self.drain_timeout < 1 {
+            return Err(anyhow::anyhow!(
+                "--drain-timeout must be at least 1 second (got {})",
+                self.drain_timeout
+            ));
+        }
+
+        // Validate log_format
+        match self.log_format.as_str() {
+            "pretty" | "compact" | "json" => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "--log-format must be one of: pretty, compact, json (got '{}')",
+                    other
+                ));
+            }
+        }
+
+        // Validate log_level
+        match self.log_level.as_str() {
+            "trace" | "debug" | "info" | "warn" | "error" | "off" => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "--log-level must be one of: trace, debug, info, warn, error, off (got '{}')",
+                    other
+                ));
+            }
+        }
+
+        // Validate spec formats early to give clear error messages
+        for spec in &self.export {
+            crate::export::parse_export_spec(spec)?;
+        }
+        for spec in &self.import {
+            crate::import::parse_import_spec(spec)?;
+        }
+        for spec in &self.http_export {
+            crate::export::parse_http_export_spec(spec)?;
+        }
+        for spec in &self.http_import {
+            crate::import::parse_import_spec(spec)?;
+        }
+        for spec in &self.ws_export {
+            crate::export::parse_ws_export_spec(spec)?;
+        }
+        for spec in &self.ws_import {
+            crate::import::parse_import_spec(spec)?;
+        }
+        for spec in &self.auto_import {
+            crate::import::parse_import_spec(spec)?;
+        }
+        for spec in &self.http_multiroute_import {
+            crate::import::parse_import_spec(spec)?;
         }
 
         Ok(())

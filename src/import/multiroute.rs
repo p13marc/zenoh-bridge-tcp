@@ -290,9 +290,13 @@ async fn handle_multiroute_connection(
             }
             Err(_) => {
                 warn!(request_id = %request_id, "Response timeout");
-                let _ = stream
-                    .write_all(&crate::http_parser::http_504_response())
-                    .await;
+                // Only send error response if no data has been written yet;
+                // writing a second HTTP response mid-stream would corrupt the connection.
+                if bytes_written == 0 {
+                    let _ = stream
+                        .write_all(&crate::http_parser::http_504_response())
+                        .await;
+                }
                 break;
             }
         }

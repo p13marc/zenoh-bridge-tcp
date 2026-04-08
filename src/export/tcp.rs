@@ -47,6 +47,16 @@ pub(super) async fn handle_client_connect(
         Ok(backend_stream) => {
             info!(client_id = %client_id, backend = %backend_addr, "Backend connection established");
 
+            // Cancel any existing connection for this client ID BEFORE spawning new task
+            {
+                let mut senders = cancellation_senders.lock().await;
+                if let Some((old_cancel_tx, old_handle)) = senders.remove(client_id) {
+                    warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
+                    let _ = old_cancel_tx.send(()).await;
+                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
+                }
+            }
+
             let (backend_reader, backend_writer) = backend_stream.into_split();
             let reader = crate::transport::TcpReader::new(backend_reader, config.buffer_size);
             let writer = crate::transport::TcpWriter::new(backend_writer);
@@ -91,16 +101,11 @@ pub(super) async fn handle_client_connect(
                 .instrument(span),
             );
 
-            // Cancel any existing connection for this client ID before storing the new one
-            {
-                let mut senders = cancellation_senders.lock().await;
-                if let Some((old_cancel_tx, old_handle)) = senders.remove(&client_id_for_map) {
-                    warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
-                    drop(old_cancel_tx);
-                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
-                }
-                senders.insert(client_id_for_map, (cancel_tx, main_handle));
-            }
+            // Store the new task handle
+            cancellation_senders
+                .lock()
+                .await
+                .insert(client_id_for_map, (cancel_tx, main_handle));
         }
         Err(e) => {
             error!(

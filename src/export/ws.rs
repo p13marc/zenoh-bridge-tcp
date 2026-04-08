@@ -51,6 +51,16 @@ pub(super) async fn handle_ws_client_connect(
         Ok((ws_stream, _response)) => {
             info!(client_id = %client_id, ws_url = %ws_url, "WebSocket backend connection established");
 
+            // Cancel any existing connection for this client ID BEFORE spawning new task
+            {
+                let mut senders = cancellation_senders.lock().await;
+                if let Some((old_cancel_tx, old_handle)) = senders.remove(client_id) {
+                    warn!(client_id = %client_id, "WS client already has active connection, cancelling old one");
+                    let _ = old_cancel_tx.send(()).await;
+                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
+                }
+            }
+
             let (ws_sender, ws_receiver) = ws_stream.split();
             let reader = crate::transport::WsReader::new(ws_receiver);
             let writer = crate::transport::WsWriter::new(ws_sender);
@@ -92,16 +102,11 @@ pub(super) async fn handle_ws_client_connect(
                 .instrument(span),
             );
 
-            // Cancel any existing connection for this client ID before storing the new one
-            {
-                let mut senders = cancellation_senders.lock().await;
-                if let Some((old_cancel_tx, old_handle)) = senders.remove(&client_id_for_map) {
-                    warn!(client_id = %client_id, "WS client already has active connection, cancelling old one");
-                    drop(old_cancel_tx);
-                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
-                }
-                senders.insert(client_id_for_map, (cancel_tx, main_handle));
-            }
+            // Store the new task handle
+            cancellation_senders
+                .lock()
+                .await
+                .insert(client_id_for_map, (cancel_tx, main_handle));
         }
         Err(e) => {
             error!(

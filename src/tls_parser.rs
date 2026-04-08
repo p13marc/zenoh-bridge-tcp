@@ -80,21 +80,16 @@ where
         // Extract length (bytes 3-4, big-endian)
         let length = u16::from_be_bytes([buffer[3], buffer[4]]) as usize;
 
-        if length > max_handshake_size {
+        // Read the rest of the handshake message (5 bytes header + length bytes)
+        let total_size = 5 + length;
+        if total_size > max_handshake_size {
             return Err(BridgeError::TlsParse(format!(
                 "TLS handshake too large: {} bytes (max: {})",
-                length, max_handshake_size
+                total_size, max_handshake_size
             )));
         }
 
-        // Read the rest of the handshake message (5 bytes header + length bytes)
-        let total_size = 5 + length;
         while buffer.len() < total_size {
-            if buffer.len() >= max_handshake_size {
-                return Err(BridgeError::TlsParse(
-                    "TLS handshake exceeds maximum size".to_string(),
-                ));
-            }
 
             let n = stream.read(&mut temp_buf).await?;
             if n == 0 {
