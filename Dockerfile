@@ -1,5 +1,5 @@
 # Multi-stage build for Zenoh TCP Bridge
-FROM rust:1.75-slim as builder
+FROM rust:1.95-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
