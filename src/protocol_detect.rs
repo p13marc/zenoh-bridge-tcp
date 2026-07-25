@@ -272,6 +272,6 @@ mod tests {
     fn test_detect_single_byte() {
         assert_eq!(detect_protocol(&[0x00]), DetectedProtocol::RawTcp);
         assert_eq!(detect_protocol(&[0xFF]), DetectedProtocol::RawTcp);
-        assert_eq!(detect_protocol(&[b'G']), DetectedProtocol::RawTcp);
+        assert_eq!(detect_protocol(b"G"), DetectedProtocol::RawTcp);
     }
 }

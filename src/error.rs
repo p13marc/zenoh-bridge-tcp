@@ -284,7 +284,7 @@ mod tests {
             BridgeError::Timeout("t".into()),
             BridgeError::NoBackend { dns: "d".into() },
             BridgeError::WebSocket("w".into()),
-            BridgeError::Io(std::io::Error::new(std::io::ErrorKind::Other, "e")),
+            BridgeError::Io(std::io::Error::other("e")),
         ];
         for err in variants {
             let debug = format!("{:?}", err);
