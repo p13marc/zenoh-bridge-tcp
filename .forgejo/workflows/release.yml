@@ -59,7 +59,13 @@ jobs:
           image="$REGISTRY/${GITHUB_REPOSITORY,,}"
           cd src
           buildah login --tls-verify=false -u marcpardo -p "${{ secrets.REGISTRY_TOKEN }}" "$REGISTRY"
-          buildah build \
+          # layer cache lives in the registry (real TLS via the hairpin fix);
+          # pruned by the Forgejo packages cleanup rule on *-cache
+          buildah login -u marcpardo -p "${{ secrets.REGISTRY_TOKEN }}" git.marcpardo.eu
+          buildah build --layers \
+            --cache-from=git.marcpardo.eu/marcpardo/zenoh-bridge-tcp-cache \
+            --cache-to=git.marcpardo.eu/marcpardo/zenoh-bridge-tcp-cache \
+            --cache-ttl=168h \
             --label "org.opencontainers.image.source=https://git.marcpardo.eu/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             -t "$image:${GITHUB_REF_NAME}" -t "$image:latest" -f Dockerfile .
