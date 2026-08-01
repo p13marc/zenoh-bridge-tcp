@@ -43,7 +43,20 @@ pub(super) async fn run_http_multiroute_import_mode(
 
     let mut tasks = JoinSet::new();
 
+    // Cap concurrent connections with backpressure (D3).
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+
     loop {
+        let permit = tokio::select! {
+            p = conn_limit.clone().acquire_owned() => {
+                p.expect("connection semaphore is never closed")
+            }
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "Multi-route HTTP import bridge shutting down");
+                break;
+            }
+        };
+
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -61,6 +74,7 @@ pub(super) async fn run_http_multiroute_import_mode(
                         );
 
                         tasks.spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = handle_multiroute_connection(
                                 session, stream, &service_name, &client_id,
                                 config,
@@ -70,10 +84,14 @@ pub(super) async fn run_http_multiroute_import_mode(
                             info!("Multi-route connection closed");
                         }.instrument(span));
                     }
-                    Err(e) => error!("Failed to accept connection: {:?}", e),
+                    Err(e) => {
+                        drop(permit);
+                        error!("Failed to accept connection: {:?}", e);
+                    }
                 }
             }
             _ = shutdown_token.cancelled() => {
+                drop(permit);
                 info!(service = %service_name, "Multi-route HTTP import bridge shutting down");
                 break;
             }
@@ -134,7 +152,8 @@ async fn handle_multiroute_connection(
 
         // 2. Check backend availability
         let service_key = format!("{}/{}/available", service_name, dns);
-        let backend_available = check_backend_available(&session, &service_key).await;
+        let backend_available =
+            check_backend_available(&session, &service_key, config.availability_timeout).await;
 
         if !backend_available {
             warn!(request_id = %request_id, dns = %dns, "No backend available");
@@ -186,10 +205,9 @@ async fn handle_multiroute_connection(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
-        // Small delay for Zenoh subscriber/publisher to establish
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Send the request through Zenoh
+        // Send the request through Zenoh. The AdvancedPublisher/Subscriber with
+        // cache + history handle late-joiner synchronization, so no fixed delay
+        // is needed here (E7).
         tx_publisher
             .put(&parsed.buffer[..])
             .await
@@ -328,9 +346,13 @@ async fn handle_multiroute_connection(
 }
 
 /// Check if a backend is available via liveliness query.
-pub(super) async fn check_backend_available(session: &Session, service_key: &str) -> bool {
+pub(super) async fn check_backend_available(
+    session: &Session,
+    service_key: &str,
+    availability_timeout: Duration,
+) -> bool {
     match session.liveliness().get(service_key).await {
-        Ok(replies) => tokio::time::timeout(Duration::from_millis(1000), async {
+        Ok(replies) => tokio::time::timeout(availability_timeout, async {
             replies.recv_async().await.is_ok()
         })
         .await

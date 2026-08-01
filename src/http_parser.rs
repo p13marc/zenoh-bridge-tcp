@@ -156,6 +156,7 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
         if normalized.is_empty() {
             return Err(BridgeError::HttpParse("Host header is empty".to_string()));
         }
+        validate_dns_for_key(&normalized)?;
         return Ok(normalized);
     }
 
@@ -169,6 +170,7 @@ fn extract_and_normalize_host(req: &httparse::Request, _buffer: &[u8]) -> Result
                 "Host is empty in absolute URI".to_string(),
             ));
         }
+        validate_dns_for_key(&normalized)?;
         return Ok(normalized);
     }
 
@@ -216,6 +218,36 @@ fn extract_host_from_absolute_uri(path: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Validate a normalized `Host`-derived DNS name before it is interpolated into
+/// a Zenoh key expression.
+///
+/// The `Host` header is attacker-controlled and flows unvalidated into key
+/// expressions such as `{service}/{dns}/tx/{client_id}`. Zenoh key-expression
+/// metacharacters (`*`, `?`, `#`, `$`, `/`) would let a crafted `Host` graft the
+/// key-space or match wildcards (`Host: *` -> `svc/*/available` matches every
+/// backend, bypassing the availability gate). The SNI path already enforces a
+/// strict hostname ruleset; this brings the plain-HTTP path to parity.
+///
+/// Allows ASCII alphanumerics plus `.`, `-`, `:` (port), and `[`/`]` (IPv6),
+/// bounded to the DNS length limit. Everything else is rejected.
+fn validate_dns_for_key(dns: &str) -> Result<()> {
+    if dns.len() > 253 {
+        return Err(BridgeError::HttpParse(format!(
+            "Host too long ({} bytes, max 253)",
+            dns.len()
+        )));
+    }
+    for c in dns.chars() {
+        let ok = c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']');
+        if !ok {
+            return Err(BridgeError::HttpParse(format!(
+                "Host contains an invalid character {c:?} for routing"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Normalize a DNS name for consistent routing
@@ -297,6 +329,37 @@ pub fn http_504_response() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_dns_for_key_accepts_valid() {
+        for host in [
+            "example.com",
+            "my-api.example.com",
+            "api123.example.com",
+            "api.v1.staging.example.com",
+            "example.com:8080",
+            "[::1]:8080",
+        ] {
+            assert!(validate_dns_for_key(host).is_ok(), "should accept {host:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_dns_for_key_rejects_key_metacharacters() {
+        // These are the F1 attack vectors: wildcard match and key-space grafting.
+        for host in ["*", "**", "a/b", "svc/*", "a?b", "a#b", "a$b", "a b", "a@b"] {
+            assert!(
+                validate_dns_for_key(host).is_err(),
+                "should reject {host:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_dns_for_key_rejects_non_ascii_and_overlong() {
+        assert!(validate_dns_for_key("exämple.com").is_err());
+        assert!(validate_dns_for_key(&"a".repeat(254)).is_err());
+    }
 
     #[test]
     fn test_normalize_dns_lowercase() {

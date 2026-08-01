@@ -37,7 +37,20 @@ pub(super) async fn run_auto_import_mode(
 
     let mut tasks = JoinSet::new();
 
+    // Cap concurrent connections with backpressure (D3).
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+
     loop {
+        let permit = tokio::select! {
+            p = conn_limit.clone().acquire_owned() => {
+                p.expect("connection semaphore is never closed")
+            }
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "Auto-detect import bridge shutting down");
+                break;
+            }
+        };
+
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -61,6 +74,7 @@ pub(super) async fn run_auto_import_mode(
                         );
 
                         tasks.spawn(async move {
+                            let _permit = permit;
                             if let Err(e) = handle_auto_import_connection(
                                 session, stream, &service_name, &client_id, config,
                             ).await {
@@ -70,11 +84,13 @@ pub(super) async fn run_auto_import_mode(
                         }.instrument(span));
                     }
                     Err(e) => {
+                        drop(permit);
                         error!("Failed to accept connection: {:?}", e);
                     }
                 }
             }
             _ = shutdown_token.cancelled() => {
+                drop(permit);
                 info!(service = %service_name, "Auto-detect import bridge shutting down");
                 break;
             }
@@ -100,9 +116,19 @@ async fn handle_auto_import_connection(
 ) -> Result<()> {
     use crate::protocol_detect::{DetectedProtocol, detect_protocol};
 
-    // Peek at the first bytes to detect the protocol
+    // Peek at the first bytes to detect the protocol. Bound the wait so an idle
+    // client cannot pin a task+fd forever (F4).
     let mut peek_buf = vec![0u8; 16];
-    let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
+    let peek_len = match tokio::time::timeout(config.read_timeout, stream.peek(&mut peek_buf)).await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to peek connection: {}", e)),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Client sent no data within the read timeout"
+            ));
+        }
+    };
 
     if peek_len == 0 {
         return Err(anyhow::anyhow!("Connection closed before sending any data"));

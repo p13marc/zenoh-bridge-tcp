@@ -38,8 +38,21 @@ pub(super) async fn run_ws_import_mode(
 
     let mut tasks = JoinSet::new();
 
+    // Cap concurrent connections with backpressure (D3).
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+
     // Accept connections
     loop {
+        let permit = tokio::select! {
+            p = conn_limit.clone().acquire_owned() => {
+                p.expect("connection semaphore is never closed")
+            }
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "WebSocket import bridge shutting down, no new connections");
+                break;
+            }
+        };
+
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -62,6 +75,7 @@ pub(super) async fn run_ws_import_mode(
 
                         tasks.spawn(
                             async move {
+                                let _permit = permit;
                                 // Perform WebSocket upgrade
                                 match tokio_tungstenite::accept_async(stream).await {
                                     Ok(ws_stream) => {
@@ -93,11 +107,13 @@ pub(super) async fn run_ws_import_mode(
                         );
                     }
                     Err(e) => {
+                        drop(permit);
                         error!("Failed to accept connection: {:?}", e);
                     }
                 }
             }
             _ = shutdown_token.cancelled() => {
+                drop(permit);
                 info!(service = %service_name, "WebSocket import bridge shutting down, no new connections");
                 break;
             }

@@ -5,6 +5,39 @@ use std::path::Path;
 use std::time::Duration;
 use zenoh::config::Config;
 
+/// Reliability posture for the Zenoh data plane.
+///
+/// The bridge splices a TCP byte stream over Zenoh pub/sub. TCP guarantees
+/// reliable, ordered, gap-free delivery; Zenoh's push default (`Drop`) does
+/// not. `Stream` reconciles the two; `Telemetry` keeps the drop-tolerant
+/// behavior for lossy-but-latency-sensitive use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReliabilityMode {
+    /// Byte-stream fidelity (default): publishers use `CongestionControl::Block`
+    /// so a full TX queue applies backpressure instead of silently dropping, and
+    /// an unrecoverable sample miss resets the connection rather than delivering
+    /// a corrupted stream.
+    #[default]
+    Stream,
+    /// Drop-tolerant: publishers may drop under pressure and misses are not fatal.
+    /// Appropriate only when the payload tolerates loss.
+    Telemetry,
+}
+
+impl std::str::FromStr for ReliabilityMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stream" => Ok(Self::Stream),
+            "telemetry" => Ok(Self::Telemetry),
+            other => Err(format!(
+                "invalid reliability mode '{other}' (expected 'stream' or 'telemetry')"
+            )),
+        }
+    }
+}
+
 /// Configuration for bridge operations.
 ///
 /// This struct holds all configurable parameters for the bridge,
@@ -13,6 +46,14 @@ use zenoh::config::Config;
 pub struct BridgeConfig {
     /// Buffer size for TCP read/write operations (default: 65536 bytes).
     pub buffer_size: usize,
+
+    /// Data-plane reliability posture (default: `Stream`).
+    pub reliability: ReliabilityMode,
+
+    /// Maximum number of concurrent client connections per listener (default: 1024).
+    /// The accept loop applies backpressure at this limit instead of spawning
+    /// connections without bound.
+    pub max_connections: usize,
 
     /// Maximum size for HTTP headers (default: 16384 bytes).
     pub max_header_size: usize,
@@ -38,6 +79,8 @@ impl Default for BridgeConfig {
     fn default() -> Self {
         Self {
             buffer_size: 65536,
+            reliability: ReliabilityMode::Stream,
+            max_connections: 1024,
             max_header_size: 16 * 1024,
             read_timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_millis(500),
@@ -58,6 +101,27 @@ impl BridgeConfig {
             ..Default::default()
         }
     }
+}
+
+/// Validate a service name from a CLI spec before it becomes a Zenoh key segment.
+///
+/// Service names are interpolated into key expressions such as
+/// `{service}/clients/*`. Zenoh's `KeyExpr` parser accepts wildcards (`*`, `$*`),
+/// so `--export '*/127.0.0.1:80'` would subscribe to *every* service's clients.
+/// Require a non-empty literal segment: ASCII alphanumerics plus `-`, `_`, `.`.
+pub fn validate_service_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow::anyhow!("service name must not be empty"));
+    }
+    for c in name.chars() {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            return Err(anyhow::anyhow!(
+                "service name '{name}' contains an invalid character {c:?} \
+                 (allowed: alphanumerics, '-', '_', '.')"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Create a Zenoh config from a JSON5 configuration file

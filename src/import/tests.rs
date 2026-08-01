@@ -29,10 +29,9 @@ fn test_parse_import_spec_too_many_parts() {
 
 #[test]
 fn test_parse_import_spec_empty_service_name() {
-    let result = parse_import_spec("/127.0.0.1:8080");
-    assert!(result.is_ok());
-    let (service, _) = result.unwrap();
-    assert_eq!(service, "");
+    // Empty and wildcard service names are now rejected (F2).
+    assert!(parse_import_spec("/127.0.0.1:8080").is_err());
+    assert!(parse_import_spec("*/127.0.0.1:8080").is_err());
 }
 
 #[test]

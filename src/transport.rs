@@ -99,6 +99,12 @@ impl<W: AsyncWriteExt + Unpin + Send + 'static> TransportWriter for TcpWriter<W>
         self.inner.flush().await
     }
 
+    async fn send_eof(&mut self) -> io::Result<()> {
+        // Half-close (G4): shut down the write half so the peer sees FIN while our
+        // read half stays open. For a split TCP stream this is a directional FIN.
+        self.inner.shutdown().await
+    }
+
     async fn shutdown(&mut self) -> io::Result<()> {
         self.inner.shutdown().await
     }
@@ -134,7 +140,12 @@ where
                     return Err(io::Error::other(format!("WebSocket read error: {}", e)));
                 }
                 Some(Ok(msg)) => match msg {
+                    // G2: a zero-length data frame is not EOF; skip it so it isn't
+                    // read as a connection close. Empty payload == EOF is reserved
+                    // for the Zenoh framing layer, and Close is the real WS EOF.
+                    Message::Binary(data) if data.is_empty() => continue,
                     Message::Binary(data) => return Ok(data.to_vec()),
+                    Message::Text(text) if text.is_empty() => continue,
                     Message::Text(text) => return Ok(text.as_bytes().to_vec()),
                     Message::Close(_) => return Ok(Vec::new()),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,

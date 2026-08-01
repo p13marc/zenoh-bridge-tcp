@@ -111,6 +111,31 @@ pub struct Args {
     #[arg(long, default_value = "5")]
     pub drain_timeout: u64,
 
+    /// Data-plane reliability posture: `stream` (default) blocks on backpressure
+    /// and resets the connection on unrecoverable loss; `telemetry` tolerates drops.
+    #[arg(long, default_value = "stream")]
+    pub reliability: String,
+
+    /// Maximum number of concurrent client connections per listener
+    #[arg(long, default_value = "1024")]
+    pub max_connections: usize,
+
+    /// Maximum size for HTTP/TLS headers in bytes
+    #[arg(long, default_value = "16384")]
+    pub max_header_size: usize,
+
+    /// Heartbeat interval in milliseconds for Zenoh publisher/subscriber recovery
+    #[arg(long, default_value = "500")]
+    pub heartbeat_interval_ms: u64,
+
+    /// Timeout in milliseconds for checking backend availability
+    #[arg(long, default_value = "1000")]
+    pub availability_timeout_ms: u64,
+
+    /// Maximum response size for multiroute HTTP mode in bytes (exceeding -> HTTP 502)
+    #[arg(long, default_value = "10485760")]
+    pub max_response_size: usize,
+
     /// Log level: trace, debug, info, warn, error
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -145,6 +170,12 @@ impl Default for Args {
             buffer_size: 65536,
             read_timeout: 10,
             drain_timeout: 5,
+            reliability: "stream".to_string(),
+            max_connections: 1024,
+            max_header_size: 16384,
+            heartbeat_interval_ms: 500,
+            availability_timeout_ms: 1000,
+            max_response_size: 10 * 1024 * 1024,
             log_level: "info".to_string(),
             log_format: "pretty".to_string(),
         }
@@ -192,6 +223,39 @@ impl Args {
             return Err(anyhow::anyhow!(
                 "--drain-timeout must be at least 1 second (got {})",
                 self.drain_timeout
+            ));
+        }
+
+        // Validate reliability posture
+        self.reliability
+            .parse::<crate::config::ReliabilityMode>()
+            .map_err(|e| anyhow::anyhow!("--reliability: {}", e))?;
+
+        // Validate tunables
+        if self.max_connections < 1 {
+            return Err(anyhow::anyhow!("--max-connections must be at least 1"));
+        }
+        if self.max_header_size < 1024 {
+            return Err(anyhow::anyhow!(
+                "--max-header-size must be at least 1024 (got {})",
+                self.max_header_size
+            ));
+        }
+        if self.heartbeat_interval_ms < 1 {
+            return Err(anyhow::anyhow!(
+                "--heartbeat-interval-ms must be at least 1"
+            ));
+        }
+        if self.availability_timeout_ms < 1 {
+            return Err(anyhow::anyhow!(
+                "--availability-timeout-ms must be at least 1"
+            ));
+        }
+        if self.max_response_size < self.max_header_size {
+            return Err(anyhow::anyhow!(
+                "--max-response-size ({}) must be >= --max-header-size ({})",
+                self.max_response_size,
+                self.max_header_size
             ));
         }
 
@@ -248,7 +312,16 @@ impl Args {
 
     /// Build a BridgeConfig from command-line arguments
     pub fn bridge_config(&self) -> BridgeConfig {
-        BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout)
+        let mut config = BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout);
+        // Already validated in `validate()`; fall back to the default posture.
+        config.reliability = self.reliability.parse().unwrap_or_default();
+        config.max_connections = self.max_connections;
+        config.max_header_size = self.max_header_size;
+        config.heartbeat_interval = std::time::Duration::from_millis(self.heartbeat_interval_ms);
+        config.availability_timeout =
+            std::time::Duration::from_millis(self.availability_timeout_ms);
+        config.max_response_size = self.max_response_size;
+        config
     }
 }
 

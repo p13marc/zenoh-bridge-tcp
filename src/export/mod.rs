@@ -52,6 +52,7 @@ pub fn parse_export_spec(export_spec: &str) -> Result<(String, SocketAddr)> {
     }
 
     let service_name = parts[0].to_string();
+    crate::config::validate_service_name(&service_name)?;
     let backend_addr: SocketAddr = parts[1]
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid backend address: {}", e))?;
@@ -69,6 +70,7 @@ pub fn parse_http_export_spec(export_spec: &str) -> Result<(String, String, Sock
     }
 
     let service_name = parts[0].to_string();
+    crate::config::validate_service_name(&service_name)?;
     let dns = normalize_dns(parts[1]);
     let backend_addr: SocketAddr = parts[2]
         .parse()
@@ -89,6 +91,7 @@ pub fn parse_ws_export_spec(export_spec: &str) -> Result<(String, String)> {
         ))?;
 
     let service_name = export_spec[..slash_pos].to_string();
+    crate::config::validate_service_name(&service_name)?;
     let ws_url = export_spec[slash_pos + 1..].to_string();
 
     // Validate that the URL starts with ws:// or wss://
