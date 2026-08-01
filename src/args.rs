@@ -242,7 +242,9 @@ impl Args {
             ));
         }
         if self.heartbeat_interval_ms < 1 {
-            return Err(anyhow::anyhow!("--heartbeat-interval-ms must be at least 1"));
+            return Err(anyhow::anyhow!(
+                "--heartbeat-interval-ms must be at least 1"
+            ));
         }
         if self.availability_timeout_ms < 1 {
             return Err(anyhow::anyhow!(
@@ -316,7 +318,8 @@ impl Args {
         config.max_connections = self.max_connections;
         config.max_header_size = self.max_header_size;
         config.heartbeat_interval = std::time::Duration::from_millis(self.heartbeat_interval_ms);
-        config.availability_timeout = std::time::Duration::from_millis(self.availability_timeout_ms);
+        config.availability_timeout =
+            std::time::Duration::from_millis(self.availability_timeout_ms);
         config.max_response_size = self.max_response_size;
         config
     }

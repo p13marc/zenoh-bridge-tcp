@@ -29,17 +29,16 @@ pub(super) async fn handle_import_connection(
         // Peek at the first few bytes to detect HTTP vs HTTPS/TLS.
         // Bound the wait so an idle client cannot pin a task+fd forever (F4).
         let mut peek_buffer = vec![0u8; 16];
-        let peek_len = match tokio::time::timeout(config.read_timeout, stream.peek(&mut peek_buffer))
-            .await
-        {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to peek connection: {}", e)),
-            Err(_) => {
-                return Err(anyhow::anyhow!(
-                    "Client sent no data within the read timeout"
-                ));
-            }
-        };
+        let peek_len =
+            match tokio::time::timeout(config.read_timeout, stream.peek(&mut peek_buffer)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to peek connection: {}", e)),
+                Err(_) => {
+                    return Err(anyhow::anyhow!(
+                        "Client sent no data within the read timeout"
+                    ));
+                }
+            };
 
         if peek_len > 0 && is_tls_handshake(&peek_buffer[..peek_len]) {
             // This is a TLS/HTTPS connection - parse SNI

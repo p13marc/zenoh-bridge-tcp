@@ -340,10 +340,7 @@ mod tests {
             "example.com:8080",
             "[::1]:8080",
         ] {
-            assert!(
-                validate_dns_for_key(host).is_ok(),
-                "should accept {host:?}"
-            );
+            assert!(validate_dns_for_key(host).is_ok(), "should accept {host:?}");
         }
     }
 

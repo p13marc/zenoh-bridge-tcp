@@ -137,7 +137,10 @@ fn test_parse_export_spec_with_wildcards() {
     // F2: wildcard service names are now rejected at parse time — otherwise
     // `my*service` (or a bare `*`) would subscribe across other services' keys.
     let result = parse_export_spec("my*service/127.0.0.1:8080");
-    assert!(result.is_err(), "wildcards in service names must be rejected");
+    assert!(
+        result.is_err(),
+        "wildcards in service names must be rejected"
+    );
 }
 
 #[test]

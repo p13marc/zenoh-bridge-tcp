@@ -77,9 +77,7 @@ where
     // Stream reliability: block on a full TX queue instead of Zenoh's default
     // `Drop`, which would silently drop payload bytes and corrupt the stream.
     let publisher = match config.reliability {
-        ReliabilityMode::Stream => {
-            publisher_builder.congestion_control(CongestionControl::Block)
-        }
+        ReliabilityMode::Stream => publisher_builder.congestion_control(CongestionControl::Block),
         ReliabilityMode::Telemetry => publisher_builder,
     }
     .await
