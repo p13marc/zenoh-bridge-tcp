@@ -116,6 +116,10 @@ pub struct Args {
     #[arg(long, default_value = "stream")]
     pub reliability: String,
 
+    /// Maximum number of concurrent client connections per listener
+    #[arg(long, default_value = "1024")]
+    pub max_connections: usize,
+
     /// Maximum size for HTTP/TLS headers in bytes
     #[arg(long, default_value = "16384")]
     pub max_header_size: usize,
@@ -167,6 +171,7 @@ impl Default for Args {
             read_timeout: 10,
             drain_timeout: 5,
             reliability: "stream".to_string(),
+            max_connections: 1024,
             max_header_size: 16384,
             heartbeat_interval_ms: 500,
             availability_timeout_ms: 1000,
@@ -227,6 +232,9 @@ impl Args {
             .map_err(|e| anyhow::anyhow!("--reliability: {}", e))?;
 
         // Validate tunables
+        if self.max_connections < 1 {
+            return Err(anyhow::anyhow!("--max-connections must be at least 1"));
+        }
         if self.max_header_size < 1024 {
             return Err(anyhow::anyhow!(
                 "--max-header-size must be at least 1024 (got {})",
@@ -305,6 +313,7 @@ impl Args {
         let mut config = BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout);
         // Already validated in `validate()`; fall back to the default posture.
         config.reliability = self.reliability.parse().unwrap_or_default();
+        config.max_connections = self.max_connections;
         config.max_header_size = self.max_header_size;
         config.heartbeat_interval = std::time::Duration::from_millis(self.heartbeat_interval_ms);
         config.availability_timeout = std::time::Duration::from_millis(self.availability_timeout_ms);

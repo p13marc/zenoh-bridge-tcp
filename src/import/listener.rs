@@ -34,8 +34,22 @@ pub(super) async fn run_import_mode_internal(
 
     let mut tasks = JoinSet::new();
 
+    // Cap concurrent connections: hold a permit before accepting so the loop
+    // applies backpressure at the limit instead of spawning without bound (D3).
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+
     // Accept connections
     loop {
+        let permit = tokio::select! {
+            p = conn_limit.clone().acquire_owned() => {
+                p.expect("connection semaphore is never closed")
+            }
+            _ = shutdown_token.cancelled() => {
+                info!(service = %service_name, "Import bridge shutting down, no new connections");
+                break;
+            }
+        };
+
         tokio::select! {
             result = listener.accept() => {
                 match result {
@@ -62,6 +76,9 @@ pub(super) async fn run_import_mode_internal(
 
                         tasks.spawn(
                             async move {
+                                // Hold the permit for the connection's lifetime;
+                                // dropping it on completion frees a slot.
+                                let _permit = permit;
                                 if let Err(e) = super::connection::handle_import_connection(
                                     session,
                                     stream,
@@ -80,11 +97,14 @@ pub(super) async fn run_import_mode_internal(
                         );
                     }
                     Err(e) => {
+                        // Accept failed; release the permit we were holding.
+                        drop(permit);
                         error!("Failed to accept connection: {:?}", e);
                     }
                 }
             }
             _ = shutdown_token.cancelled() => {
+                drop(permit);
                 info!(service = %service_name, "Import bridge shutting down, no new connections");
                 break;
             }

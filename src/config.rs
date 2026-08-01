@@ -50,6 +50,11 @@ pub struct BridgeConfig {
     /// Data-plane reliability posture (default: `Stream`).
     pub reliability: ReliabilityMode,
 
+    /// Maximum number of concurrent client connections per listener (default: 1024).
+    /// The accept loop applies backpressure at this limit instead of spawning
+    /// connections without bound.
+    pub max_connections: usize,
+
     /// Maximum size for HTTP headers (default: 16384 bytes).
     pub max_header_size: usize,
 
@@ -75,6 +80,7 @@ impl Default for BridgeConfig {
         Self {
             buffer_size: 65536,
             reliability: ReliabilityMode::Stream,
+            max_connections: 1024,
             max_header_size: 16 * 1024,
             read_timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_millis(500),
