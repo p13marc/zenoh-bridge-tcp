@@ -55,6 +55,11 @@ pub struct BridgeConfig {
     /// connections without bound.
     pub max_connections: usize,
 
+    /// AdvancedPublisher cache depth in samples (default: 256). This bounds how
+    /// many samples a late-joining peer subscriber can recover; too small a cache
+    /// loses the earliest samples of a large burst sent before the peer is ready.
+    pub cache_size: usize,
+
     /// Maximum size for HTTP headers (default: 16384 bytes).
     pub max_header_size: usize,
 
@@ -81,6 +86,7 @@ impl Default for BridgeConfig {
             buffer_size: 65536,
             reliability: ReliabilityMode::Stream,
             max_connections: 1024,
+            cache_size: 256,
             max_header_size: 16 * 1024,
             read_timeout: Duration::from_secs(10),
             heartbeat_interval: Duration::from_millis(500),

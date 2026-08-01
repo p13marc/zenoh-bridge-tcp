@@ -197,7 +197,7 @@ async fn handle_multiroute_connection(
             .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
         let tx_publisher = session
             .declare_publisher(tx_key_expr)
-            .cache(CacheConfig::default().max_samples(64))
+            .cache(CacheConfig::default().max_samples(config.cache_size))
             .publisher_detection()
             .sample_miss_detection(
                 MissDetectionConfig::default().heartbeat(config.heartbeat_interval),
