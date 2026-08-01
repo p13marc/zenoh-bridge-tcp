@@ -120,6 +120,10 @@ pub struct Args {
     #[arg(long, default_value = "1024")]
     pub max_connections: usize,
 
+    /// AdvancedPublisher cache depth in samples (late-joiner recovery window)
+    #[arg(long, default_value = "256")]
+    pub cache_size: usize,
+
     /// Maximum size for HTTP/TLS headers in bytes
     #[arg(long, default_value = "16384")]
     pub max_header_size: usize,
@@ -172,6 +176,7 @@ impl Default for Args {
             drain_timeout: 5,
             reliability: "stream".to_string(),
             max_connections: 1024,
+            cache_size: 256,
             max_header_size: 16384,
             heartbeat_interval_ms: 500,
             availability_timeout_ms: 1000,
@@ -234,6 +239,9 @@ impl Args {
         // Validate tunables
         if self.max_connections < 1 {
             return Err(anyhow::anyhow!("--max-connections must be at least 1"));
+        }
+        if self.cache_size < 1 {
+            return Err(anyhow::anyhow!("--cache-size must be at least 1"));
         }
         if self.max_header_size < 1024 {
             return Err(anyhow::anyhow!(
@@ -316,6 +324,7 @@ impl Args {
         // Already validated in `validate()`; fall back to the default posture.
         config.reliability = self.reliability.parse().unwrap_or_default();
         config.max_connections = self.max_connections;
+        config.cache_size = self.cache_size;
         config.max_header_size = self.max_header_size;
         config.heartbeat_interval = std::time::Duration::from_millis(self.heartbeat_interval_ms);
         config.availability_timeout =

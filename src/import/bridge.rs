@@ -71,7 +71,7 @@ where
         .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
     let publisher_builder = session
         .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(64))
+        .cache(CacheConfig::default().max_samples(config.cache_size))
         .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
         .publisher_detection();
     // Stream reliability: block on a full TX queue instead of Zenoh's default
