@@ -322,22 +322,37 @@ async fn main() -> Result<()> {
         "All bridge tasks started"
     );
 
-    // Wait for shutdown signal
-    shutdown_token.cancelled().await;
-
     let drain_timeout = tokio::time::Duration::from_secs(args.drain_timeout);
-    info!(
-        "Waiting for tasks to drain (max {} seconds)...",
-        args.drain_timeout
-    );
 
-    // Wait for all tasks to finish with timeout
-    let _ = tokio::time::timeout(drain_timeout, async {
+    // Wait for a shutdown signal — or detect that every bridge task exited on its
+    // own first. Bridges run until cancelled, so if they all finish while no
+    // shutdown was requested, no listeners remain (e.g. every bind failed with
+    // EADDRINUSE); fail fast rather than linger as a live process doing nothing.
+    let drain_all = async move {
         for task in tasks {
             let _ = task.await;
         }
-    })
-    .await;
+    };
+    tokio::pin!(drain_all);
+
+    tokio::select! {
+        _ = shutdown_token.cancelled() => {
+            info!(
+                "Waiting for tasks to drain (max {} seconds)...",
+                args.drain_timeout
+            );
+            let _ = tokio::time::timeout(drain_timeout, &mut drain_all).await;
+        }
+        _ = &mut drain_all => {
+            tracing::error!(
+                "All bridge tasks exited before a shutdown signal; no listeners remain — exiting"
+            );
+            if let Err(e) = session.close().await {
+                warn!("Error closing Zenoh session: {}", e);
+            }
+            std::process::exit(1);
+        }
+    }
 
     // Close Zenoh session explicitly
     if let Err(e) = session.close().await {
