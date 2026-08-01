@@ -335,6 +335,12 @@ where
                         }
                         Err(e) => {
                             error!("Backend read error for client {}: {:?}", client_id_for_reader, e);
+                            // C1: signal end-of-stream on the error path too, so the
+                            // import side learns the peer is gone instead of hanging
+                            // forever waiting for samples that will never come.
+                            if let Err(e) = publisher.put(Vec::<u8>::new()).await {
+                                error!("Failed to send EOF after read error for client {}: {:?}", client_id_for_reader, e);
+                            }
                             break;
                         }
                     }
