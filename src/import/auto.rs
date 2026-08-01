@@ -100,9 +100,19 @@ async fn handle_auto_import_connection(
 ) -> Result<()> {
     use crate::protocol_detect::{DetectedProtocol, detect_protocol};
 
-    // Peek at the first bytes to detect the protocol
+    // Peek at the first bytes to detect the protocol. Bound the wait so an idle
+    // client cannot pin a task+fd forever (F4).
     let mut peek_buf = vec![0u8; 16];
-    let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
+    let peek_len = match tokio::time::timeout(config.read_timeout, stream.peek(&mut peek_buf)).await
+    {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to peek connection: {}", e)),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Client sent no data within the read timeout"
+            ));
+        }
+    };
 
     if peek_len == 0 {
         return Err(anyhow::anyhow!("Connection closed before sending any data"));
