@@ -81,11 +81,33 @@ async fn large_transfer_is_byte_exact() {
     let service = unique_service_name("regnet_large");
     let mut pair = BridgePair::tcp(&service, backend).await;
 
+    // Warm up so the path is wired before the bulk transfer.
+    let _ = round_trip_with_retry(pair.import_addr, b"warmup", Duration::from_secs(20)).await;
+
     // 1 MiB — well past the default 64 KiB buffer, so it exercises chunking.
-    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
-    let got = round_trip_with_retry(pair.import_addr, &payload, Duration::from_secs(30)).await;
+    // Read and write concurrently: a bulk echo that writes everything before
+    // reading would self-deadlock once socket + queue buffers fill.
+    let payload: std::sync::Arc<Vec<u8>> =
+        std::sync::Arc::new((0..1024 * 1024).map(|i| (i % 251) as u8).collect());
+
+    let stream = TcpStream::connect(pair.import_addr).await.unwrap();
+    let (mut rd, mut wr) = stream.into_split();
+
+    let w_payload = payload.clone();
+    let writer = tokio::spawn(async move {
+        wr.write_all(&w_payload).await.unwrap();
+        wr.shutdown().await.unwrap();
+    });
+
+    let mut got = vec![0u8; payload.len()];
+    tokio::time::timeout(Duration::from_secs(30), rd.read_exact(&mut got))
+        .await
+        .expect("large transfer timed out")
+        .expect("read_exact");
+    writer.await.unwrap();
+
     assert_eq!(got.len(), payload.len(), "length must match");
-    assert_eq!(got, payload, "large transfer must be byte-exact");
+    assert_eq!(&got, payload.as_ref(), "large transfer must be byte-exact");
 
     pair.kill_and_wait().await;
 }
@@ -156,14 +178,8 @@ async fn backend_close_propagates_to_client_as_eof() {
 }
 
 /// Client half-close: after the client shuts down its write half, the response
-/// direction must still deliver the backend's reply.
-///
-/// This is the desired behavior per issues #13/#14 (B1/B2). It is currently
-/// broken — the response direction is cancelled on client half-close — and the
-/// fix is deferred to the framing-layer work (#20). Kept as an ignored,
-/// documented regression target so it is not forgotten.
+/// direction must still deliver the backend's reply (B1/B2, #13/#14).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "B1/B2: half-close propagation deferred to the framing layer (#20)"]
 async fn client_half_close_still_delivers_response() {
     let (backend, _backend) = start_echo_server().await;
     let service = unique_service_name("regnet_halfclose");

@@ -277,19 +277,18 @@ where
 
     let client_id_for_reader = client_id.clone();
     let client_id_for_writer = client_id.clone();
-    let client_id_for_final = client_id.clone();
 
-    // Cancellation tokens for graceful shutdown of each direction
-    let cancel_backend_to_zenoh = CancellationToken::new();
-    let cancel_zenoh_to_backend = CancellationToken::new();
+    // Single abort token for the whole connection. A clean directional EOF ends
+    // only its own direction (a half-close); a hard error, external teardown, or
+    // an unrecoverable sample miss trips this token to reset both directions.
+    let conn_cancel = CancellationToken::new();
 
     // Stream reliability: an unrecoverable sample miss means the byte stream has a
     // gap that cannot be delivered faithfully. Reset the connection rather than
     // hand corrupted bytes to the backend. The listener runs in the background for
     // the subscriber's lifetime.
     if config.reliability == ReliabilityMode::Stream {
-        let miss_b2z = cancel_backend_to_zenoh.clone();
-        let miss_z2b = cancel_zenoh_to_backend.clone();
+        let miss_cancel = conn_cancel.clone();
         let miss_client = client_id.clone();
         subscriber
             .sample_miss_listener()
@@ -299,164 +298,123 @@ where
                     miss_client,
                     miss.nb()
                 );
-                miss_b2z.cancel();
-                miss_z2b.cancel();
+                miss_cancel.cancel();
             })
             .background()
             .await
             .map_err(|e| anyhow::anyhow!("Failed to register sample-miss listener: {:?}", e))?;
     }
 
-    // Task: read from backend and publish to Zenoh using AdvancedPublisher
+    // Direction: backend -> Zenoh. A clean EOF publishes the empty EOF marker so
+    // the import half-closes the client and ends this direction only. A read or
+    // publish error resets the whole connection.
     let buffer_size = config.buffer_size;
-    let drain_timeout = config.drain_timeout;
-    let b2z_token = cancel_backend_to_zenoh.clone();
-    let signal_peer_z2b = cancel_zenoh_to_backend.clone();
-    let mut backend_to_zenoh_handle = tokio::spawn(async move {
+    let b2z_cancel = conn_cancel.clone();
+    let backend_to_zenoh_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = backend_reader.read_data(buffer_size) => {
                     match result {
                         Ok(data) if data.is_empty() => {
-                            info!("Backend closed connection for client: {}", client_id_for_reader);
-                            if let Err(e) = publisher.put(Vec::<u8>::new()).await {
-                                error!("Failed to send EOF signal for client {}: {:?}", client_id_for_reader, e);
-                            }
+                            debug!("Backend half-close -> EOF for client {}", client_id_for_reader);
+                            let _ = publisher.put(Vec::<u8>::new()).await;
                             break;
                         }
                         Ok(data) => {
-                            debug!("← {} bytes from backend for client {}", data.len(), client_id_for_reader);
                             if let Err(e) = publisher.put(&data[..]).await {
                                 error!("Failed to publish for client {}: {:?}", client_id_for_reader, e);
+                                b2z_cancel.cancel();
                                 break;
                             }
                         }
                         Err(e) => {
                             error!("Backend read error for client {}: {:?}", client_id_for_reader, e);
-                            // C1: signal end-of-stream on the error path too, so the
-                            // import side learns the peer is gone instead of hanging
-                            // forever waiting for samples that will never come.
-                            if let Err(e) = publisher.put(Vec::<u8>::new()).await {
-                                error!("Failed to send EOF after read error for client {}: {:?}", client_id_for_reader, e);
-                            }
+                            // C1: emit EOF so the import side doesn't hang, then reset.
+                            let _ = publisher.put(Vec::<u8>::new()).await;
+                            b2z_cancel.cancel();
                             break;
                         }
                     }
                 }
-                _ = b2z_token.cancelled() => {
-                    debug!("Backend-to-Zenoh cancelled for client: {}", client_id_for_reader);
-                    break;
-                }
+                _ = b2z_cancel.cancelled() => break,
             }
         }
-        // Signal the writer direction to stop
-        signal_peer_z2b.cancel();
-        if let Err(e) = publisher.undeclare().await {
-            debug!(
-                "Error undeclaring publisher for {}: {:?}",
-                client_id_for_reader, e
-            );
-        }
+        // Return the publisher so it (and its cache) stays alive until the whole
+        // connection ends, letting a late-joining import subscriber recover.
+        publisher
     });
 
-    // Task: receive from Zenoh and write to backend
-    let z2b_token = cancel_zenoh_to_backend.clone();
-    let signal_peer_b2z = cancel_backend_to_zenoh.clone();
-    let mut zenoh_to_backend_handle = tokio::spawn(async move {
+    // Direction: Zenoh -> backend. An empty payload is the client's half-close;
+    // propagate it as a FIN on the backend's write side and end this direction only.
+    let z2b_cancel = conn_cancel.clone();
+    let zenoh_to_backend_handle = tokio::spawn(async move {
         loop {
             tokio::select! {
                 result = subscriber.recv_async() => {
                     match result {
                         Ok(sample) => {
-                            let payload = sample.payload().to_bytes();
-                            debug!("→ {} bytes to backend for client {}", payload.len(), client_id_for_writer);
+                            let payload = sample.payload().to_bytes().to_vec();
+                            if payload.is_empty() {
+                                debug!("Client {}: client half-close -> FIN to backend", client_id_for_writer);
+                                let _ = backend_writer.send_eof().await;
+                                break;
+                            }
                             if let Err(e) = backend_writer.write_data(&payload).await {
                                 error!("Failed to write to backend for client {}: {:?}", client_id_for_writer, e);
+                                z2b_cancel.cancel();
                                 break;
                             }
                         }
                         Err(e) => {
                             error!("Subscriber error for client {}: {:?}", client_id_for_writer, e);
+                            z2b_cancel.cancel();
                             break;
                         }
                     }
                 }
-                _ = z2b_token.cancelled() => {
-                    debug!("Zenoh-to-backend cancelled for client: {}", client_id_for_writer);
+                _ = z2b_cancel.cancelled() => {
+                    let _ = backend_writer.shutdown().await;
                     break;
                 }
             }
         }
-        // Signal the reader direction to stop
-        signal_peer_b2z.cancel();
-        if let Err(e) = subscriber.undeclare().await {
-            debug!(
-                "Error undeclaring subscriber for {}: {:?}",
-                client_id_for_writer, e
-            );
-        }
+        // Return the subscriber; the coordinator undeclares it after both ends.
+        subscriber
     });
 
-    // Wait for either task to complete or cancellation signal.
-    // Use a single deadline so both drain waits share the same budget.
-    let deadline = tokio::time::Instant::now() + drain_timeout;
+    // External teardown (liveliness delete / duplicate connect) resets the connection.
+    let ext_cancel = conn_cancel.clone();
+    let ext_task = tokio::spawn(async move {
+        let _ = cancel_rx.recv().await;
+        ext_cancel.cancel();
+    });
 
-    tokio::select! {
-        _result = &mut backend_to_zenoh_handle => {
-            info!("Backend closed for client: {}", client_id_for_final);
-            cancel_zenoh_to_backend.cancel();
-            match tokio::time::timeout_at(deadline, &mut zenoh_to_backend_handle).await {
-                Ok(_) => {}
-                Err(_) => {
-                    debug!("Zenoh-to-backend drain timeout for client: {}", client_id_for_final);
-                    zenoh_to_backend_handle.abort();
-                    let _ = zenoh_to_backend_handle.await;
-                }
-            }
-        },
-        _result = &mut zenoh_to_backend_handle => {
-            info!("Zenoh closed for client: {}", client_id_for_final);
-            cancel_backend_to_zenoh.cancel();
-            match tokio::time::timeout_at(deadline, &mut backend_to_zenoh_handle).await {
-                Ok(_) => {}
-                Err(_) => {
-                    debug!("Backend-to-Zenoh drain timeout for client: {}", client_id_for_final);
-                    backend_to_zenoh_handle.abort();
-                    let _ = backend_to_zenoh_handle.await;
-                }
-            }
-        },
-        _ = cancel_rx.recv() => {
-            info!("Cancellation received for client: {}", client_id_for_final);
-            cancel_zenoh_to_backend.cancel();
-            cancel_backend_to_zenoh.cancel();
-            match tokio::time::timeout_at(deadline, &mut backend_to_zenoh_handle).await {
-                Ok(_) => {
-                    debug!("Backend-to-Zenoh drained for client: {}", client_id_for_final);
-                }
-                Err(_) => {
-                    debug!("Backend-to-Zenoh drain timeout for client: {}", client_id_for_final);
-                    backend_to_zenoh_handle.abort();
-                    let _ = backend_to_zenoh_handle.await;
-                }
-            }
-            match tokio::time::timeout_at(deadline, &mut zenoh_to_backend_handle).await {
-                Ok(_) => {
-                    debug!("Zenoh-to-backend drained for client: {}", client_id_for_final);
-                }
-                Err(_) => {
-                    debug!("Zenoh-to-backend drain timeout for client: {}", client_id_for_final);
-                    zenoh_to_backend_handle.abort();
-                    let _ = zenoh_to_backend_handle.await;
-                }
-            }
-        },
+    // Wait for BOTH directions. Each ends on its own EOF (half-close) or when the
+    // connection is reset. A healthy half-open connection has no artificial timeout;
+    // once reset, a watchdog gives the tasks the drain budget and then aborts them.
+    let drain_timeout = config.drain_timeout;
+    let watchdog_cancel = conn_cancel.clone();
+    let b2z_abort = backend_to_zenoh_handle.abort_handle();
+    let z2b_abort = zenoh_to_backend_handle.abort_handle();
+    let watchdog = tokio::spawn(async move {
+        watchdog_cancel.cancelled().await;
+        tokio::time::sleep(drain_timeout).await;
+        b2z_abort.abort();
+        z2b_abort.abort();
+    });
+
+    let (b2z_res, z2b_res) = tokio::join!(backend_to_zenoh_handle, zenoh_to_backend_handle);
+    watchdog.abort();
+    ext_task.abort();
+    let _ = ext_task.await;
+    if let Ok(publisher) = b2z_res {
+        let _ = publisher.undeclare().await;
+    }
+    if let Ok(subscriber) = z2b_res {
+        let _ = subscriber.undeclare().await;
     }
 
-    info!(
-        "Connection handler stopped for client: {}",
-        client_id_for_final
-    );
+    info!("Connection handler stopped for client: {}", client_id);
 
     Ok(())
 }
