@@ -187,10 +187,9 @@ async fn handle_multiroute_connection(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
-        // Small delay for Zenoh subscriber/publisher to establish
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Send the request through Zenoh
+        // Send the request through Zenoh. The AdvancedPublisher/Subscriber with
+        // cache + history handle late-joiner synchronization, so no fixed delay
+        // is needed here (E7).
         tx_publisher
             .put(&parsed.buffer[..])
             .await
