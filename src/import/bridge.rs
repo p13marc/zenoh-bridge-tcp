@@ -1,10 +1,11 @@
-use crate::config::BridgeConfig;
+use crate::config::{BridgeConfig, ReliabilityMode};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
+use zenoh::qos::CongestionControl;
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
     MissDetectionConfig, RecoveryConfig,
@@ -68,13 +69,21 @@ where
         .clone()
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
-    let publisher = session
+    let publisher_builder = session
         .declare_publisher(pub_key.clone())
         .cache(CacheConfig::default().max_samples(64))
         .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
-        .publisher_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+        .publisher_detection();
+    // Stream reliability: block on a full TX queue instead of Zenoh's default
+    // `Drop`, which would silently drop payload bytes and corrupt the stream.
+    let publisher = match config.reliability {
+        ReliabilityMode::Stream => {
+            publisher_builder.congestion_control(CongestionControl::Block)
+        }
+        ReliabilityMode::Telemetry => publisher_builder,
+    }
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
     debug!(
         "Client {}: Declared AdvancedPublisher on {} with cache",
@@ -120,6 +129,28 @@ where
     // Cancellation tokens for graceful shutdown of each direction
     let cancel_zenoh_to_client = CancellationToken::new();
     let cancel_client_to_zenoh = CancellationToken::new();
+
+    // Stream reliability: reset the connection on an unrecoverable sample miss
+    // rather than deliver a corrupted byte stream to the client.
+    if config.reliability == ReliabilityMode::Stream {
+        let miss_z2c = cancel_zenoh_to_client.clone();
+        let miss_c2z = cancel_client_to_zenoh.clone();
+        let miss_client = client_id.to_string();
+        subscriber
+            .sample_miss_listener()
+            .callback(move |miss| {
+                warn!(
+                    "Client {}: unrecoverable sample miss ({} sample(s)) — resetting connection",
+                    miss_client,
+                    miss.nb()
+                );
+                miss_z2c.cancel();
+                miss_c2z.cancel();
+            })
+            .background()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to register sample-miss listener: {:?}", e))?;
+    }
 
     // Task: Monitor error signals from export bridge
     let mut error_monitor = tokio::spawn(async move {

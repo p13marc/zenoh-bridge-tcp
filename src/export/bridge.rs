@@ -1,5 +1,5 @@
 use super::{CancellationSender, ExportBackend};
-use crate::config::BridgeConfig;
+use crate::config::{BridgeConfig, ReliabilityMode};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
+use zenoh::qos::CongestionControl;
 use zenoh_ext::{
     AdvancedPublisherBuilderExt, AdvancedSubscriberBuilderExt, CacheConfig, HistoryConfig,
     MissDetectionConfig, RecoveryConfig,
@@ -255,13 +256,21 @@ where
         .clone()
         .try_into()
         .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
-    let publisher = session
+    let publisher_builder = session
         .declare_publisher(pub_key.clone())
         .cache(CacheConfig::default().max_samples(64))
         .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
-        .publisher_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+        .publisher_detection();
+    // Stream reliability: block on a full TX queue instead of Zenoh's default
+    // `Drop`, which would silently drop payload bytes and corrupt the stream.
+    let publisher = match config.reliability {
+        ReliabilityMode::Stream => {
+            publisher_builder.congestion_control(CongestionControl::Block)
+        }
+        ReliabilityMode::Telemetry => publisher_builder,
+    }
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
     debug!(
         "Client {}: Declared AdvancedPublisher on {} with cache",
@@ -275,6 +284,30 @@ where
     // Cancellation tokens for graceful shutdown of each direction
     let cancel_backend_to_zenoh = CancellationToken::new();
     let cancel_zenoh_to_backend = CancellationToken::new();
+
+    // Stream reliability: an unrecoverable sample miss means the byte stream has a
+    // gap that cannot be delivered faithfully. Reset the connection rather than
+    // hand corrupted bytes to the backend. The listener runs in the background for
+    // the subscriber's lifetime.
+    if config.reliability == ReliabilityMode::Stream {
+        let miss_b2z = cancel_backend_to_zenoh.clone();
+        let miss_z2b = cancel_zenoh_to_backend.clone();
+        let miss_client = client_id.clone();
+        subscriber
+            .sample_miss_listener()
+            .callback(move |miss| {
+                warn!(
+                    "Client {}: unrecoverable sample miss ({} sample(s)) — resetting connection",
+                    miss_client,
+                    miss.nb()
+                );
+                miss_b2z.cancel();
+                miss_z2b.cancel();
+            })
+            .background()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to register sample-miss listener: {:?}", e))?;
+    }
 
     // Task: read from backend and publish to Zenoh using AdvancedPublisher
     let buffer_size = config.buffer_size;

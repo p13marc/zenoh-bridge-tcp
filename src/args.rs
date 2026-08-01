@@ -111,6 +111,11 @@ pub struct Args {
     #[arg(long, default_value = "5")]
     pub drain_timeout: u64,
 
+    /// Data-plane reliability posture: `stream` (default) blocks on backpressure
+    /// and resets the connection on unrecoverable loss; `telemetry` tolerates drops.
+    #[arg(long, default_value = "stream")]
+    pub reliability: String,
+
     /// Log level: trace, debug, info, warn, error
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -145,6 +150,7 @@ impl Default for Args {
             buffer_size: 65536,
             read_timeout: 10,
             drain_timeout: 5,
+            reliability: "stream".to_string(),
             log_level: "info".to_string(),
             log_format: "pretty".to_string(),
         }
@@ -194,6 +200,11 @@ impl Args {
                 self.drain_timeout
             ));
         }
+
+        // Validate reliability posture
+        self.reliability
+            .parse::<crate::config::ReliabilityMode>()
+            .map_err(|e| anyhow::anyhow!("--reliability: {}", e))?;
 
         // Validate log_format
         match self.log_format.as_str() {
@@ -248,7 +259,10 @@ impl Args {
 
     /// Build a BridgeConfig from command-line arguments
     pub fn bridge_config(&self) -> BridgeConfig {
-        BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout)
+        let mut config = BridgeConfig::new(self.buffer_size, self.read_timeout, self.drain_timeout);
+        // Already validated in `validate()`; fall back to the default posture.
+        config.reliability = self.reliability.parse().unwrap_or_default();
+        config
     }
 }
 

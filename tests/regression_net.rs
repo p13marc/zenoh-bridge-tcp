@@ -76,7 +76,6 @@ async fn raw_round_trip_is_byte_exact() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "flaky under Drop congestion control (A1/A3); un-ignored by the A1 fix (#10)"]
 async fn large_transfer_is_byte_exact() {
     let (backend, _backend) = start_echo_server().await;
     let service = unique_service_name("regnet_large");
