@@ -50,6 +50,7 @@ pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
     }
 
     let service_name = parts[0].to_string();
+    crate::config::validate_service_name(&service_name)?;
     let listen_addr: SocketAddr = parts[1]
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid listen address: {}", e))?;

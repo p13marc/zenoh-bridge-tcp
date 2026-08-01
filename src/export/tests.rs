@@ -103,11 +103,17 @@ fn test_parse_ws_export_spec_empty_service() {
 
 #[test]
 fn test_parse_export_spec_empty_service_name() {
+    // An empty service name is now rejected (F2): it would otherwise become an
+    // empty key segment.
     let result = parse_export_spec("/127.0.0.1:8080");
-    // Empty service name should succeed at parsing but is an edge case
-    assert!(result.is_ok());
-    let (service, _) = result.unwrap();
-    assert_eq!(service, "");
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_parse_export_spec_rejects_wildcard_service_name() {
+    // F2: a wildcard service name would subscribe to every service's clients.
+    assert!(parse_export_spec("*/127.0.0.1:8080").is_err());
+    assert!(parse_export_spec("a*b/127.0.0.1:8080").is_err());
 }
 
 #[test]
@@ -128,12 +134,10 @@ fn test_parse_export_spec_nested_service_name() {
 
 #[test]
 fn test_parse_export_spec_with_wildcards() {
-    // Zenoh wildcards in service names: parsing succeeds but usage would be invalid
+    // F2: wildcard service names are now rejected at parse time — otherwise
+    // `my*service` (or a bare `*`) would subscribe across other services' keys.
     let result = parse_export_spec("my*service/127.0.0.1:8080");
-    assert!(
-        result.is_ok(),
-        "Parser accepts wildcards (validation is at Zenoh level)"
-    );
+    assert!(result.is_err(), "wildcards in service names must be rejected");
 }
 
 #[test]

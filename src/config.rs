@@ -97,6 +97,27 @@ impl BridgeConfig {
     }
 }
 
+/// Validate a service name from a CLI spec before it becomes a Zenoh key segment.
+///
+/// Service names are interpolated into key expressions such as
+/// `{service}/clients/*`. Zenoh's `KeyExpr` parser accepts wildcards (`*`, `$*`),
+/// so `--export '*/127.0.0.1:80'` would subscribe to *every* service's clients.
+/// Require a non-empty literal segment: ASCII alphanumerics plus `-`, `_`, `.`.
+pub fn validate_service_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(anyhow::anyhow!("service name must not be empty"));
+    }
+    for c in name.chars() {
+        if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            return Err(anyhow::anyhow!(
+                "service name '{name}' contains an invalid character {c:?} \
+                 (allowed: alphanumerics, '-', '_', '.')"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Create a Zenoh config from a JSON5 configuration file
 pub fn create_zenoh_config_from_file<P: AsRef<Path>>(path: P) -> Result<Config> {
     Config::from_file(path.as_ref())
