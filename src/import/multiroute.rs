@@ -134,7 +134,8 @@ async fn handle_multiroute_connection(
 
         // 2. Check backend availability
         let service_key = format!("{}/{}/available", service_name, dns);
-        let backend_available = check_backend_available(&session, &service_key).await;
+        let backend_available =
+            check_backend_available(&session, &service_key, config.availability_timeout).await;
 
         if !backend_available {
             warn!(request_id = %request_id, dns = %dns, "No backend available");
@@ -328,9 +329,13 @@ async fn handle_multiroute_connection(
 }
 
 /// Check if a backend is available via liveliness query.
-pub(super) async fn check_backend_available(session: &Session, service_key: &str) -> bool {
+pub(super) async fn check_backend_available(
+    session: &Session,
+    service_key: &str,
+    availability_timeout: Duration,
+) -> bool {
     match session.liveliness().get(service_key).await {
-        Ok(replies) => tokio::time::timeout(Duration::from_millis(1000), async {
+        Ok(replies) => tokio::time::timeout(availability_timeout, async {
             replies.recv_async().await.is_ok()
         })
         .await
