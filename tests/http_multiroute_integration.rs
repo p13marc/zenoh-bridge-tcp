@@ -338,3 +338,148 @@ async fn test_multiroute_unavailable_host_returns_502() {
     export_task.abort();
     import_task.abort();
 }
+
+/// Backend with a GET `/` (so HEAD yields Content-Length + no body) and a POST
+/// `/echo` that returns the exact request body.
+async fn start_echo_backend() -> SocketAddr {
+    use axum::body::Bytes;
+    use axum::routing::post;
+    let app = Router::new()
+        .route("/", get(|| async { "hello-body-of-known-length" }))
+        .route("/echo", post(|body: Bytes| async move { body }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    sleep(Duration::from_millis(200)).await;
+    addr
+}
+
+async fn spawn_multiroute(
+    dns: &str,
+    backend_addr: SocketAddr,
+    shutdown_token: &CancellationToken,
+) -> SocketAddr {
+    let config = Arc::new(BridgeConfig::default());
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec = format!("mr-echo/{}/{}", dns, backend_addr);
+    let bc = config.clone();
+    tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, bc, t1)
+            .await
+            .unwrap();
+    });
+    sleep(Duration::from_millis(500)).await;
+
+    let import_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let import_addr = import_listener.local_addr().unwrap();
+    drop(import_listener);
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let spec_import = format!("mr-echo/{}", import_addr);
+    tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_multiroute_import_mode(s2, &spec_import, config, t2)
+            .await
+            .unwrap();
+    });
+    sleep(Duration::from_secs(1)).await;
+    import_addr
+}
+
+/// E1: a POST whose body arrives in a segment after the headers must be
+/// forwarded in full (not truncated), and the echoed body must match.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_post_with_delayed_body() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+    let backend_addr = start_echo_backend().await;
+    let import_addr = spawn_multiroute("echo.test", backend_addr, &shutdown_token).await;
+
+    let body = "A".repeat(20_000);
+    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    let headers = format!(
+        "POST /echo HTTP/1.1\r\nHost: echo.test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    // Delay so the bridge parses the headers before the body arrives — the
+    // segmentation that used to truncate the body.
+    sleep(Duration::from_millis(300)).await;
+    stream.write_all(body.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut response = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(15), stream.read(&mut buf))
+            .await
+            .expect("timeout reading POST response")
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("200"),
+        "expected 200, got: {}",
+        &text[..text.len().min(120)]
+    );
+    let echoed = text.rsplit("\r\n\r\n").next().unwrap_or("");
+    assert!(
+        echoed.matches('A').count() >= body.len(),
+        "echoed body truncated: got {} 'A's, expected {}",
+        echoed.matches('A').count(),
+        body.len()
+    );
+
+    shutdown_token.cancel();
+}
+
+/// E3: a HEAD response has Content-Length but no body; the bridge must complete
+/// it promptly instead of blocking ~30s waiting for a body that never comes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_head_completes_promptly() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+    let backend_addr = start_echo_backend().await;
+    let import_addr = spawn_multiroute("head.test", backend_addr, &shutdown_token).await;
+
+    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    stream
+        .write_all(b"HEAD / HTTP/1.1\r\nHost: head.test\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let mut response = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match tokio::time::timeout(Duration::from_secs(12), stream.read(&mut buf)).await {
+            Ok(Ok(0)) | Err(_) => break,
+            Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) => break,
+        }
+    }
+    let elapsed = start.elapsed();
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("200"),
+        "expected 200 for HEAD, got: {}",
+        &text[..text.len().min(120)]
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "HEAD response took {:?} — likely hung waiting for a body (E3)",
+        elapsed
+    );
+
+    shutdown_token.cancel();
+}

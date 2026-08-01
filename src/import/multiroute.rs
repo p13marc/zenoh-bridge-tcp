@@ -1,9 +1,9 @@
 use crate::config::BridgeConfig;
-use crate::http_parser::{http_400_response, parse_http_request};
+use crate::http_parser::{ParsedHttpRequest, http_400_response, parse_http_request};
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -205,15 +205,28 @@ async fn handle_multiroute_connection(
             .await
             .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
+        // Read the full request body before forwarding. parse_http_request stops
+        // at the end of the headers, so a POST whose body arrives in a later
+        // segment would otherwise be truncated and the leftover bytes mis-parsed
+        // as the next request (E1).
+        let full_request = match read_full_request(&mut stream, &parsed, &config).await {
+            Ok(buf) => buf,
+            Err(e) => {
+                warn!(request_id = %request_id, "Failed to read request body: {}", e);
+                let _ = liveliness_token.undeclare().await;
+                break;
+            }
+        };
+
         // Send the request through Zenoh. The AdvancedPublisher/Subscriber with
         // cache + history handle late-joiner synchronization, so no fixed delay
         // is needed here (E7).
         tx_publisher
-            .put(&parsed.buffer[..])
+            .put(&full_request[..])
             .await
             .map_err(|e| anyhow::anyhow!("Failed to publish request: {}", e))?;
 
-        debug!(request_id = %request_id, "Published request ({} bytes)", parsed.buffer.len());
+        debug!(request_id = %request_id, "Published request ({} bytes)", full_request.len());
 
         // 4. Receive response and forward to client
         let mut response_buf = Vec::with_capacity(config.buffer_size);
@@ -250,7 +263,14 @@ async fn handle_multiroute_connection(
                         crate::http_response_parser::parse_response_headers(&response_buf)
                 {
                     header_len = hlen;
-                    body_framing = Some(framing);
+                    // A HEAD response carries body-framing headers (e.g.
+                    // Content-Length) but no body follows, so treat it as NoBody
+                    // to avoid waiting ~30s for a body that never comes (E3).
+                    body_framing = Some(if parsed.method.eq_ignore_ascii_case("HEAD") {
+                        crate::http_response_parser::ResponseBodyFraming::NoBody
+                    } else {
+                        framing
+                    });
                 }
 
                 // Write to client
@@ -343,6 +363,58 @@ async fn handle_multiroute_connection(
     }
 
     Ok(())
+}
+
+/// Read the complete request (headers + full body) so the whole request is
+/// forwarded, not just the bytes that arrived with the headers (E1).
+///
+/// Reads up to `content_length` (or the chunked terminator) beyond the already
+/// buffered `header_len`, bounded by `max_response_size` and `read_timeout`.
+async fn read_full_request(
+    stream: &mut TcpStream,
+    parsed: &ParsedHttpRequest,
+    config: &BridgeConfig,
+) -> Result<Vec<u8>> {
+    let mut buf = parsed.buffer.clone();
+
+    if parsed.is_chunked {
+        // Read until the chunked body terminator is present.
+        while crate::http_response_parser::find_chunked_body_end(&buf[parsed.header_len..])
+            .is_none()
+        {
+            if buf.len() > config.max_response_size {
+                return Err(anyhow::anyhow!("request body exceeds max size"));
+            }
+            let mut tmp = vec![0u8; config.buffer_size];
+            let n = tokio::time::timeout(config.read_timeout, stream.read(&mut tmp))
+                .await
+                .map_err(|_| anyhow::anyhow!("timeout reading chunked request body"))??;
+            if n == 0 {
+                break; // client closed before the body completed
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    } else if let Some(total) = parsed.content_length {
+        if total > config.max_response_size {
+            return Err(anyhow::anyhow!("Content-Length exceeds max size"));
+        }
+        let mut have = buf.len().saturating_sub(parsed.header_len);
+        while have < total {
+            let want = (total - have).min(config.buffer_size);
+            let mut tmp = vec![0u8; want];
+            let n = tokio::time::timeout(config.read_timeout, stream.read(&mut tmp))
+                .await
+                .map_err(|_| anyhow::anyhow!("timeout reading request body"))??;
+            if n == 0 {
+                break; // client closed before sending the declared body
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            have += n;
+        }
+    }
+    // Otherwise (no Content-Length and not chunked) there is no body to read.
+
+    Ok(buf)
 }
 
 /// Check if a backend is available via liveliness query.

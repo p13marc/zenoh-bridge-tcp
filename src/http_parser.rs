@@ -15,10 +15,20 @@ use tracing::{debug, warn};
 pub struct ParsedHttpRequest {
     /// The normalized DNS name extracted from the Host header
     pub dns: String,
-    /// The complete buffered request that should be forwarded
+    /// The buffered request read so far: headers plus whatever body bytes arrived
+    /// in the same reads. Callers that need the full body must read up to
+    /// `content_length`/chunked terminator beyond `header_len`.
     pub buffer: Vec<u8>,
     /// Whether this is a WebSocket upgrade request
     pub is_websocket_upgrade: bool,
+    /// Request method (e.g. "GET", "POST", "HEAD").
+    pub method: String,
+    /// Offset in `buffer` where the body begins (end of the header block).
+    pub header_len: usize,
+    /// Declared request body length, if a `Content-Length` header was present.
+    pub content_length: Option<usize>,
+    /// Whether the request body uses chunked transfer-encoding.
+    pub is_chunked: bool,
 }
 
 /// Parse an HTTP request from a TCP stream and extract the Host header
@@ -105,7 +115,7 @@ pub(crate) fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpReques
     let mut req = httparse::Request::new(&mut headers);
 
     match req.parse(buffer) {
-        Ok(httparse::Status::Complete(_body_offset)) => {
+        Ok(httparse::Status::Complete(body_offset)) => {
             // Successfully parsed headers
             let dns = extract_and_normalize_host(&req, buffer)?;
 
@@ -117,9 +127,30 @@ pub(crate) fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpReques
                         .unwrap_or(false)
             });
 
+            // Request body framing, so callers can read the full body (not just the
+            // bytes that happened to arrive with the headers).
+            let mut content_length: Option<usize> = None;
+            let mut is_chunked = false;
+            for h in req.headers.iter() {
+                if h.name.eq_ignore_ascii_case("content-length") {
+                    if let Ok(s) = std::str::from_utf8(h.value)
+                        && let Ok(n) = s.trim().parse::<usize>()
+                    {
+                        content_length = Some(n);
+                    }
+                } else if h.name.eq_ignore_ascii_case("transfer-encoding")
+                    && let Ok(s) = std::str::from_utf8(h.value)
+                    && s.to_ascii_lowercase().contains("chunked")
+                {
+                    is_chunked = true;
+                }
+            }
+
+            let method = req.method.unwrap_or("").to_string();
+
             debug!(
                 "Parsed HTTP request: {} {} (Host: {}, WS: {})",
-                req.method.unwrap_or("?"),
+                method,
                 req.path.unwrap_or("?"),
                 dns,
                 is_websocket_upgrade,
@@ -129,6 +160,10 @@ pub(crate) fn try_parse_request(buffer: &[u8]) -> Result<Option<ParsedHttpReques
                 dns,
                 buffer: buffer.to_vec(),
                 is_websocket_upgrade,
+                method,
+                header_len: body_offset,
+                content_length,
+                is_chunked,
             }))
         }
         Ok(httparse::Status::Partial) => {
