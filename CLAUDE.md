@@ -25,8 +25,8 @@ cargo nextest run
 ### Validation and Safety
 
 - `src/args.rs` validates all CLI arguments early: buffer_size >= 1024, drain_timeout >= 1s, log format/level, and all spec formats
-- `src/tls_parser.rs` enforces RFC 6066/1035 SNI hostname rules (253-byte limit, 63-byte labels, ASCII-only, no trailing dots)
-- `src/http_response_parser.rs` rejects smuggling attempts (TE+CL, duplicate CL), bounds Content-Length to 1GB
+- **L7 parsing is delegated to the [`flowscope`](https://crates.io/crates/flowscope) crate** (features `http` + `tls`, pure-compute, no async/CAP/root). `flowscope::classify::classify_first_bytes` detects the protocol; `flowscope::tls::TlsParser` extracts SNI (reassembling segmented/PQ ClientHellos); `flowscope::http::HttpProxyParser` frames HTTP/1.1 streaming — method-aware bodies, chunked, `1xx` interim, upgrades, and RFC 9112 §6.3 smuggling defense (`SmugglingPolicy::Strict` → typed `HttpPoison` → 400/502). The bridge routes on the head and relays raw bytes it never retains.
+- `src/dns.rs` normalizes the DNS routing key (lowercase, strip default 80/443); `src/http_util.rs` holds the 400/502/504 byte templates.
 - `src/import/listener.rs` tracks per-connection tasks via `JoinSet` with graceful drain on shutdown
 - `src/export/bridge.rs` cancels old connections before spawning replacements, releases mutex before await
 

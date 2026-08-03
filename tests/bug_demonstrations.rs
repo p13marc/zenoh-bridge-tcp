@@ -428,10 +428,11 @@ fn fix_015_log_format_validated() {
 }
 
 // ============================================================================
-// FIX 16: TLS size check — consistent total_size validation
-// File: src/tls_parser.rs
-// Changed outer check from `length > max` to `total_size > max` (where total_size = 5 + length).
-// Removed redundant inner loop check.
+// FIX 16: TLS ClientHello size bound — total_size validation
+// Historical: the bridge's own TLS reader once mis-scoped this check. SNI
+// extraction now runs on flowscope's TlsParser, bounded by the read loop's
+// max_header_size in import::connection::read_tls_sni. This remains as an
+// invariant check on the size arithmetic the bound relies on.
 // ============================================================================
 
 #[test]
