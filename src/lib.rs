@@ -12,7 +12,6 @@ pub mod http_parser;
 pub mod http_response_parser;
 pub mod http_util;
 pub mod import;
-pub mod protocol_detect;
 #[cfg(feature = "tls-termination")]
 pub mod tls_config;
 pub mod tls_parser;
