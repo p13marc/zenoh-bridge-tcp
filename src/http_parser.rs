@@ -5,6 +5,7 @@
 //! ensure consistent routing behavior.
 
 use crate::config::BridgeConfig;
+use crate::dns::normalize_dns;
 use crate::error::{BridgeError, Result};
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
@@ -285,82 +286,6 @@ fn validate_dns_for_key(dns: &str) -> Result<()> {
     Ok(())
 }
 
-/// Normalize a DNS name for consistent routing
-///
-/// This function:
-/// 1. Converts to lowercase (DNS is case-insensitive)
-/// 2. Strips default ports (80 for HTTP, 443 for HTTPS)
-///
-/// Examples:
-/// - "Example.COM" -> "example.com"
-/// - "example.com:80" -> "example.com"
-/// - "example.com:443" -> "example.com"
-/// - "example.com:8080" -> "example.com:8080"
-pub fn normalize_dns(host: &str) -> String {
-    let host = host.to_lowercase();
-
-    // IPv6 without brackets: multiple colons means it's an IPv6 address, not host:port
-    let colon_count = host.chars().filter(|&c| c == ':').count();
-    if colon_count > 1 && !host.starts_with('[') {
-        return host;
-    }
-
-    // Strip default ports using proper port parsing
-    if let Some(colon_pos) = host.rfind(':') {
-        let port_str = &host[colon_pos + 1..];
-        if let Ok(port) = port_str.parse::<u16>()
-            && (port == 80 || port == 443)
-        {
-            return host[..colon_pos].to_string();
-        }
-    }
-    host
-}
-
-/// Generate an HTTP 400 Bad Request response
-pub fn http_400_response() -> Vec<u8> {
-    let body = "400 Bad Request: Missing Host header";
-    format!(
-        "HTTP/1.1 400 Bad Request\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        body.len(),
-        body
-    )
-    .into_bytes()
-}
-
-/// Generate an HTTP 502 Bad Gateway response
-pub fn http_502_response(dns: &str) -> Vec<u8> {
-    let body = format!("502 Bad Gateway: No backend available for {}", dns);
-    let content_length = body.len();
-
-    format!(
-        "HTTP/1.1 502 Bad Gateway\r\n\
-         Content-Type: text/plain\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n\
-         {}",
-        content_length, body
-    )
-    .into_bytes()
-}
-
-/// Generate an HTTP 504 Gateway Timeout response
-pub fn http_504_response() -> Vec<u8> {
-    let body = "504 Gateway Timeout";
-    format!(
-        "HTTP/1.1 504 Gateway Timeout\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )
-    .into_bytes()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,59 +319,6 @@ mod tests {
     fn test_validate_dns_for_key_rejects_non_ascii_and_overlong() {
         assert!(validate_dns_for_key("exämple.com").is_err());
         assert!(validate_dns_for_key(&"a".repeat(254)).is_err());
-    }
-
-    #[test]
-    fn test_normalize_dns_lowercase() {
-        assert_eq!(normalize_dns("Example.COM"), "example.com");
-        assert_eq!(normalize_dns("API.Example.COM"), "api.example.com");
-    }
-
-    #[test]
-    fn test_normalize_dns_strip_port_80() {
-        assert_eq!(normalize_dns("example.com:80"), "example.com");
-        assert_eq!(normalize_dns("Example.COM:80"), "example.com");
-    }
-
-    #[test]
-    fn test_normalize_dns_strip_port_443() {
-        assert_eq!(normalize_dns("example.com:443"), "example.com");
-        assert_eq!(normalize_dns("Example.COM:443"), "example.com");
-    }
-
-    #[test]
-    fn test_normalize_dns_keep_custom_port() {
-        assert_eq!(normalize_dns("example.com:8080"), "example.com:8080");
-        assert_eq!(normalize_dns("example.com:3000"), "example.com:3000");
-    }
-
-    #[test]
-    fn test_normalize_dns_combined() {
-        assert_eq!(normalize_dns("Example.COM:80"), "example.com");
-        assert_eq!(normalize_dns("API.Example.COM:443"), "api.example.com");
-        assert_eq!(
-            normalize_dns("Dev.Example.COM:8080"),
-            "dev.example.com:8080"
-        );
-    }
-
-    #[test]
-    fn test_normalize_dns_numeric_port_parsing() {
-        // Ensure only actual port 80/443 are stripped
-        assert_eq!(normalize_dns("host:80"), "host");
-        assert_eq!(normalize_dns("host:443"), "host");
-        assert_eq!(normalize_dns("host:8080"), "host:8080");
-        assert_eq!(normalize_dns("host:180"), "host:180");
-        assert_eq!(normalize_dns("host:4430"), "host:4430");
-        // No port at all
-        assert_eq!(normalize_dns("example.com"), "example.com");
-        // IPv6 with port (bracket notation)
-        assert_eq!(normalize_dns("[::1]:80"), "[::1]");
-        assert_eq!(normalize_dns("[::1]:8080"), "[::1]:8080");
-        // IPv6 without brackets: must not strip address octets as "port"
-        assert_eq!(normalize_dns("::1"), "::1");
-        assert_eq!(normalize_dns("2001:db8::1"), "2001:db8::1");
-        assert_eq!(normalize_dns("::ffff:127.0.0.1"), "::ffff:127.0.0.1");
     }
 
     #[test]
@@ -661,97 +533,6 @@ mod tests {
         assert!(parsed.is_websocket_upgrade);
     }
 
-    #[test]
-    fn test_http_400_response() {
-        let response = http_400_response();
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(response_str.contains("400 Bad Request"));
-        assert!(response_str.contains("Missing Host header"));
-
-        // Verify proper HTTP formatting: no leading spaces in headers
-        let parts: Vec<&str> = response_str.split("\r\n").collect();
-        for (i, part) in parts.iter().enumerate() {
-            if i == 0 {
-                assert!(
-                    part.starts_with("HTTP/1.1"),
-                    "Status line should start with HTTP/1.1"
-                );
-            } else if !part.is_empty() {
-                assert!(
-                    !part.starts_with(' '),
-                    "HTTP header/body should not start with space: {:?}",
-                    part
-                );
-            }
-        }
-
-        // Verify Content-Length matches actual body
-        let header_end = response_str
-            .find("\r\n\r\n")
-            .expect("should have header terminator");
-        let body = &response_str[header_end + 4..];
-        let expected_cl = format!("Content-Length: {}\r\n", body.len());
-        assert!(
-            response_str.contains(&expected_cl),
-            "Content-Length should match body size. Body len: {}, response: {:?}",
-            body.len(),
-            response_str
-        );
-    }
-
-    #[test]
-    fn test_http_502_response() {
-        let response = http_502_response("example.com");
-        let response_str = String::from_utf8_lossy(&response);
-        assert!(response_str.contains("502 Bad Gateway"));
-        assert!(response_str.contains("example.com"));
-
-        // Verify proper HTTP formatting: no leading spaces in headers
-        let parts: Vec<&str> = response_str.split("\r\n").collect();
-        for (i, part) in parts.iter().enumerate() {
-            if i == 0 {
-                assert!(
-                    part.starts_with("HTTP/1.1"),
-                    "Status line should start with HTTP/1.1"
-                );
-            } else if !part.is_empty() {
-                assert!(
-                    !part.starts_with(' '),
-                    "HTTP header/body should not start with space: {:?}",
-                    part
-                );
-            }
-        }
-
-        // Verify Content-Length matches actual body
-        let header_end = response_str
-            .find("\r\n\r\n")
-            .expect("should have header terminator");
-        let body = &response_str[header_end + 4..];
-        let expected_cl = format!("Content-Length: {}\r\n", body.len());
-        assert!(
-            response_str.contains(&expected_cl),
-            "Content-Length should match body size. Body len: {}, response: {:?}",
-            body.len(),
-            response_str
-        );
-    }
-
-    #[test]
-    fn test_http_504_response() {
-        let response = http_504_response();
-        let s = String::from_utf8_lossy(&response);
-        assert!(s.contains("504 Gateway Timeout"));
-
-        // Verify Content-Length matches actual body
-        let body_start = s.find("\r\n\r\n").unwrap() + 4;
-        let body = &s[body_start..];
-        let cl_start = s.find("Content-Length: ").unwrap() + 16;
-        let cl_end = s[cl_start..].find("\r\n").unwrap() + cl_start;
-        let content_length: usize = s[cl_start..cl_end].parse().unwrap();
-        assert_eq!(content_length, body.len());
-    }
-
     // --- Additional edge case tests ---
 
     #[test]
@@ -794,17 +575,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_dns_empty_string() {
-        assert_eq!(normalize_dns(""), "");
-    }
-
-    #[test]
-    fn test_normalize_dns_port_only() {
-        assert_eq!(normalize_dns(":80"), "");
-        assert_eq!(normalize_dns(":8080"), ":8080");
-    }
-
-    #[test]
     fn test_find_host_header_empty_value() {
         let mut headers = [httparse::EMPTY_HEADER; 1];
         headers[0] = httparse::Header {
@@ -826,22 +596,6 @@ mod tests {
         let result = parse_http_request(&mut cursor).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().dns, "example.com");
-    }
-
-    // --- HTTP response Content-Length accuracy ---
-
-    #[test]
-    fn test_http_502_response_various_dns() {
-        for dns in &["a.com", "very-long-subdomain.deep.nested.example.com", "x"] {
-            let response = http_502_response(dns);
-            let s = String::from_utf8_lossy(&response);
-            let header_end = s.find("\r\n\r\n").unwrap() + 4;
-            let body = &s[header_end..];
-            let cl_start = s.find("Content-Length: ").unwrap() + 16;
-            let cl_end = s[cl_start..].find("\r\n").unwrap() + cl_start;
-            let cl: usize = s[cl_start..cl_end].parse().unwrap();
-            assert_eq!(cl, body.len(), "Content-Length mismatch for dns='{}'", dns);
-        }
     }
 
     // --- Absolute URI with port ---
@@ -869,29 +623,6 @@ mod tests {
             None
         );
         assert_eq!(extract_host_from_absolute_uri("ws://example.com"), None);
-    }
-
-    // --- normalize_dns with unusual inputs ---
-
-    #[test]
-    fn test_normalize_dns_unicode_passthrough() {
-        // Unicode is lowercased but otherwise passed through
-        assert_eq!(normalize_dns("MÜNCHEN.de"), "münchen.de");
-    }
-
-    #[test]
-    fn test_normalize_dns_only_port() {
-        assert_eq!(normalize_dns(":443"), "");
-    }
-
-    #[test]
-    fn test_normalize_dns_ipv6_bracket_port_443() {
-        assert_eq!(normalize_dns("[::1]:443"), "[::1]");
-    }
-
-    #[test]
-    fn test_normalize_dns_ipv6_bracket_custom_port() {
-        assert_eq!(normalize_dns("[2001:db8::1]:9090"), "[2001:db8::1]:9090");
     }
 
     // --- try_parse_request edge cases ---

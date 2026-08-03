@@ -4,8 +4,8 @@
 //! the SNI (Server Name Indication) hostname for routing purposes.
 
 use crate::config::BridgeConfig;
+use crate::dns::normalize_dns;
 use crate::error::{BridgeError, Result};
-use crate::http_parser::normalize_dns;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tracing::{debug, warn};

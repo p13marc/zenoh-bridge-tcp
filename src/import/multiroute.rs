@@ -1,5 +1,6 @@
 use crate::config::BridgeConfig;
-use crate::http_parser::{ParsedHttpRequest, http_400_response, parse_http_request};
+use crate::http_parser::{ParsedHttpRequest, parse_http_request};
+use crate::http_util::http_400_response;
 use anyhow::Result;
 use std::sync::Arc;
 use std::time::Duration;
@@ -158,7 +159,7 @@ async fn handle_multiroute_connection(
         if !backend_available {
             warn!(request_id = %request_id, dns = %dns, "No backend available");
             let _ = stream
-                .write_all(&crate::http_parser::http_502_response(dns))
+                .write_all(&crate::http_util::http_502_response(dns))
                 .await;
             // Don't close the persistent connection — client may retry with different Host
             continue;
@@ -251,7 +252,7 @@ async fn handle_multiroute_connection(
                 if response_buf.len() > config.max_response_size {
                     warn!(request_id = %request_id, "Response exceeded max size ({} bytes)", config.max_response_size);
                     if bytes_written == 0 {
-                        let error_resp = crate::http_parser::http_502_response("Response too large");
+                        let error_resp = crate::http_util::http_502_response("Response too large");
                         let _ = stream.write_all(&error_resp).await;
                     }
                     return Err(std::io::Error::other("response too large"));
@@ -343,7 +344,7 @@ async fn handle_multiroute_connection(
                 // writing a second HTTP response mid-stream would corrupt the connection.
                 if bytes_written == 0 {
                     let _ = stream
-                        .write_all(&crate::http_parser::http_504_response())
+                        .write_all(&crate::http_util::http_504_response())
                         .await;
                 }
                 break;

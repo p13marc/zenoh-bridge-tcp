@@ -1,5 +1,6 @@
 use crate::config::BridgeConfig;
-use crate::http_parser::{http_400_response, http_502_response, parse_http_request};
+use crate::http_parser::parse_http_request;
+use crate::http_util::{http_400_response, http_502_response};
 use crate::tls_parser::{is_tls_handshake, parse_tls_client_hello};
 use anyhow::Result;
 use std::sync::Arc;
