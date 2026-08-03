@@ -1,12 +1,14 @@
 use crate::config::BridgeConfig;
 use crate::dns::normalize_dns;
-use crate::http_parser::parse_http_request;
 use crate::http_util::{http_400_response, http_502_response};
 use anyhow::Result;
+use bytes::Bytes;
 use flowscope::SessionParser;
 use flowscope::Timestamp;
 use flowscope::classify::{Classify, WireProtocol, classify_first_bytes};
+use flowscope::http::{HttpEvent, HttpProxyParser};
 use flowscope::tls::{TlsMessage, TlsParser};
+use flowscope::{FlowSide, http::RequestHead};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -98,11 +100,10 @@ pub(super) async fn handle_import_connection(
                 }
             }
         } else {
-            // This is a plain HTTP connection - parse HTTP
+            // This is a plain HTTP connection - parse the request head for Host.
             info!("Client {}: Detected plain HTTP connection", client_id);
-            match parse_http_request(&mut stream).await {
-                Ok(parsed) => {
-                    let dns = parsed.dns.clone();
+            match read_http_head(&mut stream, &config).await {
+                Ok((dns, buffer)) => {
                     info!(
                         "Client {}: HTTP routing to DNS: {} (service: {})",
                         client_id, dns, service_name
@@ -134,7 +135,7 @@ pub(super) async fn handle_import_connection(
                     }
 
                     info!("Client {}: Backend available for DNS: {}", client_id, dns);
-                    (format!("/{}", dns), Some(parsed.buffer))
+                    (format!("/{}", dns), Some(buffer))
                 }
                 Err(e) => {
                     warn!("Client {}: Failed to parse HTTP request: {}", client_id, e);
@@ -223,6 +224,127 @@ where
         Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow::anyhow!("timeout reading TLS ClientHello")),
     }
+}
+
+/// Resolve the DNS routing key from a request head's authority.
+///
+/// flowscope's [`RequestHead::authority`] applies RFC 9112 §3.2 rules — an
+/// absolute-form request-target beats the `Host` header, a duplicate `Host` is
+/// rejected, and the host is ASCII-folded (rejecting non-ASCII authorities that
+/// could otherwise desync routing, F3). We then run it through [`normalize_dns`]
+/// so the default 80/443 ports collapse exactly as on the export side.
+fn routing_key_from_head(head: &RequestHead) -> Result<String> {
+    let authority = head
+        .authority()
+        .map_err(|p| anyhow::anyhow!("unroutable request target: {}", p.as_str()))?;
+    let with_port = match authority.port {
+        Some(port) => format!("{}:{}", authority.host, port),
+        None => authority.host,
+    };
+    let dns = normalize_dns(&with_port);
+    if dns.is_empty() {
+        return Err(anyhow::anyhow!("request has no Host/authority"));
+    }
+    Ok(dns)
+}
+
+/// Read an HTTP/1.x request head from `stream` and resolve its DNS routing key.
+///
+/// Bytes are streamed into flowscope's [`HttpProxyParser`]; the routing key is
+/// taken from the first [`HttpEvent::RequestHead`], before any body byte. The
+/// returned buffer is every byte read from the socket so far (head plus any body
+/// bytes that arrived in the same reads), forwarded verbatim to the backend as
+/// the connection's initial payload — the bridge relays, it does not rewrite.
+pub(super) async fn read_http_head<R>(
+    stream: &mut R,
+    config: &BridgeConfig,
+) -> Result<(String, Vec<u8>)>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut parser = HttpProxyParser::new();
+    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+    let mut temp = vec![0u8; 4096];
+    let max_size = config.max_header_size;
+
+    let outcome = tokio::time::timeout(config.read_timeout, async {
+        loop {
+            let n = stream
+                .read(&mut temp)
+                .await
+                .map_err(|e| anyhow::anyhow!("read error while reading HTTP request: {}", e))?;
+            if n == 0 {
+                return Err(anyhow::anyhow!(
+                    "connection closed before complete HTTP request"
+                ));
+            }
+            buffer.extend_from_slice(&temp[..n]);
+
+            // Offer the new bytes to the parser, re-offering the tail on a short
+            // count (the backpressure signal). The head fits well within the
+            // parser's buffer, so this converges before any RequestHead.
+            let mut pending = Bytes::copy_from_slice(&temp[..n]);
+            while !pending.is_empty() {
+                let accepted = parser.push(FlowSide::Initiator, &pending);
+                pending = pending.slice(accepted..);
+                if accepted == 0 {
+                    break;
+                }
+            }
+
+            while let Some(ev) = parser.next_event() {
+                if let HttpEvent::RequestHead(head) = ev {
+                    return routing_key_from_head(&head);
+                }
+            }
+
+            if let Some(reason) = parser.poison() {
+                return Err(anyhow::anyhow!(
+                    "malformed HTTP request: {}",
+                    reason.as_str()
+                ));
+            }
+
+            if buffer.len() >= max_size {
+                return Err(anyhow::anyhow!(
+                    "HTTP headers exceed maximum size of {} bytes",
+                    max_size
+                ));
+            }
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(dns)) => Ok((dns, buffer)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow::anyhow!("timeout reading HTTP request")),
+    }
+}
+
+/// Detect a WebSocket upgrade from peeked (non-consumed) request bytes.
+///
+/// Feeds the peek into an [`HttpProxyParser`] and inspects the first request
+/// head's `Upgrade` header. A partial head simply yields `false` (the caller
+/// treats it as ordinary HTTP).
+pub(super) fn peek_is_websocket(peek: &[u8]) -> bool {
+    let mut parser = HttpProxyParser::new();
+    let mut pending = Bytes::copy_from_slice(peek);
+    while !pending.is_empty() {
+        let accepted = parser.push(FlowSide::Initiator, &pending);
+        pending = pending.slice(accepted..);
+        if accepted == 0 {
+            break;
+        }
+    }
+    while let Some(ev) = parser.next_event() {
+        if let HttpEvent::RequestHead(head) = ev {
+            return head
+                .header("upgrade")
+                .is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"));
+        }
+    }
+    false
 }
 
 #[cfg(test)]
