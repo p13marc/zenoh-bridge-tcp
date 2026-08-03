@@ -233,7 +233,7 @@ where
 /// rejected, and the host is ASCII-folded (rejecting non-ASCII authorities that
 /// could otherwise desync routing, F3). We then run it through [`normalize_dns`]
 /// so the default 80/443 ports collapse exactly as on the export side.
-fn routing_key_from_head(head: &RequestHead) -> Result<String> {
+pub(super) fn routing_key_from_head(head: &RequestHead) -> Result<String> {
     let authority = head
         .authority()
         .map_err(|p| anyhow::anyhow!("unroutable request target: {}", p.as_str()))?;

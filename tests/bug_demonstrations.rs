@@ -5,163 +5,79 @@
 //! the fix applied, and how the test proves correctness.
 
 // ============================================================================
-// FIX 1: HTTP Response Smuggling — Transfer-Encoding + Content-Length now rejected
-// File: src/http_response_parser.rs
-// RFC 7230 §3.3.3: responses with both TE and CL must be rejected.
+// FIX 1-4: HTTP response framing / smuggling defenses
+//
+// These once tested the bridge's own `http_response_parser` module. That module
+// has been replaced by flowscope's `HttpProxyParser` (SmugglingPolicy::Strict),
+// which frames responses inside one state machine and refuses ambiguous ones by
+// poisoning the connection. The bridge maps a poison to a 4xx/5xx and closes
+// (see the multiroute E6 end-to-end test). We re-assert the smuggling guarantees
+// the bridge depends on directly against that parser.
+//
+// The former Content-Length / chunk-size *magnitude* bounds (old FIX 3 / FIX 4)
+// are obsolete: flowscope streams bodies without buffering them, so an absurd
+// declared length no longer allocates anything — the DoS vector those bounds
+// guarded is gone by construction, replaced by flowscope's bounded head / chunk
+// line / buffer limits.
 // ============================================================================
+
+/// Feed a request, then `response`, into a strict inline parser and return the
+/// framing poison (if any) — the bridge's response-smuggling gate.
+fn response_poison(response: &[u8]) -> Option<flowscope::http::HttpPoison> {
+    use flowscope::FlowSide;
+    use flowscope::http::HttpProxyParser;
+
+    let mut parser = HttpProxyParser::new();
+    let request = bytes::Bytes::from_static(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+    let _ = parser.push(FlowSide::Initiator, &request);
+    while parser.next_event().is_some() {}
+
+    let mut pending = bytes::Bytes::copy_from_slice(response);
+    while !pending.is_empty() {
+        let accepted = parser.push(FlowSide::Responder, &pending);
+        if accepted == 0 {
+            break;
+        }
+        pending = pending.slice(accepted..);
+    }
+    while parser.next_event().is_some() {}
+    parser.poison()
+}
 
 #[test]
 fn fix_001_transfer_encoding_and_content_length_rejected() {
+    // RFC 9112 §6.3: a response with both TE and CL is refused (CL.TE/TE.CL).
     let response = b"HTTP/1.1 200 OK\r\n\
                      Transfer-Encoding: chunked\r\n\
                      Content-Length: 100\r\n\
                      \r\n";
-
-    let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
-
-    // FIXED: Parser now rejects responses with both TE and CL
     assert!(
-        result.is_err(),
-        "Should reject response with both TE and CL"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("Transfer-Encoding") && err_msg.contains("Content-Length"),
-        "Error should mention both headers, got: {}",
-        err_msg
+        response_poison(response).is_some(),
+        "TE + CL response must poison the connection"
     );
 }
 
-// ============================================================================
-// FIX 2: Multiple Content-Length headers with different values now rejected
-// File: src/http_response_parser.rs
-// RFC 7230 §3.3.3: differing Content-Length values must be rejected.
-// ============================================================================
-
 #[test]
 fn fix_002_multiple_differing_content_length_rejected() {
+    // Contradictory duplicate Content-Length values are refused.
     let response = b"HTTP/1.1 200 OK\r\n\
                      Content-Length: 10\r\n\
                      Content-Length: 50\r\n\
                      \r\n";
-
-    let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
-
-    // FIXED: Parser now rejects multiple differing Content-Length values
     assert!(
-        result.is_err(),
-        "Should reject response with differing Content-Length values"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("Content-Length"),
-        "Error should mention Content-Length, got: {}",
-        err_msg
+        response_poison(response).is_some(),
+        "differing Content-Length values must poison the connection"
     );
 }
 
 #[test]
-fn fix_002b_multiple_identical_content_length_accepted() {
-    // Multiple identical Content-Length values are OK per RFC 7230
-    let response = b"HTTP/1.1 200 OK\r\n\
-                     Content-Length: 10\r\n\
-                     Content-Length: 10\r\n\
-                     \r\n";
-
-    let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
+fn fix_002b_well_formed_response_accepted() {
+    // A single Content-Length with a matching body frames cleanly (no poison).
+    let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
     assert!(
-        result.is_ok(),
-        "Identical Content-Length values should be accepted"
+        response_poison(response).is_none(),
+        "a well-formed response must not poison the connection"
     );
-    let (_, framing) = result.unwrap().unwrap();
-    assert_eq!(
-        framing,
-        zenoh_bridge_tcp::http_response_parser::ResponseBodyFraming::ContentLength(10)
-    );
-}
-
-// ============================================================================
-// FIX 3: Content-Length now bounded
-// File: src/http_response_parser.rs
-// Absurdly large Content-Length values are rejected (max 1 GiB).
-// ============================================================================
-
-#[test]
-fn fix_003_unbounded_content_length_rejected() {
-    let response = b"HTTP/1.1 200 OK\r\n\
-                     Content-Length: 999999999999999\r\n\
-                     \r\n";
-
-    let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
-
-    // FIXED: Parser rejects Content-Length exceeding MAX_CONTENT_LENGTH (1 GiB)
-    assert!(
-        result.is_err(),
-        "Should reject absurdly large Content-Length"
-    );
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("exceeds maximum"),
-        "Error should mention exceeding maximum, got: {}",
-        err_msg
-    );
-}
-
-#[test]
-fn fix_003b_reasonable_content_length_accepted() {
-    // 100 MB should be accepted (under the 1 GiB limit)
-    let response = b"HTTP/1.1 200 OK\r\n\
-                     Content-Length: 104857600\r\n\
-                     \r\n";
-
-    let result = zenoh_bridge_tcp::http_response_parser::parse_response_headers(response);
-    assert!(
-        result.is_ok(),
-        "Reasonable Content-Length should be accepted"
-    );
-    let (_, framing) = result.unwrap().unwrap();
-    assert_eq!(
-        framing,
-        zenoh_bridge_tcp::http_response_parser::ResponseBodyFraming::ContentLength(104_857_600)
-    );
-}
-
-// ============================================================================
-// FIX 4: Chunked body parser — bounds check on chunk size + overflow protection
-// File: src/http_response_parser.rs
-// Chunk sizes > 256 MiB are rejected. Arithmetic uses checked_add.
-// ============================================================================
-
-#[test]
-fn fix_004_chunked_huge_chunk_size_rejected() {
-    // Chunk claims to be 1 TB (hex: E8D4A51000). Should be rejected.
-    let body = b"E8D4A51000\r\n";
-
-    let result = zenoh_bridge_tcp::http_response_parser::find_chunked_body_end(body);
-
-    // FIXED: Parser rejects chunk sizes > MAX_CHUNK_SIZE (256 MiB)
-    assert_eq!(result, None, "Absurdly large chunk should be rejected");
-}
-
-#[test]
-fn fix_004b_chunked_reasonable_size_accepted() {
-    // Normal chunked body should work fine
-    let body = b"5\r\nHello\r\n0\r\n\r\n";
-    assert_eq!(
-        zenoh_bridge_tcp::http_response_parser::find_chunked_body_end(body),
-        Some(body.len())
-    );
-}
-
-#[test]
-fn fix_004c_chunked_overflow_safe() {
-    // Verify the arithmetic is overflow-safe even on 32-bit conceptually.
-    // A chunk size near usize::MAX would have wrapped before; now uses checked_add.
-    // We can't actually create a usize::MAX-sized buffer, but the parser
-    // correctly returns None for any size > MAX_CHUNK_SIZE.
-    let body = b"FFFFFFFE\r\n"; // Near u32::MAX
-    let result = zenoh_bridge_tcp::http_response_parser::find_chunked_body_end(body);
-    assert_eq!(result, None, "Near-overflow chunk size should be rejected");
 }
 
 // ============================================================================
