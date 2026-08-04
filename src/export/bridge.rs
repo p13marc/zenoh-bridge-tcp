@@ -213,10 +213,57 @@ async fn dispatch_client_connect(
     }
 }
 
+/// How one direction of a client bridge ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionEnd {
+    /// Clean directional EOF / half-close.
+    Eof,
+    /// Torn down because the connection was reset (external teardown, sample
+    /// miss, or the peer direction's error) — no error on this direction itself.
+    Reset,
+    /// This direction hit a hard error (read/write/publish/subscriber failure).
+    Error,
+}
+
+/// The observable outcome of a whole client connection (C3 #18).
+///
+/// Returned by `handle_client_bridge` so callers — and a future metrics layer
+/// (#43) — can count how connections end instead of only seeing `error!` logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectionOutcome {
+    /// Both directions reached a clean EOF.
+    Completed,
+    /// The connection was reset without a direction erroring (external teardown
+    /// or an unrecoverable sample miss).
+    Reset,
+    /// At least one direction failed with an error, or a direction task did not
+    /// join cleanly (panic/abort).
+    Failed,
+}
+
+/// Fold the two directional ends into a connection outcome. `None` means that
+/// direction's task failed to join (panic/abort), which counts as a failure.
+fn fold_outcome(b2z: Option<DirectionEnd>, z2b: Option<DirectionEnd>) -> ConnectionOutcome {
+    let ends = [b2z, z2b];
+    if ends
+        .iter()
+        .any(|e| matches!(e, None | Some(DirectionEnd::Error)))
+    {
+        ConnectionOutcome::Failed
+    } else if ends.iter().any(|e| matches!(e, Some(DirectionEnd::Reset))) {
+        ConnectionOutcome::Reset
+    } else {
+        ConnectionOutcome::Completed
+    }
+}
+
 /// Handle the bridge logic for a single client connection.
 ///
 /// Generic over `TransportReader`/`TransportWriter` so the same function
 /// serves both TCP and WebSocket export paths.
+///
+/// Returns the [`ConnectionOutcome`] so the spawning task can log/count how the
+/// connection ended (C3 #18).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client_bridge<R, W>(
     session: Arc<Session>,
@@ -227,7 +274,7 @@ pub(super) async fn handle_client_bridge<R, W>(
     mut cancel_rx: mpsc::Receiver<()>,
     dns_suffix: Option<&str>,
     config: Arc<BridgeConfig>,
-) -> Result<()>
+) -> Result<ConnectionOutcome>
 where
     R: crate::transport::TransportReader,
     W: crate::transport::TransportWriter,
@@ -311,20 +358,20 @@ where
     let buffer_size = config.buffer_size;
     let b2z_cancel = conn_cancel.clone();
     let backend_to_zenoh_handle = tokio::spawn(async move {
-        loop {
+        let end = loop {
             tokio::select! {
                 result = backend_reader.read_data(buffer_size) => {
                     match result {
                         Ok(data) if data.is_empty() => {
                             debug!("Backend half-close -> EOF for client {}", client_id_for_reader);
                             let _ = publisher.put(Vec::<u8>::new()).await;
-                            break;
+                            break DirectionEnd::Eof;
                         }
                         Ok(data) => {
                             if let Err(e) = publisher.put(&data[..]).await {
                                 error!("Failed to publish for client {}: {:?}", client_id_for_reader, e);
                                 b2z_cancel.cancel();
-                                break;
+                                break DirectionEnd::Error;
                             }
                         }
                         Err(e) => {
@@ -332,23 +379,23 @@ where
                             // C1: emit EOF so the import side doesn't hang, then reset.
                             let _ = publisher.put(Vec::<u8>::new()).await;
                             b2z_cancel.cancel();
-                            break;
+                            break DirectionEnd::Error;
                         }
                     }
                 }
-                _ = b2z_cancel.cancelled() => break,
+                _ = b2z_cancel.cancelled() => break DirectionEnd::Reset,
             }
-        }
+        };
         // Return the publisher so it (and its cache) stays alive until the whole
         // connection ends, letting a late-joining import subscriber recover.
-        publisher
+        (publisher, end)
     });
 
     // Direction: Zenoh -> backend. An empty payload is the client's half-close;
     // propagate it as a FIN on the backend's write side and end this direction only.
     let z2b_cancel = conn_cancel.clone();
     let zenoh_to_backend_handle = tokio::spawn(async move {
-        loop {
+        let end = loop {
             tokio::select! {
                 result = subscriber.recv_async() => {
                     match result {
@@ -357,29 +404,29 @@ where
                             if payload.is_empty() {
                                 debug!("Client {}: client half-close -> FIN to backend", client_id_for_writer);
                                 let _ = backend_writer.send_eof().await;
-                                break;
+                                break DirectionEnd::Eof;
                             }
                             if let Err(e) = backend_writer.write_data(&payload).await {
                                 error!("Failed to write to backend for client {}: {:?}", client_id_for_writer, e);
                                 z2b_cancel.cancel();
-                                break;
+                                break DirectionEnd::Error;
                             }
                         }
                         Err(e) => {
                             error!("Subscriber error for client {}: {:?}", client_id_for_writer, e);
                             z2b_cancel.cancel();
-                            break;
+                            break DirectionEnd::Error;
                         }
                     }
                 }
                 _ = z2b_cancel.cancelled() => {
                     let _ = backend_writer.shutdown().await;
-                    break;
+                    break DirectionEnd::Reset;
                 }
             }
-        }
+        };
         // Return the subscriber; the coordinator undeclares it after both ends.
-        subscriber
+        (subscriber, end)
     });
 
     // External teardown (liveliness delete / duplicate connect) resets the connection.
@@ -407,16 +454,34 @@ where
     watchdog.abort();
     ext_task.abort();
     let _ = ext_task.await;
-    if let Ok(publisher) = b2z_res {
-        let _ = publisher.undeclare().await;
-    }
-    if let Ok(subscriber) = z2b_res {
-        let _ = subscriber.undeclare().await;
-    }
 
-    info!("Connection handler stopped for client: {}", client_id);
+    // Undeclare the entities and capture each direction's end. A join error
+    // (panic/abort past the drain deadline) counts as a failed direction.
+    let b2z_end = match b2z_res {
+        Ok((publisher, end)) => {
+            let _ = publisher.undeclare().await;
+            Some(end)
+        }
+        Err(e) => {
+            warn!(client_id = %client_id, error = %e, "backend->zenoh task did not join cleanly");
+            None
+        }
+    };
+    let z2b_end = match z2b_res {
+        Ok((subscriber, end)) => {
+            let _ = subscriber.undeclare().await;
+            Some(end)
+        }
+        Err(e) => {
+            warn!(client_id = %client_id, error = %e, "zenoh->backend task did not join cleanly");
+            None
+        }
+    };
 
-    Ok(())
+    let outcome = fold_outcome(b2z_end, z2b_end);
+    info!(client_id = %client_id, ?outcome, "Connection handler stopped");
+
+    Ok(outcome)
 }
 
 /// Remove `client_id` from the map only if its entry is still the one owned by
@@ -488,7 +553,7 @@ pub(super) async fn spawn_and_track<R, W>(
     let mut guard = cancellation_senders.lock().await;
     let main_handle = tokio::spawn(
         async move {
-            if let Err(e) = handle_client_bridge(
+            match handle_client_bridge(
                 session,
                 service_name,
                 client_id_task.clone(),
@@ -500,7 +565,9 @@ pub(super) async fn spawn_and_track<R, W>(
             )
             .await
             {
-                error!(error = %e, "Client bridge error");
+                Ok(ConnectionOutcome::Completed) => {}
+                Ok(outcome) => warn!(?outcome, "Client bridge ended non-cleanly"),
+                Err(e) => error!(error = %e, "Client bridge error"),
             }
             // D1: free our own entry on natural completion, but only if it is
             // still ours (guards against a duplicate-connect replacement).
@@ -594,5 +661,49 @@ mod tests {
         let mut map: HashMap<String, CancellationSender> = HashMap::new();
         let (tx, _rx) = mpsc::channel::<()>(1);
         assert!(!remove_if_current(&mut map, "absent", &tx));
+    }
+
+    // --- C3 #18: connection outcome folding ---
+
+    #[test]
+    fn fold_outcome_both_eof_is_completed() {
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Eof), Some(DirectionEnd::Eof)),
+            ConnectionOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn fold_outcome_any_error_is_failed() {
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Eof), Some(DirectionEnd::Error)),
+            ConnectionOutcome::Failed
+        );
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Error), Some(DirectionEnd::Reset)),
+            ConnectionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn fold_outcome_join_failure_is_failed() {
+        // A direction whose task panicked/aborted (None) is a failure.
+        assert_eq!(
+            fold_outcome(None, Some(DirectionEnd::Eof)),
+            ConnectionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn fold_outcome_reset_without_error() {
+        // External teardown / sample-miss resets a direction without an error.
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Eof), Some(DirectionEnd::Reset)),
+            ConnectionOutcome::Reset
+        );
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Reset), Some(DirectionEnd::Reset)),
+            ConnectionOutcome::Reset
+        );
     }
 }
