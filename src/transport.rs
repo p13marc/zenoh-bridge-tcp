@@ -4,6 +4,7 @@
 //! WebSocket I/O, allowing the core bridge loop to be generic over the
 //! underlying transport.
 
+use bytes::{Bytes, BytesMut};
 use futures_util::{SinkExt, StreamExt};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -20,16 +21,15 @@ use tokio_tungstenite::tungstenite::Message;
 pub trait TransportReader: Send + 'static {
     /// Read the next chunk of data.
     ///
-    /// * Returns non-empty `Vec<u8>` on success.
-    /// * Returns empty `Vec` on clean EOF / connection close.
+    /// * Returns a non-empty [`Bytes`] on success.
+    /// * Returns an empty [`Bytes`] on clean EOF / connection close.
     /// * Returns `Err` on I/O error.
     ///
-    /// `buf_size` is a hint for the maximum read size; WebSocket
-    /// implementations may ignore it.
-    fn read_data(
-        &mut self,
-        buf_size: usize,
-    ) -> impl std::future::Future<Output = io::Result<Vec<u8>>> + Send;
+    /// The read size is fixed at construction (G1 #37): the returned `Bytes`
+    /// shares the reader's buffer allocation, so the relay path forwards it with
+    /// no per-chunk copy — and Zenoh's `From<bytes::Bytes>` publishes it
+    /// zero-copy.
+    fn read_data(&mut self) -> impl std::future::Future<Output = io::Result<Bytes>> + Send;
 }
 
 /// Writer half of a bridge transport.
@@ -59,26 +59,36 @@ pub trait TransportWriter: Send + 'static {
 /// TCP reader wrapping any `AsyncReadExt` type.
 pub struct TcpReader<R> {
     inner: R,
-    buffer: Vec<u8>,
+    /// Reusable read buffer. Each read fills its spare capacity and the filled
+    /// region is split off as an owned `Bytes` sharing this allocation, so there
+    /// is no per-chunk copy on the relay hot path (G1 #37).
+    buffer: BytesMut,
+    /// Fixed per-read reservation, set at construction.
+    cap: usize,
 }
 
 impl<R> TcpReader<R> {
     pub fn new(inner: R, buf_size: usize) -> Self {
         Self {
             inner,
-            buffer: vec![0u8; buf_size],
+            buffer: BytesMut::with_capacity(buf_size),
+            cap: buf_size,
         }
     }
 }
 
 impl<R: AsyncReadExt + Unpin + Send + 'static> TransportReader for TcpReader<R> {
-    async fn read_data(&mut self, _buf_size: usize) -> io::Result<Vec<u8>> {
-        let n = self.inner.read(&mut self.buffer).await?;
+    async fn read_data(&mut self) -> io::Result<Bytes> {
+        // Ensure at least `cap` spare bytes, then read directly into the
+        // uninitialized tail via `read_buf` — no zeroing, no per-chunk alloc.
+        self.buffer.reserve(self.cap);
+        let n = self.inner.read_buf(&mut self.buffer).await?;
         if n == 0 {
-            Ok(Vec::new())
-        } else {
-            Ok(self.buffer[..n].to_vec())
+            return Ok(Bytes::new());
         }
+        // Hand off exactly the bytes read as an owned `Bytes` sharing this
+        // allocation. Zenoh publishes it zero-copy via `From<bytes::Bytes>`.
+        Ok(self.buffer.split().freeze())
     }
 }
 
@@ -132,10 +142,10 @@ where
         + Send
         + 'static,
 {
-    async fn read_data(&mut self, _buf_size: usize) -> io::Result<Vec<u8>> {
+    async fn read_data(&mut self) -> io::Result<Bytes> {
         loop {
             match self.inner.next().await {
-                None => return Ok(Vec::new()),
+                None => return Ok(Bytes::new()),
                 Some(Err(e)) => {
                     return Err(io::Error::other(format!("WebSocket read error: {}", e)));
                 }
@@ -144,10 +154,12 @@ where
                     // read as a connection close. Empty payload == EOF is reserved
                     // for the Zenoh framing layer, and Close is the real WS EOF.
                     Message::Binary(data) if data.is_empty() => continue,
-                    Message::Binary(data) => return Ok(data.to_vec()),
+                    // The binary payload is already `bytes::Bytes` — forward it
+                    // without copying.
+                    Message::Binary(data) => return Ok(data),
                     Message::Text(text) if text.is_empty() => continue,
-                    Message::Text(text) => return Ok(text.as_bytes().to_vec()),
-                    Message::Close(_) => return Ok(Vec::new()),
+                    Message::Text(text) => return Ok(Bytes::copy_from_slice(text.as_bytes())),
+                    Message::Close(_) => return Ok(Bytes::new()),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
                 },
             }
@@ -208,10 +220,10 @@ mod tests {
         drop(client); // close to signal EOF after data
 
         let mut reader = TcpReader::new(server, 1024);
-        let data = reader.read_data(1024).await.unwrap();
-        assert_eq!(data, b"hello");
+        let data = reader.read_data().await.unwrap();
+        assert_eq!(&data[..], b"hello");
 
-        let eof = reader.read_data(1024).await.unwrap();
+        let eof = reader.read_data().await.unwrap();
         assert!(eof.is_empty());
     }
 
@@ -221,7 +233,7 @@ mod tests {
         drop(_client);
 
         let mut reader = TcpReader::new(server, 1024);
-        let data = reader.read_data(1024).await.unwrap();
+        let data = reader.read_data().await.unwrap();
         assert!(data.is_empty());
     }
 
@@ -250,7 +262,7 @@ mod tests {
         let mut reader = TcpReader::new(server, 4096); // 4KB buffer
         let mut received = Vec::new();
         loop {
-            let chunk = reader.read_data(4096).await.unwrap();
+            let chunk = reader.read_data().await.unwrap();
             if chunk.is_empty() {
                 break;
             }
@@ -269,7 +281,7 @@ mod tests {
         drop(client);
 
         let mut reader = TcpReader::new(server, 1024);
-        let chunk = reader.read_data(1024).await.unwrap();
+        let chunk = reader.read_data().await.unwrap();
         assert_eq!(chunk.len(), 1024);
         assert!(chunk.iter().all(|&b| b == 0xCD));
     }
@@ -315,12 +327,12 @@ mod tests {
 
         // Left writes, right reads
         left_writer.write_data(b"ping").await.unwrap();
-        let data = right_reader.read_data(1024).await.unwrap();
-        assert_eq!(data, b"ping");
+        let data = right_reader.read_data().await.unwrap();
+        assert_eq!(&data[..], b"ping");
 
         // Right writes, left reads
         right_writer.write_data(b"pong").await.unwrap();
-        let data = left_reader.read_data(1024).await.unwrap();
-        assert_eq!(data, b"pong");
+        let data = left_reader.read_data().await.unwrap();
+        assert_eq!(&data[..], b"pong");
     }
 }

@@ -207,12 +207,11 @@ where
     // publish the EOF marker so the export half-closes the backend, then end this
     // direction only. A read error resets the whole connection.
     let c2z_client = client_id.to_string();
-    let buffer_size = config.buffer_size;
     let c2z_cancel = conn_cancel.clone();
     let client_to_zenoh = tokio::spawn(async move {
         loop {
             tokio::select! {
-                result = reader.read_data(buffer_size) => {
+                result = reader.read_data() => {
                     match result {
                         Ok(data) if data.is_empty() => {
                             debug!("Client {}: client half-close -> EOF to Zenoh", c2z_client);
@@ -220,7 +219,9 @@ where
                             break;
                         }
                         Ok(data) => {
-                            if let Err(e) = publisher.put(&data[..]).await {
+                            // Zero-copy: `data` is `Bytes`, published via Zenoh's
+                            // `From<bytes::Bytes>` without a further copy.
+                            if let Err(e) = publisher.put(data).await {
                                 error!("Client {}: Failed to publish to Zenoh: {:?}", c2z_client, e);
                                 c2z_cancel.cancel();
                                 break;

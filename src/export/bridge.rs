@@ -355,12 +355,11 @@ where
     // Direction: backend -> Zenoh. A clean EOF publishes the empty EOF marker so
     // the import half-closes the client and ends this direction only. A read or
     // publish error resets the whole connection.
-    let buffer_size = config.buffer_size;
     let b2z_cancel = conn_cancel.clone();
     let backend_to_zenoh_handle = tokio::spawn(async move {
         let end = loop {
             tokio::select! {
-                result = backend_reader.read_data(buffer_size) => {
+                result = backend_reader.read_data() => {
                     match result {
                         Ok(data) if data.is_empty() => {
                             debug!("Backend half-close -> EOF for client {}", client_id_for_reader);
@@ -368,7 +367,9 @@ where
                             break DirectionEnd::Eof;
                         }
                         Ok(data) => {
-                            if let Err(e) = publisher.put(&data[..]).await {
+                            // Zero-copy: `data` is `Bytes`, published via Zenoh's
+                            // `From<bytes::Bytes>` without a further copy.
+                            if let Err(e) = publisher.put(data).await {
                                 error!("Failed to publish for client {}: {:?}", client_id_for_reader, e);
                                 b2z_cancel.cancel();
                                 break DirectionEnd::Error;
