@@ -174,6 +174,71 @@ pub(super) async fn handle_import_connection(
     .await
 }
 
+/// How a [`read_until`] head-read ended, short of a hard failure.
+///
+/// Both variants carry every byte consumed from the socket so far — the head
+/// readers relay, they never retain, so whatever was read must either be
+/// replayed to a backend or the connection torn down. `Timeout` makes the
+/// fallback possible: the h2c auto-detect path (#74) downgrades a client that
+/// never sent its first HEADERS (RFC 9113 §3.4 lets it wait for the server's
+/// SETTINGS) to an opaque relay of exactly these bytes.
+pub(super) enum ReadHeadOutcome<T> {
+    /// The step produced a value; the buffer is the verbatim replay payload.
+    Parsed(T, Vec<u8>),
+    /// `read_timeout` elapsed first; the buffer is what had been consumed.
+    Timeout(Vec<u8>),
+}
+
+/// Shared shell of the head readers: read chunks off `stream`, mirror every
+/// byte into a replay buffer, and offer each chunk to `step` until it yields a
+/// value, errors, or the connection exceeds `max_header_size` / `read_timeout`.
+///
+/// `step` owns the incremental parser; it sees each newly read chunk exactly
+/// once. `what` names the head being read in error messages.
+async fn read_until<R, T, F>(
+    stream: &mut R,
+    config: &BridgeConfig,
+    what: &'static str,
+    mut step: F,
+) -> Result<ReadHeadOutcome<T>>
+where
+    R: AsyncReadExt + Unpin,
+    F: FnMut(&[u8]) -> Result<Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + config.read_timeout;
+    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+    let mut temp = vec![0u8; 4096];
+
+    loop {
+        let n = match tokio::time::timeout_at(deadline, stream.read(&mut temp)).await {
+            Err(_) => return Ok(ReadHeadOutcome::Timeout(buffer)),
+            Ok(Err(e)) => {
+                return Err(anyhow::anyhow!("read error while reading {}: {}", what, e));
+            }
+            Ok(Ok(0)) => {
+                return Err(anyhow::anyhow!(
+                    "connection closed before complete {}",
+                    what
+                ));
+            }
+            Ok(Ok(n)) => n,
+        };
+        buffer.extend_from_slice(&temp[..n]);
+
+        if let Some(value) = step(&temp[..n])? {
+            return Ok(ReadHeadOutcome::Parsed(value, buffer));
+        }
+
+        if buffer.len() >= config.max_header_size {
+            return Err(anyhow::anyhow!(
+                "{} exceeds maximum size of {} bytes",
+                what,
+                config.max_header_size
+            ));
+        }
+    }
+}
+
 /// Read a TLS ClientHello from `stream` and extract its SNI for routing.
 ///
 /// Bytes are streamed into flowscope's [`TlsParser`], which reassembles a
@@ -189,48 +254,27 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut parser = TlsParser::default();
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let mut temp = vec![0u8; 4096];
-    let max_size = config.max_header_size;
-
-    let outcome = tokio::time::timeout(config.read_timeout, async {
-        loop {
-            let n = stream
-                .read(&mut temp)
-                .await
-                .map_err(|e| anyhow::anyhow!("read error while reading TLS ClientHello: {}", e))?;
-            if n == 0 {
-                return Err(anyhow::anyhow!(
-                    "connection closed before TLS ClientHello complete"
-                ));
-            }
-            buffer.extend_from_slice(&temp[..n]);
-
-            let mut msgs: Vec<TlsMessage> = Vec::new();
-            parser.feed_initiator(&temp[..n], Timestamp::new(0, 0), &mut msgs);
-            for msg in &msgs {
-                if let TlsMessage::ClientHello(ch) = msg {
-                    return match ch.sni() {
-                        Some(sni) => Ok(normalize_dns(sni)),
-                        None => Err(anyhow::anyhow!("TLS ClientHello has no SNI extension")),
-                    };
-                }
-            }
-
-            if buffer.len() >= max_size {
-                return Err(anyhow::anyhow!(
-                    "TLS ClientHello exceeds maximum size of {} bytes",
-                    max_size
-                ));
+    let outcome = read_until(stream, config, "TLS ClientHello", |chunk| {
+        let mut msgs: Vec<TlsMessage> = Vec::new();
+        parser.feed_initiator(chunk, Timestamp::new(0, 0), &mut msgs);
+        for msg in &msgs {
+            if let TlsMessage::ClientHello(ch) = msg {
+                return match ch.sni() {
+                    Some(sni) => Ok(Some(normalize_dns(sni))),
+                    None => Err(anyhow::anyhow!("TLS ClientHello has no SNI extension")),
+                };
             }
         }
+        Ok(None)
     })
-    .await;
+    .await?;
 
     match outcome {
-        Ok(Ok(dns)) => Ok((dns, buffer)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow::anyhow!("timeout reading TLS ClientHello")),
+        ReadHeadOutcome::Parsed(dns, buffer) => Ok((dns, buffer)),
+        ReadHeadOutcome::Timeout(partial) => Err(anyhow::anyhow!(
+            "timeout reading TLS ClientHello ({} bytes consumed)",
+            partial.len()
+        )),
     }
 }
 
@@ -271,62 +315,41 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut parser = HttpProxyParser::new();
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let mut temp = vec![0u8; 4096];
-    let max_size = config.max_header_size;
-
-    let outcome = tokio::time::timeout(config.read_timeout, async {
-        loop {
-            let n = stream
-                .read(&mut temp)
-                .await
-                .map_err(|e| anyhow::anyhow!("read error while reading HTTP request: {}", e))?;
-            if n == 0 {
-                return Err(anyhow::anyhow!(
-                    "connection closed before complete HTTP request"
-                ));
-            }
-            buffer.extend_from_slice(&temp[..n]);
-
-            // Offer the new bytes to the parser, re-offering the tail on a short
-            // count (the backpressure signal). The head fits well within the
-            // parser's buffer, so this converges before any RequestHead.
-            let mut pending = Bytes::copy_from_slice(&temp[..n]);
-            while !pending.is_empty() {
-                let accepted = parser.push(FlowSide::Initiator, &pending);
-                pending = pending.slice(accepted..);
-                if accepted == 0 {
-                    break;
-                }
-            }
-
-            while let Some(ev) = parser.next_event() {
-                if let HttpEvent::RequestHead(head) = ev {
-                    return routing_key_from_head(&head);
-                }
-            }
-
-            if let Some(reason) = parser.poison() {
-                return Err(anyhow::anyhow!(
-                    "malformed HTTP request: {}",
-                    reason.as_str()
-                ));
-            }
-
-            if buffer.len() >= max_size {
-                return Err(anyhow::anyhow!(
-                    "HTTP headers exceed maximum size of {} bytes",
-                    max_size
-                ));
+    let outcome = read_until(stream, config, "HTTP request head", |chunk| {
+        // Offer the new bytes to the parser, re-offering the tail on a short
+        // count (the backpressure signal). The head fits well within the
+        // parser's buffer, so this converges before any RequestHead.
+        let mut pending = Bytes::copy_from_slice(chunk);
+        while !pending.is_empty() {
+            let accepted = parser.push(FlowSide::Initiator, &pending);
+            pending = pending.slice(accepted..);
+            if accepted == 0 {
+                break;
             }
         }
+
+        while let Some(ev) = parser.next_event() {
+            if let HttpEvent::RequestHead(head) = ev {
+                return routing_key_from_head(&head).map(Some);
+            }
+        }
+
+        if let Some(reason) = parser.poison() {
+            return Err(anyhow::anyhow!(
+                "malformed HTTP request: {}",
+                reason.as_str()
+            ));
+        }
+        Ok(None)
     })
-    .await;
+    .await?;
 
     match outcome {
-        Ok(Ok(dns)) => Ok((dns, buffer)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow::anyhow!("timeout reading HTTP request")),
+        ReadHeadOutcome::Parsed(dns, buffer) => Ok((dns, buffer)),
+        ReadHeadOutcome::Timeout(partial) => Err(anyhow::anyhow!(
+            "timeout reading HTTP request ({} bytes consumed)",
+            partial.len()
+        )),
     }
 }
 
@@ -368,74 +391,53 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut parser = Http2Parser::with_config(Http2Config::default().with_require_preface(false));
-    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
-    let mut temp = vec![0u8; 4096];
-    let max_size = config.max_header_size;
-
-    let outcome = tokio::time::timeout(config.read_timeout, async {
-        loop {
-            let n = stream
-                .read(&mut temp)
-                .await
-                .map_err(|e| anyhow::anyhow!("read error while reading HTTP/2 head: {}", e))?;
-            if n == 0 {
-                return Err(anyhow::anyhow!(
-                    "connection closed before an HTTP/2 request head"
-                ));
-            }
-            buffer.extend_from_slice(&temp[..n]);
-
-            // Offer new bytes to the parser, re-offering the tail on a short count
-            // (the backpressure signal), mirroring the HTTP/1.1 head reader.
-            let mut pending = Bytes::copy_from_slice(&temp[..n]);
-            while !pending.is_empty() {
-                let accepted = parser.push(FlowSide::Initiator, &pending);
-                pending = pending.slice(accepted..);
-                if accepted == 0 {
-                    break;
-                }
-            }
-
-            while let Some(ev) = parser.next_event() {
-                if let Http2Event::Head(head) = ev
-                    && head.dir == FlowSide::Initiator
-                {
-                    if let Some(call) = grpc_call(&head) {
-                        info!(
-                            authority = head.authority().unwrap_or("-"),
-                            service = call.service,
-                            method = call.method,
-                            "Routing terminated gRPC call"
-                        );
-                    }
-                    return h2_routing_key(&head);
-                }
-            }
-
-            if parser.is_failed() {
-                return Err(anyhow::anyhow!(
-                    "malformed HTTP/2 connection: {}",
-                    parser
-                        .error()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| "unknown".into())
-                ));
-            }
-
-            if buffer.len() >= max_size {
-                return Err(anyhow::anyhow!(
-                    "HTTP/2 head exceeds maximum size of {} bytes",
-                    max_size
-                ));
+    let outcome = read_until(stream, config, "HTTP/2 head", |chunk| {
+        // Offer new bytes to the parser, re-offering the tail on a short count
+        // (the backpressure signal), mirroring the HTTP/1.1 head reader.
+        let mut pending = Bytes::copy_from_slice(chunk);
+        while !pending.is_empty() {
+            let accepted = parser.push(FlowSide::Initiator, &pending);
+            pending = pending.slice(accepted..);
+            if accepted == 0 {
+                break;
             }
         }
+
+        while let Some(ev) = parser.next_event() {
+            if let Http2Event::Head(head) = ev
+                && head.dir == FlowSide::Initiator
+            {
+                if let Some(call) = grpc_call(&head) {
+                    info!(
+                        authority = head.authority().unwrap_or("-"),
+                        service = call.service,
+                        method = call.method,
+                        "Routing terminated gRPC call"
+                    );
+                }
+                return h2_routing_key(&head).map(Some);
+            }
+        }
+
+        if parser.is_failed() {
+            return Err(anyhow::anyhow!(
+                "malformed HTTP/2 connection: {}",
+                parser
+                    .error()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+        }
+        Ok(None)
     })
-    .await;
+    .await?;
 
     match outcome {
-        Ok(Ok(dns)) => Ok((dns, buffer)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(anyhow::anyhow!("timeout reading HTTP/2 head")),
+        ReadHeadOutcome::Parsed(dns, buffer) => Ok((dns, buffer)),
+        ReadHeadOutcome::Timeout(partial) => Err(anyhow::anyhow!(
+            "timeout reading HTTP/2 head ({} bytes consumed)",
+            partial.len()
+        )),
     }
 }
 
@@ -575,6 +577,51 @@ mod tests {
             }
             // Empty queue -> a zero-byte read, which read_tls_sni treats as EOF.
             Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Yields its chunks, then stays pending forever — a client that sent a
+    /// partial head and went quiet, for exercising the read timeout.
+    struct StallingReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl tokio::io::AsyncRead for StallingReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            match self.chunks.pop_front() {
+                Some(mut chunk) => {
+                    let n = chunk.len().min(buf.remaining());
+                    buf.put_slice(&chunk[..n]);
+                    if n < chunk.len() {
+                        self.chunks.push_front(chunk.split_off(n));
+                    }
+                    Poll::Ready(Ok(()))
+                }
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    // #76: on read timeout the shared reader surfaces the bytes it consumed,
+    // so a caller can fall back to relaying them opaquely (the h2c path, #74)
+    // instead of silently dropping them on the floor.
+    #[tokio::test(start_paused = true)]
+    async fn read_until_timeout_returns_partial_buffer() {
+        let partial = b"PRI * HT".to_vec();
+        let mut reader = StallingReader {
+            chunks: vec![partial.clone()].into(),
+        };
+        let cfg = BridgeConfig::default();
+        let outcome = read_until(&mut reader, &cfg, "test head", |_chunk| Ok(None::<()>))
+            .await
+            .unwrap();
+        match outcome {
+            ReadHeadOutcome::Timeout(buffer) => assert_eq!(buffer, partial),
+            ReadHeadOutcome::Parsed(..) => panic!("nothing should have parsed"),
         }
     }
 
