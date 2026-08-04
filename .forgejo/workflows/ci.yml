@@ -45,7 +45,43 @@ jobs:
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
           cache-targets: false
-      - run: cargo test --all-features --locked
+      # nextest: the repo requires the serial http_edge_cases override in
+      # .config/nextest.toml (port/session isolation); plain `cargo test` loses it.
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo nextest run --all-features --locked
+      - run: cargo test --doc --all-features --locked  # nextest skips doctests
+
+  # The h2/gRPC code is behind `tls-termination`; --all-features never compiles the
+  # default build, so exercise it explicitly (clippy + tests, no features).
+  default-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo nextest run --locked
+
+  msrv:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+      - run: cargo check --all-features --locked
 
   deny:
     runs-on: ubuntu-24.04
