@@ -47,6 +47,7 @@ tls-termination = [
 ]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 tokio-stream = "0.1"
 tower = "0.4"
 axum = "0.7"
