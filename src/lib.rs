@@ -4,6 +4,7 @@
 //! to the Zenoh distributed data bus.
 
 pub mod args;
+pub(crate) mod backpressure;
 pub mod config;
 pub mod dns;
 pub mod error;

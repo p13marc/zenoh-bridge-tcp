@@ -55,3 +55,10 @@ Uses `zenoh-ext` AdvancedPublisher/Subscriber for reliability:
 - **AdvancedPublisher**: Cache + publisher detection + heartbeat
 - **AdvancedSubscriber**: History + late publisher detection + recovery
 - **Liveliness**: Client presence tracking, backend availability signals
+
+Each data subscriber (`/tx/`, `/rx/`) is drained through `src/backpressure.rs`
+(`rx_channel`): a **non-blocking** callback (`try_send`) into a bounded
+`tokio::mpsc` instead of Zenoh's default FIFO handler, whose blocking callback
+would stall the shared session's reception thread and head-of-line-block every
+client (D2). On overflow: `Stream` mode resets that one connection (byte-exact,
+never drops), `Telemetry` mode sheds the sample. Depth is `--rx-channel-capacity`.

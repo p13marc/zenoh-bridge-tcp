@@ -46,11 +46,28 @@ where
         client_id, error_key
     );
 
+    // Single abort token for the whole connection. A clean directional EOF ends
+    // only its own direction (a half-close); a hard error, external teardown, an
+    // unrecoverable sample miss, or reception backpressure (D2) trips this token
+    // to reset both directions.
+    let conn_cancel = CancellationToken::new();
+
+    // D2: drain the client's RX subscriber through a bounded, non-blocking channel
+    // so a slow client TCP writer cannot fill the default FIFO handler and block
+    // the shared session's reception thread (head-of-line-blocking every client).
+    let (rx_callback, rx_channel_rx) = crate::backpressure::rx_channel(
+        config.rx_channel_capacity,
+        config.reliability,
+        conn_cancel.clone(),
+        client_id.to_string(),
+    );
+
     // Subscribe to responses from the service for this specific client using AdvancedSubscriber
     // This allows late publisher detection and recovery of missed samples
     let sub_key = format!("{}{}/rx/{}", service_name, dns_suffix, client_id);
     let subscriber = session
         .declare_subscriber(&sub_key)
+        .callback(rx_callback)
         .history(HistoryConfig::default().detect_late_publishers())
         .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
         .subscriber_detection()
@@ -122,11 +139,6 @@ where
 
     let client_id_for_error = client_id.to_string();
 
-    // Single abort token for the whole connection. A clean directional EOF ends
-    // only its own direction (a half-close); a hard error, external teardown, or
-    // an unrecoverable sample miss trips this token to reset both directions.
-    let conn_cancel = CancellationToken::new();
-
     // Stream reliability: reset the connection on an unrecoverable sample miss
     // rather than deliver a corrupted byte stream to the client.
     if config.reliability == ReliabilityMode::Stream {
@@ -164,15 +176,18 @@ where
 
     // Direction: Zenoh -> client. An empty payload is the backend's half-close;
     // propagate it as a FIN on the client's write side and end this direction
-    // only. The reverse direction keeps flowing.
+    // only. The reverse direction keeps flowing. Samples arrive via the bounded
+    // backpressure channel (D2); the subscriber is kept alive so its callback
+    // keeps delivering.
     let z2c_client = client_id.to_string();
     let z2c_cancel = conn_cancel.clone();
+    let mut rx = rx_channel_rx;
     let zenoh_to_client = tokio::spawn(async move {
         loop {
             tokio::select! {
-                result = subscriber.recv_async() => {
-                    match result {
-                        Ok(sample) => {
+                maybe_sample = rx.recv() => {
+                    match maybe_sample {
+                        Some(sample) => {
                             let payload = sample.payload().to_bytes().to_vec();
                             if payload.is_empty() {
                                 debug!("Client {}: backend half-close -> FIN to client", z2c_client);
@@ -185,8 +200,8 @@ where
                                 break;
                             }
                         }
-                        Err(e) => {
-                            error!("Client {}: Subscriber error: {:?}", z2c_client, e);
+                        None => {
+                            // Reception channel closed (subscriber gone) — reset.
                             z2c_cancel.cancel();
                             break;
                         }
