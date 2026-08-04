@@ -18,6 +18,7 @@
 //! - **Shutdown**: each task direction has a `CancellationToken`; the outer select cancels the
 //!   peer token and waits up to `drain_timeout` before a final `.abort()` fallback.
 
+mod accept;
 mod auto;
 mod bridge;
 mod connection;
