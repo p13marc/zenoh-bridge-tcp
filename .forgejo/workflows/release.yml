@@ -24,7 +24,9 @@ jobs:
           name="${GITHUB_REPOSITORY#*/}"
           git archive --format=tar.gz --prefix="${name}-${GITHUB_REF_NAME}/" \
             -o "dist/release/${name}-${GITHUB_REF_NAME}.tar.gz" "${GITHUB_REF_NAME}"
-          cargo build --release --locked
+          # Ship a fully-featured binary: tls-termination enables --https-terminate
+          # and terminated h2/gRPC routing (rustls→ring, no extra system deps).
+          cargo build --release --locked --features tls-termination
           cp "target/release/${name}" "dist/release/${name}-${GITHUB_REF_NAME}-linux-x86_64"
           (cd dist/release && sha256sum * > SHA256SUMS)
       - uses: https://data.forgejo.org/actions/forgejo-release@v2
