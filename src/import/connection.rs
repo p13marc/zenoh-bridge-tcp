@@ -226,6 +226,24 @@ where
         parser.feed_initiator(chunk, Timestamp::new(0, 0), &mut msgs);
         for msg in &msgs {
             if let TlsMessage::ClientHello(ch) = msg {
+                // #80: surface the offered ALPN — it answers "is this
+                // passthrough connection h2/gRPC or h1?" without decrypting
+                // anything. Guess via the first offered token (client
+                // preference order, RFC 7301 §3.1).
+                if !ch.alpn.is_empty() {
+                    let guess = ch
+                        .alpn
+                        .first()
+                        .and_then(|t| flowscope::app_proto::classify_alpn_token(t))
+                        .map(|p| p.as_str())
+                        .unwrap_or("unknown");
+                    info!(
+                        sni = ch.sni().unwrap_or("-"),
+                        alpn = ?ch.alpn,
+                        proto_guess = %guess,
+                        "TLS ClientHello ALPN offer"
+                    );
+                }
                 return match ch.sni() {
                     Some(sni) => Ok(Some(normalize_dns(sni))),
                     None => Err(anyhow::anyhow!("TLS ClientHello has no SNI extension")),
