@@ -7,6 +7,7 @@ use flowscope::SessionParser;
 use flowscope::Timestamp;
 use flowscope::classify::{Classify, WireProtocol, classify_first_bytes};
 use flowscope::http::{HttpEvent, HttpProxyParser};
+#[cfg(feature = "tls-termination")]
 use flowscope::http2::{
     GrpcStatus, Http2Config, Http2Event, Http2Parser, StreamHead, grpc_call, grpc_status,
     grpc_status_of,
@@ -16,7 +17,9 @@ use flowscope::{FlowSide, http::RequestHead};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+#[cfg(feature = "tls-termination")]
+use tracing::debug;
+use tracing::{info, warn};
 use zenoh::Session;
 
 /// Handle a single import connection
@@ -331,6 +334,7 @@ where
 ///
 /// `:authority` is the h2 equivalent of the `Host` header (RFC 9113 §8.3.1);
 /// [`normalize_dns`] collapses default 80/443 ports so keys match the export side.
+#[cfg(feature = "tls-termination")]
 fn h2_routing_key(head: &StreamHead) -> Result<String> {
     let authority = head
         .authority()
@@ -355,6 +359,7 @@ fn h2_routing_key(head: &StreamHead) -> Result<String> {
 /// The connection is routed by the first stream's authority; its multiplexed
 /// streams are then relayed opaquely (a single-authority h2 proxy, not a
 /// per-stream demux). If the first head is a gRPC call it is logged.
+#[cfg(feature = "tls-termination")]
 pub(super) async fn read_h2_head<R>(
     stream: &mut R,
     config: &BridgeConfig,
@@ -436,11 +441,13 @@ where
 
 /// Scans a terminated-h2 **response** (Responder) byte stream for each stream's
 /// gRPC completion status (#62), read-only.
+#[cfg(feature = "tls-termination")]
 struct GrpcStatusScanner {
     parser: Http2Parser,
     seen: std::collections::HashSet<u32>,
 }
 
+#[cfg(feature = "tls-termination")]
 impl GrpcStatusScanner {
     fn new() -> Self {
         Self {
@@ -486,6 +493,7 @@ impl GrpcStatusScanner {
 /// connection that surfaces gRPC completion status (#62): each call is recorded
 /// to the `zbridge_grpc_status_total{service,code}` metric and logged (a non-OK
 /// code at `warn`, since a failed gRPC call still carries HTTP 200).
+#[cfg(feature = "tls-termination")]
 pub(super) fn h2_response_tap(service: String) -> super::bridge::ResponseTap {
     let mut scanner = GrpcStatusScanner::new();
     Box::new(move |chunk: &[u8]| {
@@ -691,6 +699,7 @@ mod tests {
 
     /// Build a real on-the-wire h2 client request (preface + a HEADERS frame)
     /// via flowscope's own HPACK encoder, so the test exercises the actual parse.
+    #[cfg(feature = "tls-termination")]
     fn build_h2_request(authority: &str, path: &str, content_type: Option<&str>) -> Vec<u8> {
         use flowscope::http2::{HpackEncoder, PREFACE, write_headers};
 
@@ -722,11 +731,13 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "tls-termination")]
     fn chunkify(data: &[u8], size: usize) -> Vec<Vec<u8>> {
         data.chunks(size).map(|c| c.to_vec()).collect()
     }
 
     #[tokio::test]
+    #[cfg(feature = "tls-termination")]
     async fn read_h2_head_routes_by_authority() {
         let req = build_h2_request(
             "api.example.com",
@@ -742,6 +753,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "tls-termination")]
     async fn read_h2_head_reassembles_split_frames() {
         // Preface + HEADERS split into tiny 5-byte segments must still reassemble.
         let req = build_h2_request("grpc.internal:8443", "/svc/m", None);
@@ -753,6 +765,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "tls-termination")]
     async fn read_h2_head_default_port_normalized() {
         // :443 collapses just like the Host path, so keys match the export side.
         let req = build_h2_request("svc.example:443", "/svc/m", None);
@@ -765,6 +778,7 @@ mod tests {
     // --- gRPC status trailer surfacing (#62) ---
 
     /// Encode a response HEADERS/Trailers field block into HEADERS frame(s).
+    #[cfg(feature = "tls-termination")]
     fn h2_headers_frame(fields: &[(&[u8], &[u8])], end_stream: bool) -> Vec<u8> {
         use flowscope::http2::{HpackEncoder, write_headers};
         let owned: Vec<(Bytes, Bytes)> = fields
@@ -775,6 +789,7 @@ mod tests {
         write_headers(1, &block, end_stream, 16_384).expect("framable")
     }
 
+    #[cfg(feature = "tls-termination")]
     fn h2_data_frame(payload: &[u8], end_stream: bool) -> Vec<u8> {
         let len = payload.len();
         let mut f = vec![
@@ -789,6 +804,7 @@ mod tests {
         f
     }
 
+    #[cfg(feature = "tls-termination")]
     fn scan(bytes: &[&[u8]]) -> Vec<(u32, u32)> {
         let mut scanner = GrpcStatusScanner::new();
         let mut got = Vec::new();
@@ -799,6 +815,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tls-termination")]
     fn grpc_status_scanner_reads_trailers_only() {
         // A gRPC error is commonly a single HEADERS block (END_STREAM) with the
         // status and no body — flowscope reports it as a Head, so grpc_status_of.
@@ -814,6 +831,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tls-termination")]
     fn grpc_status_scanner_reads_headers_data_trailers() {
         // The full-success shape: HEADERS(200) + DATA + Trailers(grpc-status: 0).
         let head = h2_headers_frame(
@@ -827,6 +845,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tls-termination")]
     fn grpc_status_scanner_reassembles_split_stream() {
         let resp = h2_headers_frame(
             &[

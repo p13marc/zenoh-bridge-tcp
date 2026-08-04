@@ -160,6 +160,90 @@ async fn test_multiroute_single_request() {
     import_task.abort();
 }
 
+/// #63: a multiroute request moves the per-service byte + connection metrics.
+///
+/// The import runs in-process, so the global metrics registry is readable here;
+/// nextest isolates each test in its own process, so the counters for this
+/// (unique) service name are clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_byte_metrics() {
+    use std::sync::atomic::Ordering;
+
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
+    let service = "mr-metrics";
+
+    let backend_addr = start_backend("backend-m").await;
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let bc = config.clone();
+    let export_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_http_export_mode(
+            s1,
+            &format!("{service}/host-m.test/{backend_addr}"),
+            bc,
+            t1,
+        )
+        .await
+        .unwrap();
+    });
+    sleep(Duration::from_millis(500)).await;
+
+    let import_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let import_addr = import_listener.local_addr().unwrap();
+    drop(import_listener);
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let bc = config.clone();
+    let import_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
+            s2,
+            &format!("{service}/{import_addr}"),
+            bc,
+            t2,
+        )
+        .await
+        .unwrap();
+    });
+    sleep(Duration::from_secs(1)).await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let resp = client
+        .get(format!("http://{}/", import_addr))
+        .header("Host", "host-m.test")
+        .header("Connection", "close")
+        .send()
+        .await
+        .expect("Failed to send request");
+    assert_eq!(resp.status(), 200);
+    let _ = resp.text().await.unwrap();
+
+    let c = zenoh_bridge_tcp::metrics::metrics().service(service);
+    assert!(
+        c.total.load(Ordering::Relaxed) >= 1,
+        "connections_total should be >= 1"
+    );
+    assert!(
+        c.bytes_up.load(Ordering::Relaxed) > 0,
+        "bytes_up should count the forwarded request head"
+    );
+    assert!(
+        c.bytes_down.load(Ordering::Relaxed) > 0,
+        "bytes_down should count the relayed response"
+    );
+
+    shutdown_token.cancel();
+    export_task.abort();
+    import_task.abort();
+}
+
 /// Test that multiple requests on a persistent connection can route to different backends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_multiroute_persistent_connection_switches_hosts() {
