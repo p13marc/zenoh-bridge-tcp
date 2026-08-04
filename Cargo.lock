@@ -987,9 +987,9 @@ dependencies = [
 
 [[package]]
 name = "flowscope"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "499c5c73a9e9fe45f39487904acfa51314b021eadaee71c2ad801145ae542b0b"
+checksum = "0fe8b520901abf8ea6a07ffd318c53a8d959df9283e61b4a5bde0553e305f66a"
 dependencies = [
  "ahash",
  "arrayvec",

@@ -325,6 +325,15 @@ where
                 reason.as_str()
             ));
         }
+        // flowscope 0.24: push returns 0 once a protocol switch tunnelled the
+        // connection. A switch before any routable request head means this
+        // reader cannot make progress — fail now with the reason, instead of
+        // accumulating refused bytes until the size cap trips.
+        if parser.is_tunnelled() {
+            return Err(anyhow::anyhow!(
+                "connection switched protocols before a routable request head"
+            ));
+        }
         Ok(None)
     })
     .await?;
@@ -516,14 +525,15 @@ pub(super) fn peek_http_head(peek: &[u8]) -> Option<RequestHead> {
     None
 }
 
-/// Whether a request head asks for a WebSocket upgrade.
-///
-/// Single-header check for now; RFC-strict semantics (Connection token,
-/// comma lists, Sec-WebSocket-*) arrive with flowscope 0.24's
-/// `RequestHead::is_websocket_upgrade` (#77).
+/// Whether a request head asks for a WebSocket upgrade, per RFC 9110 §7.8 +
+/// RFC 6455 §4.1 (flowscope 0.24, #77): the `Connection` header must name the
+/// `upgrade` option, `websocket` must appear among the offered tokens (comma
+/// lists and duplicate header instances handled), the method must be GET, and
+/// `Sec-WebSocket-Key`/`-Version` must be present. A POST with a stray
+/// `Upgrade: websocket`, or an `Upgrade` header that `Connection` does not
+/// name, now correctly routes as plain HTTP.
 pub(super) fn head_is_websocket_upgrade(head: &RequestHead) -> bool {
-    head.header("upgrade")
-        .is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"))
+    head.is_websocket_upgrade()
 }
 
 /// Query whether a backend has announced `{service}/{dns}/available`, bounded
@@ -616,6 +626,31 @@ mod tests {
     // #76: on read timeout the shared reader surfaces the bytes it consumed,
     // so a caller can fall back to relaying them opaquely (the h2c path, #74)
     // instead of silently dropping them on the floor.
+    // #77: WS-upgrade detection delegates to flowscope 0.24's RFC-strict
+    // check — the shapes the old single-header check got wrong must now
+    // resolve correctly.
+    #[test]
+    fn ws_upgrade_detection_is_rfc_strict() {
+        let ws = |wire: &[u8]| head_is_websocket_upgrade(&peek_http_head(wire).unwrap());
+
+        // Comma-listed Connection token + case variants: an upgrade.
+        assert!(ws(
+            b"GET /c HTTP/1.1\r\nHost: a\r\nConnection: keep-alive, Upgrade\r\nUpgrade: WebSocket\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ));
+        // POST with full WS headers: not the RFC 6455 handshake shape.
+        assert!(!ws(
+            b"POST /c HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\nContent-Length: 0\r\n\r\n"
+        ));
+        // Upgrade header the Connection header does not name: not an offer.
+        assert!(!ws(
+            b"GET /c HTTP/1.1\r\nHost: a\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ));
+        // Missing Sec-WebSocket-Key: not a handshake.
+        assert!(!ws(
+            b"GET /c HTTP/1.1\r\nHost: a\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn read_until_timeout_returns_partial_buffer() {
         let partial = b"PRI * HT".to_vec();
