@@ -3,7 +3,7 @@
 //! This bridge allows TCP services to be exposed over Zenoh and vice versa.
 //! Supports multiple simultaneous imports and exports.
 
-use zenoh_bridge_tcp::{args, config, export, import};
+use zenoh_bridge_tcp::{args, config, export, import, metrics};
 
 use anyhow::Result;
 use args::Args;
@@ -121,6 +121,17 @@ async fn main() -> Result<()> {
 
     // Create a global cancellation token
     let shutdown_token = CancellationToken::new();
+
+    // Spawn the health/metrics server if requested (G7). Liveness is up
+    // immediately; readiness is flipped on once all bridge tasks are started.
+    if let Some(metrics_addr) = args.metrics_addr {
+        let token = shutdown_token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = metrics::serve(metrics_addr, token).await {
+                tracing::error!(addr = %metrics_addr, error = %e, "Metrics server failed to bind");
+            }
+        });
+    }
 
     // Spawn signal handler
     let signal_token = shutdown_token.clone();
@@ -321,6 +332,9 @@ async fn main() -> Result<()> {
         https_terminates = https_terminate_count,
         "All bridge tasks started"
     );
+
+    // Bridges are up: report readiness on /readyz.
+    metrics::metrics().set_ready(true);
 
     let drain_timeout = tokio::time::Duration::from_secs(args.drain_timeout);
 

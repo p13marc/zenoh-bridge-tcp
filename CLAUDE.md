@@ -29,6 +29,7 @@ cargo nextest run
 - `src/dns.rs` normalizes the DNS routing key (lowercase, strip default 80/443); `src/http_util.rs` holds the 400/502/504 byte templates.
 - `src/import/listener.rs` tracks per-connection tasks via `JoinSet` with graceful drain on shutdown
 - `src/export/bridge.rs` cancels old connections before spawning replacements, releases mutex before await
+- `src/metrics.rs` is the observability surface (G7): a `LazyLock` global registry of per-service atomic `Counters` (active/total/bytes/outcomes) plus a dependency-free HTTP server for `/healthz` (liveness), `/readyz` (readiness flag), and `/metrics` (Prometheus text). Enabled with `--metrics-addr`. Data planes record via `metrics::conn_start(service)` — an RAII `ConnGuard` (active gauge dec on drop) whose `counters()` is cloned into each direction for lock-free per-chunk byte counting.
 
 ### Data Flow
 

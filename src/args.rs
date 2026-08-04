@@ -2,6 +2,7 @@
 
 use crate::config::BridgeConfig;
 use clap::Parser;
+use std::net::SocketAddr;
 
 /// Command-line arguments for the Zenoh TCP Bridge
 #[derive(Parser, Debug)]
@@ -146,6 +147,11 @@ pub struct Args {
     #[arg(long, default_value = "256")]
     pub rx_channel_capacity: usize,
 
+    /// Expose /healthz, /readyz, and /metrics on this address (e.g. 0.0.0.0:9100).
+    /// Disabled when unset.
+    #[arg(long)]
+    pub metrics_addr: Option<SocketAddr>,
+
     /// Log level: trace, debug, info, warn, error
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -188,6 +194,7 @@ impl Default for Args {
             availability_timeout_ms: 1000,
             max_response_size: 10 * 1024 * 1024,
             rx_channel_capacity: 256,
+            metrics_addr: None,
             log_level: "info".to_string(),
             log_format: "pretty".to_string(),
         }
