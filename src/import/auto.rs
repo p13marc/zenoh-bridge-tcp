@@ -100,10 +100,11 @@ async fn handle_auto_import_connection(
             handle_auto_http_connection(session, stream, service_name, client_id, config).await
         }
         WireProtocol::Http2Preface => {
-            // Prior-knowledge HTTP/2 has no routing path yet (flowscope Phase C, #50).
-            Err(anyhow::anyhow!(
-                "HTTP/2 prior-knowledge connection is not supported in auto-import mode"
-            ))
+            // Prior-knowledge HTTP/2 (h2c — plaintext gRPC's wire form): route
+            // by the first stream's :authority, then relay the multiplexed
+            // streams opaquely (#74). Same single-authority semantics as the
+            // terminated-h2 path.
+            handle_h2c_connection(session, stream, service_name, client_id, config).await
         }
         // SSH, raw, or an unrecognized first-byte class -> opaque passthrough,
         // no DNS routing.
@@ -119,6 +120,74 @@ async fn handle_auto_import_connection(
             .await
         }
     }
+}
+
+/// Handle a prior-knowledge HTTP/2 (h2c) connection: peek the first request
+/// stream's `:authority`, mint the routing key, and relay everything verbatim.
+///
+/// The classifier saw the client preface, so the parser runs with
+/// `require_preface = true` (RFC 9113 §3.4 strictness). One trap, handled per
+/// the same RFC: a conformant client may send preface+SETTINGS and then wait
+/// for the *server's* SETTINGS before opening a stream — which never comes,
+/// because the bridge writes nothing during the peek. On head-read timeout the
+/// connection therefore falls back to an opaque relay of the bytes consumed so
+/// far (routing un-keyed, like raw), mirroring the `NeedMore -> Raw`
+/// classification fallback, instead of dropping the client.
+async fn handle_h2c_connection(
+    session: Arc<Session>,
+    mut stream: TcpStream,
+    service_name: &str,
+    client_id: &str,
+    config: Arc<BridgeConfig>,
+) -> Result<()> {
+    use super::connection::ReadHeadOutcome;
+
+    let (dns, buffer) = match super::connection::read_h2_head(&mut stream, &config, true).await? {
+        ReadHeadOutcome::Parsed(dns, buffer) => {
+            info!(
+                client_id = %client_id,
+                dns = %dns,
+                "h2c routing by :authority"
+            );
+            if !super::connection::backend_available(&session, service_name, &dns, &config).await? {
+                // No h2-level error is possible without becoming an h2
+                // endpoint; close, and the client reports a connection error.
+                return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+            }
+            (Some(dns), buffer)
+        }
+        ReadHeadOutcome::Timeout(partial) => {
+            info!(
+                client_id = %client_id,
+                consumed = partial.len(),
+                "h2c client sent no request head; falling back to opaque relay"
+            );
+            (None, partial)
+        }
+    };
+
+    let (tcp_reader, tcp_writer) = stream.into_split();
+    let reader = crate::transport::TcpReader::new(tcp_reader, config.buffer_size);
+    let writer = crate::transport::TcpWriter::new(tcp_writer);
+
+    // Surface gRPC status trailers from the response stream (#62) only when
+    // the connection actually routed as h2.
+    let response_tap = dns
+        .is_some()
+        .then(|| super::connection::h2_response_tap(service_name.to_string()));
+
+    super::bridge::bridge_import_connection(
+        session,
+        reader,
+        writer,
+        service_name,
+        client_id,
+        dns.as_deref(),
+        Some(buffer),
+        config,
+        response_tap,
+    )
+    .await
 }
 
 /// Handle an auto-detected HTTP connection, which might be a WebSocket upgrade.

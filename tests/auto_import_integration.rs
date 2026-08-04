@@ -277,3 +277,165 @@ async fn test_auto_import_cli_starts() -> Result<()> {
 
     Ok(())
 }
+
+/// A plaintext prior-knowledge HTTP/2 backend answering every request 200
+/// with a fixed body.
+async fn start_h2c_backend() -> Result<std::net::SocketAddr> {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|_req| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                        http_body_util::Full::new(bytes::Bytes::from_static(b"h2c-ok")),
+                    ))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    Ok(addr)
+}
+
+/// #74: a plaintext prior-knowledge HTTP/2 client (h2c — the wire form of
+/// plaintext gRPC) through the auto-detect door, routed by the first stream's
+/// `:authority`, relayed to an h2c backend. No TLS anywhere; runs in the
+/// default build.
+#[tokio::test]
+async fn test_auto_import_h2c_routes_by_authority() -> Result<()> {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let backend_addr = start_h2c_backend().await?;
+    let authority = "h2c.test";
+    let service = common::unique_service_name("h2cauto");
+
+    let export_spec = format!("{service}@{authority}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Prior-knowledge h2 straight over TCP.
+    let tcp = TcpStream::connect(import_addr).await?;
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp)).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = hyper::Request::builder()
+        .uri(format!("http://{authority}/pkg.Svc/Method"))
+        .body(Empty::<bytes::Bytes>::new())?;
+    let resp = timeout(Duration::from_secs(10), sender.send_request(req)).await??;
+    assert_eq!(resp.status(), 200, "h2c request should route and 200");
+    let body = resp.into_body().collect().await?.to_bytes();
+    assert_eq!(&body[..], b"h2c-ok");
+
+    Ok(())
+}
+
+/// #74 + #62: a plaintext gRPC call's `grpc-status` trailer is surfaced on the
+/// importer's /metrics — the response tap now runs in the default build.
+#[tokio::test]
+async fn test_auto_import_h2c_grpc_status_surfaced() -> Result<()> {
+    use http_body_util::{Empty, StreamBody};
+    use hyper::body::Frame;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    // Backend returns gRPC status 7 (PERMISSION_DENIED) in trailers.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_addr = listener.local_addr()?;
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| async move {
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("7"));
+                    let frames: Vec<Result<Frame<bytes::Bytes>, std::convert::Infallible>> = vec![
+                        Ok(Frame::data(bytes::Bytes::from_static(
+                            b"\x00\x00\x00\x00\x00",
+                        ))),
+                        Ok(Frame::trailers(trailers)),
+                    ];
+                    let body = StreamBody::new(futures::stream::iter(frames));
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let authority = "grpc-plain.test";
+    let service = common::unique_service_name("h2cgrpc");
+
+    let export_spec = format!("{service}@{authority}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let metrics_port = common::PortGuard::new();
+    let metrics_addr = metrics_port.release();
+    let listen_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&[
+        "--listen",
+        &listen_spec,
+        "--metrics-addr",
+        &metrics_addr.to_string(),
+    ])
+    .await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let tcp = TcpStream::connect(import_addr).await?;
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tcp)).await?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = hyper::Request::builder()
+        .uri(format!("http://{authority}/pkg.Svc/Method"))
+        .body(Empty::<bytes::Bytes>::new())?;
+    let resp = timeout(Duration::from_secs(10), sender.send_request(req)).await??;
+    assert_eq!(resp.status(), 200);
+    let _ = resp.into_body();
+
+    let needle = format!("zbridge_grpc_status_total{{service=\"{service}\",code=\"7\"}} ");
+    common::wait_for(
+        || {
+            let url = format!("http://{metrics_addr}/metrics");
+            let needle = needle.clone();
+            async move {
+                match reqwest::get(url).await {
+                    Ok(r) => r.text().await.map(|b| b.contains(&needle)).unwrap_or(false),
+                    Err(_) => false,
+                }
+            }
+        },
+        Duration::from_secs(10),
+        "plaintext grpc-status metric surfaced",
+    )
+    .await?;
+
+    Ok(())
+}

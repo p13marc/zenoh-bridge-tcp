@@ -79,14 +79,25 @@ async fn handle_tls_terminated_connection(
     // stream's `:authority`, otherwise the HTTP/1.1 `Host`. The bytes read are
     // kept and relayed verbatim as the connection's initial payload.
     let (dns, buffer) = if is_h2 {
-        super::connection::read_h2_head(&mut tls_reader, &config)
+        // ALPN pinned h2; tolerate a missing preface (require_preface=false).
+        // A timeout here is fatal: the terminated path has no opaque fallback
+        // that would make sense — the client negotiated h2 and went silent.
+        match super::connection::read_h2_head(&mut tls_reader, &config, false)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to parse HTTP/2 request after TLS termination: {}",
                     e
                 )
-            })?
+            })? {
+            super::connection::ReadHeadOutcome::Parsed(dns, buffer) => (dns, buffer),
+            super::connection::ReadHeadOutcome::Timeout(partial) => {
+                return Err(anyhow::anyhow!(
+                    "timeout reading HTTP/2 head after TLS termination ({} bytes consumed)",
+                    partial.len()
+                ));
+            }
+        }
     } else {
         super::connection::read_http_head(&mut tls_reader, &config)
             .await
