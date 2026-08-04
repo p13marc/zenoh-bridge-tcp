@@ -37,7 +37,7 @@ async fn start_backend(backend_id: &str) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let _ = axum::serve(listener, app).await; // ignore shutdown result to avoid a teardown panic/abort
     });
     sleep(Duration::from_millis(200)).await;
     addr
@@ -434,7 +434,7 @@ async fn start_echo_backend() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let _ = axum::serve(listener, app).await; // ignore shutdown result to avoid a teardown panic/abort
     });
     sleep(Duration::from_millis(200)).await;
     addr

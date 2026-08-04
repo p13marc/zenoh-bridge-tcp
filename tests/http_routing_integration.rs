@@ -69,7 +69,7 @@ async fn start_http_backend(backend_id: &str) -> SocketAddr {
     println!("Backend '{}' listening on {}", backend_id, addr);
 
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let _ = axum::serve(listener, app).await; // ignore shutdown result to avoid a teardown panic/abort
     });
 
     sleep(Duration::from_millis(200)).await;
