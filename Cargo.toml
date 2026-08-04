@@ -22,7 +22,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-flowscope = { version = "0.23", default-features = false, features = ["http", "http2", "tls"] }
+flowscope = { version = "0.23", default-features = false, features = ["http", "tls"] }
 bytes = "1"
 thiserror = "1"
 tokio-tungstenite = "0.26"
@@ -35,7 +35,14 @@ rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
 [features]
-tls-termination = ["dep:tokio-rustls", "dep:rustls", "dep:rustls-pemfile"]
+# TLS termination also enables flowscope's http2 parser: terminated h2/gRPC
+# routing by :authority (Phase C) is only reachable through the terminate path.
+tls-termination = [
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "flowscope/http2",
+]
 
 [dev-dependencies]
 tokio-stream = "0.1"

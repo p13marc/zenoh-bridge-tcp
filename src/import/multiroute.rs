@@ -179,10 +179,11 @@ async fn handle_multiroute_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
-    // Metrics (G7): count the connection; the guard decrements the active gauge
-    // on every exit path. Per-request byte accounting for multiroute is a
-    // follow-up — the counters here are connection-level (active/total).
-    let _conn_metrics = crate::metrics::conn_start(service_name);
+    // Metrics (G7): the guard counts the connection and decrements the active
+    // gauge on every exit path; `svc` is its per-service counters, into which
+    // run_exchange records relayed bytes per direction (#63).
+    let conn_metrics = crate::metrics::conn_start(service_name);
+    let svc = conn_metrics.counters();
 
     let mut parser = HttpProxyParser::new();
     let mut events: VecDeque<HttpEvent> = VecDeque::new();
@@ -257,6 +258,7 @@ async fn handle_multiroute_connection(
             service_name,
             &request_id,
             &config,
+            &svc,
         )
         .await?;
 
@@ -417,6 +419,7 @@ async fn run_exchange(
     service_name: &str,
     request_id: &str,
     config: &BridgeConfig,
+    svc: &Arc<crate::metrics::Counters>,
 ) -> Result<ExchangeOutcome> {
     // Per-request Zenoh entities.
     let sub_request_id = format!("{}_{}", request_id, uuid::Uuid::new_v4().as_simple());
@@ -455,6 +458,7 @@ async fn run_exchange(
         .put(&head.raw[..])
         .await
         .map_err(|e| anyhow::anyhow!("Failed to publish request head: {}", e))?;
+    svc.add_up(head.raw.len());
 
     let mut request_done = false;
     let mut response_done = false;
@@ -495,6 +499,7 @@ async fn run_exchange(
                         .put(&raw[..])
                         .await
                         .map_err(|e| anyhow::anyhow!("Failed to publish request body: {}", e))?;
+                    svc.add_up(raw.len());
                 }
                 HttpEvent::End {
                     dir: FlowSide::Initiator,
@@ -509,6 +514,7 @@ async fn run_exchange(
                 HttpEvent::ResponseHead(rh) => {
                     stream.write_all(&rh.raw).await?;
                     bytes_written += rh.raw.len();
+                    svc.add_down(rh.raw.len());
                 }
                 HttpEvent::Body {
                     dir: FlowSide::Responder,
@@ -517,6 +523,7 @@ async fn run_exchange(
                 } => {
                     stream.write_all(&raw).await?;
                     bytes_written += raw.len();
+                    svc.add_down(raw.len());
                     if bytes_written > config.max_response_size {
                         warn!(request_id = %request_id, "Response exceeded max size");
                         keep_alive = false;
@@ -531,6 +538,7 @@ async fn run_exchange(
                 } => {
                     stream.write_all(&raw).await?;
                     bytes_written += raw.len();
+                    svc.add_down(raw.len());
                 }
                 HttpEvent::End {
                     dir: FlowSide::Responder,
@@ -631,6 +639,7 @@ async fn run_exchange(
                             if tx_publisher.put(&tmp[..n]).await.is_err() {
                                 break;
                             }
+                            svc.add_up(n);
                         }
                         Err(_) => break,
                     }
@@ -642,6 +651,7 @@ async fn run_exchange(
                             if payload.is_empty() || stream.write_all(&payload).await.is_err() {
                                 break;
                             }
+                            svc.add_down(payload.len());
                         }
                         Err(_) => break,
                     }
