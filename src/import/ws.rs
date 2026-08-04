@@ -2,10 +2,8 @@ use crate::config::BridgeConfig;
 use anyhow::Result;
 use futures_util::StreamExt;
 use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio::task::JoinSet;
+use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, info_span};
 use zenoh::Session;
 
 /// Run WebSocket import mode for a single service
@@ -22,119 +20,47 @@ pub(super) async fn run_ws_import_mode(
 ) -> Result<()> {
     let (service_name, listen_addr) = super::parse_import_spec(import_spec)?;
 
-    info!(
-        mode = "ws_import",
-        service = %service_name,
-        listen_addr = %listen_addr,
-        "Starting WebSocket import bridge"
-    );
+    super::accept::run_accept_loop(
+        super::accept::AcceptLoopCfg {
+            mode: "ws_import",
+            client_id_prefix: "wsclient_",
+        },
+        session,
+        service_name,
+        listen_addr,
+        config,
+        shutdown_token,
+        handle_ws_import_connection,
+    )
+    .await
+}
 
-    // Start TCP listener
-    let listener = TcpListener::bind(listen_addr)
+/// Upgrade the connection to WebSocket, then bridge it over Zenoh.
+async fn handle_ws_import_connection(
+    session: Arc<Session>,
+    stream: TcpStream,
+    service_name: String,
+    client_id: String,
+    config: Arc<BridgeConfig>,
+) -> Result<()> {
+    let ws_stream = tokio_tungstenite::accept_async(stream)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", listen_addr, e))?;
+        .map_err(|e| anyhow::anyhow!("WebSocket handshake failed: {}", e))?;
 
-    info!(listen_addr = %listen_addr, service = %service_name, "WebSocket import bridge ready");
+    let (ws_sender, ws_receiver) = ws_stream.split();
+    let reader = crate::transport::WsReader::new(ws_receiver);
+    let writer = crate::transport::WsWriter::new(ws_sender);
 
-    let mut tasks = JoinSet::new();
-
-    // Cap concurrent connections with backpressure (D3).
-    let conn_limit = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
-
-    // Accept connections
-    loop {
-        let permit = tokio::select! {
-            p = conn_limit.clone().acquire_owned() => {
-                p.expect("connection semaphore is never closed")
-            }
-            _ = shutdown_token.cancelled() => {
-                info!(service = %service_name, "WebSocket import bridge shutting down, no new connections");
-                break;
-            }
-        };
-
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, addr)) => {
-                        let client_id = format!("wsclient_{}", uuid::Uuid::new_v4().as_simple());
-                        info!(client_id = %client_id, remote_addr = %addr, "New WebSocket connection");
-
-                        let session = session.clone();
-                        let service_name = service_name.clone();
-                        let client_id_clone = client_id.clone();
-                        let config = config.clone();
-
-                        let span = info_span!(
-                            "ws_connection",
-                            client_id = %client_id,
-                            service = %service_name,
-                            remote_addr = %addr,
-                            mode = "websocket"
-                        );
-
-                        tasks.spawn(
-                            async move {
-                                let _permit = permit;
-                                // Perform WebSocket upgrade
-                                match tokio_tungstenite::accept_async(stream).await {
-                                    Ok(ws_stream) => {
-                                        let (ws_sender, ws_receiver) = ws_stream.split();
-                                        let reader = crate::transport::WsReader::new(ws_receiver);
-                                        let writer = crate::transport::WsWriter::new(ws_sender);
-                                        if let Err(e) = super::bridge::bridge_import_connection(
-                                            session,
-                                            reader,
-                                            writer,
-                                            &service_name,
-                                            &client_id_clone,
-                                            "",
-                                            None,
-                                            config,
-                                            None,
-                                        )
-                                        .await
-                                        {
-                                            error!(error = %e, "WebSocket connection error");
-                                        }
-                                        info!("WebSocket connection closed");
-                                    }
-                                    Err(e) => {
-                                        error!(error = %e, "WebSocket handshake failed");
-                                    }
-                                }
-                            }
-                            .instrument(span),
-                        );
-                    }
-                    Err(e) => {
-                        drop(permit);
-                        error!("Failed to accept connection: {:?}", e);
-                    }
-                }
-            }
-            reaped = tasks.join_next(), if !tasks.is_empty() => {
-                // D5: reap completed connection tasks promptly, even while the
-                // listener is otherwise idle waiting for the next accept.
-                if let Some(Err(e)) = reaped {
-                    error!(error = %e, "Connection task panicked");
-                }
-                drop(permit);
-                continue;
-            }
-            _ = shutdown_token.cancelled() => {
-                drop(permit);
-                info!(service = %service_name, "WebSocket import bridge shutting down, no new connections");
-                break;
-            }
-        }
-
-        // Reap completed tasks
-        while tasks.try_join_next().is_some() {}
-    }
-
-    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
-
-    info!(service = %service_name, "WebSocket import bridge stopped");
-    Ok(())
+    super::bridge::bridge_import_connection(
+        session,
+        reader,
+        writer,
+        &service_name,
+        &client_id,
+        "",
+        None,
+        config,
+        None,
+    )
+    .await
 }
