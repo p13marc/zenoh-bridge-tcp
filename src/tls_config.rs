@@ -56,10 +56,18 @@ pub fn load_tls_config<P1: AsRef<Path>, P2: AsRef<Path>>(
             anyhow::anyhow!("No private key found in '{}'", key_path.as_ref().display())
         })?;
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
+
+    // ALPN (#46): the terminated path speaks HTTP/1.1 only — after decryption the
+    // stream is framed by the flowscope `HttpProxyParser` (h2 termination is
+    // flowscope Phase C, #50). Advertise only `http/1.1` so a client that offers
+    // it negotiates cleanly, and an h2-only client fails the handshake with a
+    // `no_application_protocol` alert instead of negotiating h2 and sending a
+    // `PRI * HTTP/2.0` preface that would mis-parse as HTTP/1.1.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
@@ -121,6 +129,26 @@ mod tests {
         );
 
         std::fs::remove_file(&cert_path).unwrap();
+    }
+
+    #[test]
+    fn test_load_tls_config_sets_http1_alpn() {
+        // #46: the terminated path is HTTP/1.1-only, so the config must advertise
+        // exactly `http/1.1` (not h2) — an h2-only client then fails the handshake
+        // rather than negotiating h2 and mis-parsing a `PRI` preface as HTTP/1.1.
+        install_crypto_provider();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = std::env::temp_dir();
+        let cert_path = dir.join("test_alpn_cert.pem");
+        let key_path = dir.join("test_alpn_key.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let config = load_tls_config(&cert_path, &key_path).unwrap();
+        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+
+        std::fs::remove_file(&cert_path).unwrap();
+        std::fs::remove_file(&key_path).unwrap();
     }
 
     #[test]
