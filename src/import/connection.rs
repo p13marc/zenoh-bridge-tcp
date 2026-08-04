@@ -7,6 +7,7 @@ use flowscope::SessionParser;
 use flowscope::Timestamp;
 use flowscope::classify::{Classify, WireProtocol, classify_first_bytes};
 use flowscope::http::{HttpEvent, HttpProxyParser};
+use flowscope::http2::{Http2Config, Http2Event, Http2Parser, StreamHead, grpc_call};
 use flowscope::tls::{TlsMessage, TlsParser};
 use flowscope::{FlowSide, http::RequestHead};
 use std::sync::Arc;
@@ -322,6 +323,113 @@ where
     }
 }
 
+/// Resolve the DNS routing key from an HTTP/2 request head's `:authority`.
+///
+/// `:authority` is the h2 equivalent of the `Host` header (RFC 9113 §8.3.1);
+/// [`normalize_dns`] collapses default 80/443 ports so keys match the export side.
+fn h2_routing_key(head: &StreamHead) -> Result<String> {
+    let authority = head
+        .authority()
+        .ok_or_else(|| anyhow::anyhow!("HTTP/2 request has no :authority"))?;
+    let dns = normalize_dns(authority);
+    if dns.is_empty() {
+        return Err(anyhow::anyhow!("HTTP/2 request has an empty :authority"));
+    }
+    Ok(dns)
+}
+
+/// Read a terminated HTTP/2 connection's first request head and resolve its DNS
+/// routing key from `:authority` (Phase C, #50).
+///
+/// Used after `--https-terminate` negotiates ALPN `h2`. The decrypted client
+/// bytes are streamed into flowscope's [`Http2Parser`] purely to *peek* the first
+/// request stream's `:authority`; the parser is read-only — every byte read is
+/// also kept in `buffer` and relayed to the backend verbatim, exactly as the
+/// HTTP/1.1 terminate path does. `require_preface = false` tolerates a client
+/// that was pinned to h2 by ALPN yet still consumes the preface when present.
+///
+/// The connection is routed by the first stream's authority; its multiplexed
+/// streams are then relayed opaquely (a single-authority h2 proxy, not a
+/// per-stream demux). If the first head is a gRPC call it is logged.
+pub(super) async fn read_h2_head<R>(
+    stream: &mut R,
+    config: &BridgeConfig,
+) -> Result<(String, Vec<u8>)>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut parser = Http2Parser::with_config(Http2Config::default().with_require_preface(false));
+    let mut buffer: Vec<u8> = Vec::with_capacity(4096);
+    let mut temp = vec![0u8; 4096];
+    let max_size = config.max_header_size;
+
+    let outcome = tokio::time::timeout(config.read_timeout, async {
+        loop {
+            let n = stream
+                .read(&mut temp)
+                .await
+                .map_err(|e| anyhow::anyhow!("read error while reading HTTP/2 head: {}", e))?;
+            if n == 0 {
+                return Err(anyhow::anyhow!(
+                    "connection closed before an HTTP/2 request head"
+                ));
+            }
+            buffer.extend_from_slice(&temp[..n]);
+
+            // Offer new bytes to the parser, re-offering the tail on a short count
+            // (the backpressure signal), mirroring the HTTP/1.1 head reader.
+            let mut pending = Bytes::copy_from_slice(&temp[..n]);
+            while !pending.is_empty() {
+                let accepted = parser.push(FlowSide::Initiator, &pending);
+                pending = pending.slice(accepted..);
+                if accepted == 0 {
+                    break;
+                }
+            }
+
+            while let Some(ev) = parser.next_event() {
+                if let Http2Event::Head(head) = ev
+                    && head.dir == FlowSide::Initiator
+                {
+                    if let Some(call) = grpc_call(&head) {
+                        info!(
+                            authority = head.authority().unwrap_or("-"),
+                            service = call.service,
+                            method = call.method,
+                            "Routing terminated gRPC call"
+                        );
+                    }
+                    return h2_routing_key(&head);
+                }
+            }
+
+            if parser.is_failed() {
+                return Err(anyhow::anyhow!(
+                    "malformed HTTP/2 connection: {}",
+                    parser
+                        .error()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                ));
+            }
+
+            if buffer.len() >= max_size {
+                return Err(anyhow::anyhow!(
+                    "HTTP/2 head exceeds maximum size of {} bytes",
+                    max_size
+                ));
+            }
+        }
+    })
+    .await;
+
+    match outcome {
+        Ok(Ok(dns)) => Ok((dns, buffer)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(anyhow::anyhow!("timeout reading HTTP/2 head")),
+    }
+}
+
 /// Detect a WebSocket upgrade from peeked (non-consumed) request bytes.
 ///
 /// Feeds the peek into an [`HttpProxyParser`] and inspects the first request
@@ -502,5 +610,80 @@ mod tests {
         let mut reader = ChunkedReader::new(vec![record]);
         let cfg = BridgeConfig::default();
         assert!(read_tls_sni(&mut reader, &cfg).await.is_err());
+    }
+
+    // --- HTTP/2 head reading (Phase C, #50) ---
+
+    /// Build a real on-the-wire h2 client request (preface + a HEADERS frame)
+    /// via flowscope's own HPACK encoder, so the test exercises the actual parse.
+    fn build_h2_request(authority: &str, path: &str, content_type: Option<&str>) -> Vec<u8> {
+        use flowscope::http2::{HpackEncoder, PREFACE, write_headers};
+
+        let mut enc = HpackEncoder::new();
+        let mut fields = vec![
+            (Bytes::from_static(b":method"), Bytes::from_static(b"POST")),
+            (Bytes::from_static(b":scheme"), Bytes::from_static(b"https")),
+            (
+                Bytes::from_static(b":authority"),
+                Bytes::copy_from_slice(authority.as_bytes()),
+            ),
+            (
+                Bytes::from_static(b":path"),
+                Bytes::copy_from_slice(path.as_bytes()),
+            ),
+        ];
+        if let Some(ct) = content_type {
+            fields.push((
+                Bytes::from_static(b"content-type"),
+                Bytes::copy_from_slice(ct.as_bytes()),
+            ));
+        }
+        let block = enc.encode(&fields).expect("encodable");
+        let frames = write_headers(1, &block, true, 16_384).expect("framable");
+
+        let mut out = Vec::with_capacity(PREFACE.len() + frames.len());
+        out.extend_from_slice(PREFACE);
+        out.extend_from_slice(&frames);
+        out
+    }
+
+    fn chunkify(data: &[u8], size: usize) -> Vec<Vec<u8>> {
+        data.chunks(size).map(|c| c.to_vec()).collect()
+    }
+
+    #[tokio::test]
+    async fn read_h2_head_routes_by_authority() {
+        let req = build_h2_request(
+            "api.example.com",
+            "/pkg.Svc/Method",
+            Some("application/grpc"),
+        );
+        let mut reader = ChunkedReader::new(vec![req.clone()]);
+        let cfg = BridgeConfig::default();
+        let (dns, buffer) = read_h2_head(&mut reader, &cfg).await.unwrap();
+        assert_eq!(dns, "api.example.com");
+        // Every byte read is relayed verbatim.
+        assert_eq!(buffer, req);
+    }
+
+    #[tokio::test]
+    async fn read_h2_head_reassembles_split_frames() {
+        // Preface + HEADERS split into tiny 5-byte segments must still reassemble.
+        let req = build_h2_request("grpc.internal:8443", "/svc/m", None);
+        let mut reader = ChunkedReader::new(chunkify(&req, 5));
+        let cfg = BridgeConfig::default();
+        let (dns, buffer) = read_h2_head(&mut reader, &cfg).await.unwrap();
+        assert_eq!(dns, "grpc.internal:8443");
+        assert_eq!(buffer, req);
+    }
+
+    #[tokio::test]
+    async fn read_h2_head_default_port_normalized() {
+        // :443 collapses just like the Host path, so keys match the export side.
+        let req = build_h2_request("svc.example:443", "/svc/m", None);
+        let mut reader = ChunkedReader::new(vec![req]);
+        let cfg = BridgeConfig::default();
+        let (dns, _) = read_h2_head(&mut reader, &cfg).await.unwrap();
+        assert_eq!(dns, "svc.example");
     }
 }

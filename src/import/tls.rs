@@ -137,8 +137,10 @@ pub(super) async fn run_https_terminate_import_mode(
 
 /// Handle a single TLS-terminated connection.
 ///
-/// After TLS termination, the decrypted stream is plain HTTP. Parse it for
-/// Host-based routing, then bridge identically to the existing HTTP import.
+/// After TLS termination the decrypted stream is plaintext HTTP/1.1 or, when ALPN
+/// negotiated `h2`, HTTP/2 (Phase C, #50). Either way we peek the decrypted head
+/// for the routing key, then relay the bytes verbatim over Zenoh — the bridge
+/// terminates TLS but never rewrites the application stream.
 async fn handle_tls_terminated_connection(
     session: Arc<Session>,
     tls_stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
@@ -146,20 +148,41 @@ async fn handle_tls_terminated_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
+    // Read the ALPN-negotiated protocol before the stream is split.
+    let is_h2 = tls_stream
+        .get_ref()
+        .1
+        .alpn_protocol()
+        .is_some_and(|p| p == b"h2");
+
     let (mut tls_reader, tls_writer) = tokio::io::split(tls_stream);
 
-    // After TLS termination, we have plaintext HTTP. Parse the request head for
-    // Host-based routing (flowscope streaming parser, same as the plain-HTTP path).
-    let (dns, buffer) = super::connection::read_http_head(&mut tls_reader, &config)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("Failed to parse HTTP request after TLS termination: {}", e)
-        })?;
+    // Resolve the routing key from the decrypted head: for h2 the first request
+    // stream's `:authority`, otherwise the HTTP/1.1 `Host`. The bytes read are
+    // kept and relayed verbatim as the connection's initial payload.
+    let (dns, buffer) = if is_h2 {
+        super::connection::read_h2_head(&mut tls_reader, &config)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to parse HTTP/2 request after TLS termination: {}",
+                    e
+                )
+            })?
+    } else {
+        super::connection::read_http_head(&mut tls_reader, &config)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to parse HTTP request after TLS termination: {}", e)
+            })?
+    };
 
     let dns_suffix = format!("/{}", dns);
     info!(
-        "Client {}: TLS-terminated HTTP routing to DNS: {}",
-        client_id, dns
+        "Client {}: TLS-terminated {} routing to DNS: {}",
+        client_id,
+        if is_h2 { "h2" } else { "HTTP/1.1" },
+        dns
     );
 
     // Check backend availability

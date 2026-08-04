@@ -23,7 +23,7 @@ protocol (including HTTP/2 / gRPC) rides through unchanged.
 | `--http-import` | HTTP | Host header | plaintext (no TLS) | HTTP/1.1 |
 | `--http-multiroute-import` | HTTP, per-request routing on one keep-alive conn | Host header | plaintext (no TLS) | **HTTP/1.1 only** |
 | `--auto-import` | TLS/HTTPS, HTTP, WebSocket, or raw — detected from first bytes | TLS→**SNI**, HTTP→Host, else opaque | passthrough for TLS | routes HTTP/1.1; TLS (incl. h2/gRPC) passes through |
-| `--https-terminate` | HTTPS, decrypted at the bridge to plaintext HTTP | Host header (post-decrypt) | **terminated** (needs `--tls-cert`/`--tls-key`, `tls-termination` feature; negotiates ALPN `http/1.1`) | **HTTP/1.1 only** — an h2-only client fails ALPN cleanly (h2 termination is [#50](https://github.com/p13marc/zenoh-bridge-tcp/issues/50)) |
+| `--https-terminate` | HTTPS or h2/gRPC, decrypted at the bridge | **HTTP/1.1** → Host; **h2** → `:authority` (ALPN-selected) | **terminated** (needs `--tls-cert`/`--tls-key`, `tls-termination` feature; ALPN advertises `h2` + `http/1.1`) | HTTP/1.1 or HTTP/2 — an h2 connection is routed by its first stream's `:authority` and its multiplexed streams relayed opaquely (single-authority proxy, not per-stream demux) |
 | `--ws-import` | WebSocket | nothing (one backend) | n/a | WebSocket |
 
 Export counterparts: `--export` (raw), `--http-export` (Host-routed HTTP), `--ws-export`
@@ -32,13 +32,16 @@ backend with a plain `--export` (or `--http-export` keyed by the SNI hostname).
 
 ### Which mode do I use?
 
-- **gRPC (HTTP/2 over TLS)** → **SNI passthrough**: `--auto-import` (routes by SNI) or
-  raw `--import` (single backend). The traffic stays encrypted end-to-end and h2 is
-  never framed by the bridge. **Do not** use `--https-terminate` or
-  `--http-multiroute-import` — both are HTTP/1.1-only and cannot frame h2.
+- **gRPC (HTTP/2 over TLS)** → **SNI passthrough** (`--auto-import` by SNI, or raw
+  `--import` for a single backend) keeps the traffic encrypted end-to-end and is the
+  simplest option. Alternatively, `--https-terminate` now **decrypts** h2 and routes by
+  the request `:authority` (multiplexed streams relayed opaquely to one backend) — use
+  this when the bridge must hold the certificate. `--http-multiroute-import` remains
+  HTTP/1.1-only.
 - **HTTPS (browsers, REST-over-TLS)** → `--auto-import` for SNI routing to multiple
-  backends, raw `--import` for a single backend, or `--https-terminate` if you want the
-  bridge to hold the certificate and route decrypted **HTTP/1.1** by Host.
+  backends, raw `--import` for a single backend, or `--https-terminate` to have the
+  bridge hold the certificate and route the decrypted request (HTTP/1.1 by Host, h2 by
+  `:authority`).
 - **Plaintext HTTP with host routing** → `--http-import`, or `--http-multiroute-import`
   when one keep-alive connection should reach different backends per request.
 - **rsync / scp / SSH / Postgres / Redis / any opaque TCP** → raw `--import` / `--export`.
