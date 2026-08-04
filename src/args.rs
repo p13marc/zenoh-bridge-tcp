@@ -140,6 +140,12 @@ pub struct Args {
     #[arg(long, default_value = "10485760")]
     pub max_response_size: usize,
 
+    /// Per-connection Zenoh reception buffer depth in samples. A slow client is
+    /// isolated at this bound (Stream: reset; Telemetry: shed) so it cannot
+    /// head-of-line-block others on the shared session (D2).
+    #[arg(long, default_value = "256")]
+    pub rx_channel_capacity: usize,
+
     /// Log level: trace, debug, info, warn, error
     #[arg(long, default_value = "info")]
     pub log_level: String,
@@ -181,6 +187,7 @@ impl Default for Args {
             heartbeat_interval_ms: 500,
             availability_timeout_ms: 1000,
             max_response_size: 10 * 1024 * 1024,
+            rx_channel_capacity: 256,
             log_level: "info".to_string(),
             log_format: "pretty".to_string(),
         }
@@ -242,6 +249,9 @@ impl Args {
         }
         if self.cache_size < 1 {
             return Err(anyhow::anyhow!("--cache-size must be at least 1"));
+        }
+        if self.rx_channel_capacity < 1 {
+            return Err(anyhow::anyhow!("--rx-channel-capacity must be at least 1"));
         }
         if self.max_header_size < 1024 {
             return Err(anyhow::anyhow!(
@@ -330,6 +340,7 @@ impl Args {
         config.availability_timeout =
             std::time::Duration::from_millis(self.availability_timeout_ms);
         config.max_response_size = self.max_response_size;
+        config.rx_channel_capacity = self.rx_channel_capacity;
         config
     }
 }

@@ -78,6 +78,15 @@ pub struct BridgeConfig {
     /// Maximum response size for multiroute HTTP mode (default: 10 MiB).
     /// Responses exceeding this limit receive HTTP 502.
     pub max_response_size: usize,
+
+    /// Per-connection Zenoh reception buffer depth in samples (default: 256).
+    ///
+    /// Each client's response subscriber is drained into a bounded channel of
+    /// this size so a slow TCP writer cannot block the shared Zenoh session and
+    /// head-of-line-block every other client (D2). When the channel is full:
+    /// `Stream` mode resets that one connection (byte-exact, never drops);
+    /// `Telemetry` mode sheds the overflow sample.
+    pub rx_channel_capacity: usize,
 }
 
 impl Default for BridgeConfig {
@@ -93,6 +102,7 @@ impl Default for BridgeConfig {
             availability_timeout: Duration::from_millis(1000),
             drain_timeout: Duration::from_secs(5),
             max_response_size: 10 * 1024 * 1024, // 10 MiB
+            rx_channel_capacity: 256,
         }
     }
 }

@@ -134,8 +134,8 @@ async fn fix_006_zero_buffer_size_rejected() {
 
     let config = BridgeConfig::new(1024, 10, 5);
     let mut reader = TcpReader::new(server, config.buffer_size);
-    let data = reader.read_data(config.buffer_size).await.unwrap();
-    assert_eq!(data, b"Hello, World!");
+    let data = reader.read_data().await.unwrap();
+    assert_eq!(&data[..], b"Hello, World!");
 }
 
 // ============================================================================

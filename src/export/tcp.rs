@@ -1,5 +1,4 @@
 use super::CancellationSender;
-use super::bridge::handle_client_bridge;
 use crate::config::BridgeConfig;
 use backon::{ExponentialBuilder, Retryable};
 use std::collections::HashMap;
@@ -7,8 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
-use tracing::{Instrument, error, info, info_span, warn};
+use tokio::sync::Mutex;
+use tracing::{error, info, info_span, warn};
 use zenoh::Session;
 
 /// Handle a client connection event for TCP backends
@@ -47,29 +46,9 @@ pub(super) async fn handle_client_connect(
         Ok(backend_stream) => {
             info!(client_id = %client_id, backend = %backend_addr, "Backend connection established");
 
-            // Cancel any existing connection for this client ID BEFORE spawning new task
-            {
-                let mut senders = cancellation_senders.lock().await;
-                if let Some((old_cancel_tx, old_handle)) = senders.remove(client_id) {
-                    warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
-                    let _ = old_cancel_tx.send(()).await;
-                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
-                }
-            }
-
             let (backend_reader, backend_writer) = backend_stream.into_split();
             let reader = crate::transport::TcpReader::new(backend_reader, config.buffer_size);
             let writer = crate::transport::TcpWriter::new(backend_writer);
-
-            let session_clone = session.clone();
-            let service_name_clone = service_name.to_string();
-            let client_id_str = client_id.to_string();
-            let client_id_for_map = client_id.to_string();
-            let dns_suffix_owned = dns_suffix.map(|s| s.to_string());
-            let config = config.clone();
-
-            // Create cancellation channel for graceful shutdown
-            let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
 
             let span = info_span!(
                 "client_bridge",
@@ -79,33 +58,20 @@ pub(super) async fn handle_client_connect(
                 dns = dns_suffix.unwrap_or("-")
             );
 
-            // Spawn dedicated task for this client connection
-            let config_clone = config.clone();
-            let main_handle = tokio::spawn(
-                async move {
-                    if let Err(e) = handle_client_bridge(
-                        session_clone,
-                        service_name_clone,
-                        client_id_str,
-                        reader,
-                        writer,
-                        cancel_rx,
-                        dns_suffix_owned.as_deref(),
-                        config_clone,
-                    )
-                    .await
-                    {
-                        error!(error = %e, "Client bridge error");
-                    }
-                }
-                .instrument(span),
-            );
-
-            // Store the new task handle
-            cancellation_senders
-                .lock()
-                .await
-                .insert(client_id_for_map, (cancel_tx, main_handle));
+            // Cancel any prior connection, spawn the bridge, and track it so it
+            // frees its own map entry on completion (D1).
+            super::bridge::spawn_and_track(
+                session.clone(),
+                service_name.to_string(),
+                client_id.to_string(),
+                reader,
+                writer,
+                dns_suffix.map(|s| s.to_string()),
+                config.clone(),
+                cancellation_senders,
+                span,
+            )
+            .await;
         }
         Err(e) => {
             error!(
