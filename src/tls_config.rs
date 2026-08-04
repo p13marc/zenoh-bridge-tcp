@@ -61,13 +61,12 @@ pub fn load_tls_config<P1: AsRef<Path>, P2: AsRef<Path>>(
         .with_single_cert(certs, key)
         .map_err(|e| anyhow::anyhow!("Failed to build TLS config: {}", e))?;
 
-    // ALPN (#46): the terminated path speaks HTTP/1.1 only — after decryption the
-    // stream is framed by the flowscope `HttpProxyParser` (h2 termination is
-    // flowscope Phase C, #50). Advertise only `http/1.1` so a client that offers
-    // it negotiates cleanly, and an h2-only client fails the handshake with a
-    // `no_application_protocol` alert instead of negotiating h2 and sending a
-    // `PRI * HTTP/2.0` preface that would mis-parse as HTTP/1.1.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // ALPN (#46, #50): advertise `h2` and `http/1.1`, h2 preferred. The terminated
+    // path routes h2 by `:authority` (Phase C) and HTTP/1.1 by `Host`; both are
+    // relayed verbatim. rustls picks the server's first offered protocol the client
+    // also supports, and fails the handshake with `no_application_protocol` if a
+    // client offers neither.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(Arc::new(config))
 }
@@ -132,10 +131,9 @@ mod tests {
     }
 
     #[test]
-    fn test_load_tls_config_sets_http1_alpn() {
-        // #46: the terminated path is HTTP/1.1-only, so the config must advertise
-        // exactly `http/1.1` (not h2) — an h2-only client then fails the handshake
-        // rather than negotiating h2 and mis-parsing a `PRI` preface as HTTP/1.1.
+    fn test_load_tls_config_sets_alpn() {
+        // #46/#50: the terminated path advertises h2 (routed by :authority) and
+        // http/1.1 (routed by Host), h2 preferred.
         install_crypto_provider();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let dir = std::env::temp_dir();
@@ -145,7 +143,10 @@ mod tests {
         std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
 
         let config = load_tls_config(&cert_path, &key_path).unwrap();
-        assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
 
         std::fs::remove_file(&cert_path).unwrap();
         std::fs::remove_file(&key_path).unwrap();

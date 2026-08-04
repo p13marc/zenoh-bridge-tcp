@@ -10,6 +10,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -177,10 +178,10 @@ fn client_config_with_alpn(alpn: &[&[u8]]) -> rustls::ClientConfig {
     cfg
 }
 
-/// #46: the terminated listener advertises ALPN `http/1.1` only. A client that
-/// offers `http/1.1` (alone or alongside `h2`) negotiates it cleanly; an h2-only
-/// client fails the handshake with a `no_application_protocol` alert instead of
-/// negotiating h2 and having its `PRI * HTTP/2.0` preface mis-parsed as HTTP/1.1.
+/// #46/#50: the terminated listener advertises ALPN `h2` and `http/1.1`, h2
+/// preferred. A client offering both negotiates `h2`; one offering only
+/// `http/1.1` negotiates `http/1.1`; one offering only `h2` also succeeds
+/// (Phase C routes terminated h2 by `:authority`).
 #[tokio::test]
 async fn test_https_terminate_alpn_negotiation() {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -217,38 +218,148 @@ async fn test_https_terminate_alpn_negotiation() {
 
     let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
 
-    // 1. Client offering h2 + http/1.1 -> negotiates http/1.1.
-    {
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(&[
-            b"h2",
-            b"http/1.1",
-        ])));
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let tls = connector
-            .connect(server_name.clone(), tcp)
-            .await
-            .expect("handshake with http/1.1 on offer should succeed");
-        let negotiated = tls.get_ref().1.alpn_protocol().map(|p| p.to_vec());
-        assert_eq!(
-            negotiated,
-            Some(b"http/1.1".to_vec()),
-            "bridge must negotiate http/1.1"
-        );
-    }
+    let negotiate = |offer: &'static [&'static [u8]]| {
+        let server_name = server_name.clone();
+        async move {
+            let connector =
+                tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(offer)));
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            connector
+                .connect(server_name, tcp)
+                .await
+                .map(|tls| tls.get_ref().1.alpn_protocol().map(|p| p.to_vec()))
+        }
+    };
 
-    // 2. Client offering ONLY h2 -> handshake fails (no_application_protocol).
-    {
-        let connector =
-            tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(&[b"h2"])));
-        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let result = connector.connect(server_name.clone(), tcp).await;
-        assert!(
-            result.is_err(),
-            "an h2-only client must fail ALPN negotiation, not mis-parse as HTTP/1.1"
-        );
-    }
+    // Offering both -> h2 (server prefers it).
+    assert_eq!(
+        negotiate(&[b"h2", b"http/1.1"]).await.unwrap(),
+        Some(b"h2".to_vec()),
+        "bridge must prefer h2 when offered"
+    );
+
+    // Offering only http/1.1 -> http/1.1.
+    assert_eq!(
+        negotiate(&[b"http/1.1"]).await.unwrap(),
+        Some(b"http/1.1".to_vec()),
+        "bridge must negotiate http/1.1 when that is all the client offers"
+    );
+
+    // Offering only h2 -> h2 (Phase C: terminated h2 is now supported).
+    assert_eq!(
+        negotiate(&[b"h2"]).await.unwrap(),
+        Some(b"h2".to_vec()),
+        "bridge must negotiate h2 for an h2-only client"
+    );
 
     let _ = child.kill().await;
+    std::fs::remove_file(&cert_path).unwrap();
+    std::fs::remove_file(&key_path).unwrap();
+}
+
+/// A plaintext, prior-knowledge HTTP/2 backend that answers every request `200`
+/// with a fixed body. The bridge relays the decrypted h2 bytes to it verbatim.
+async fn start_h2_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(|_req| async {
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                        http_body_util::Full::new(bytes::Bytes::from_static(b"h2-ok")),
+                    ))
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// End-to-end (#50): a real h2 client over TLS -> `--https-terminate` (routes by
+/// `:authority`) -> Zenoh -> `--http-export` -> plaintext h2 backend -> response.
+#[tokio::test]
+async fn test_https_terminate_h2_end_to_end() {
+    use http_body_util::{BodyExt, Empty};
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (backend_addr, _backend) = start_h2_backend().await;
+    let authority = "grpc.test";
+    let service = common::unique_service_name("h2term");
+
+    // Export the h2 backend for this authority.
+    let export_spec = format!("{service}/{authority}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cert + terminating import (advertises h2 via ALPN).
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = std::env::temp_dir();
+    let cert_path = dir.join("test_h2e2e_cert.pem");
+    let key_path = dir.join("test_h2e2e_key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let import_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&[
+        "--https-terminate",
+        &import_spec,
+        "--tls-cert",
+        cert_path.to_str().unwrap(),
+        "--tls-key",
+        key_path.to_str().unwrap(),
+    ])
+    .await;
+
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("terminate listener did not start");
+    // Liveliness propagation: import declares -> export connects to backend.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // h2 client over TLS to the terminating listener.
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(&[b"h2"])));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tcp = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // The request's :authority (from the URI) is the routing key.
+    let req = hyper::Request::builder()
+        .uri(format!("https://{authority}/pkg.Svc/Method"))
+        .body(Empty::<bytes::Bytes>::new())
+        .unwrap();
+
+    let resp = tokio::time::timeout(Duration::from_secs(10), sender.send_request(req))
+        .await
+        .expect("h2 request timed out")
+        .expect("h2 request failed");
+    assert_eq!(
+        resp.status(),
+        200,
+        "terminated h2 request should route and 200"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&body[..], b"h2-ok");
+
     std::fs::remove_file(&cert_path).unwrap();
     std::fs::remove_file(&key_path).unwrap();
 }
