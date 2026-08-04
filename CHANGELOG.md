@@ -33,9 +33,43 @@
 
 ### Added
 
-- `--backend 'svc@host/ws://…'`: WebSocket backends can register for hostname
-  routing (`{service}/{host}/available`), which the removed `--ws-export`
-  could not express.
+- **Plaintext HTTP/2 (h2c) / prior-knowledge gRPC routing** (#74): the
+  auto-detect door routes an h2 client preface by the first stream's
+  `:authority` and relays the multiplexed streams opaquely (single-authority
+  relay), with the gRPC-status response tap attached — completing
+  h1/h2/gRPC support in every deployment shape, plaintext included. A client
+  that waits for the server's SETTINGS (RFC 9113 §3.4) falls back to an
+  opaque un-keyed relay on head-read timeout instead of being dropped.
+  `zbridge_grpc_status_total` now works in the default build.
+- `--backend 'svc@host/ws://…'` (#75): WebSocket backends register for
+  hostname routing (`{service}/{host}/available`), and the auto-detect door
+  routes WS upgrades by their Host — one listener, many WS backends. The
+  removed `--ws-export` could not express this.
+- ClientHello **ALPN logging** on SNI passthrough (#80): `alpn=` +
+  `proto_guess=` on the routing log line, without decrypting anything.
+- Terminated-`wss://` end-to-end test coverage (#71).
+
+### Fixed
+
+- **WS upgrade detection survives a head split across TCP segments** (#77
+  part 1): the single 4096-byte peek misrouted split handshakes to the
+  plain-HTTP path (clients got 502 instead of 101); detection now re-peeks
+  with a growing, deadline-bounded window.
+- Head-read timeouts now report how many bytes were consumed (#76).
+
+### Changed
+
+- **One accept loop** (#73): the five per-mode listener loops collapsed into
+  `run_accept_loop` + per-connection handlers. Log lines converge to one
+  `New connection` / `Import bridge …` family with a `mode=` field.
+- **One dns-key convention** (#75): both sides thread the bare hostname and
+  the `{service}/{dns}` segment is joined in exactly one place; on-wire keys
+  are unchanged.
+- One generic head reader (#76) behind the SNI/HTTP/h2 head parsers.
+- flowscope `http2` is a base dependency (#74); the `tls-termination` feature
+  now gates only the rustls stack.
+- `docs/HTTP_ROUTING_GUIDE.md` removed — superseded by the README's routing
+  sections and `docs/ROUTING-SIMPLIFICATION.md`.
 
 ## [0.5.0] - 2026-04-08
 
