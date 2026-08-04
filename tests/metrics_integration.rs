@@ -155,3 +155,67 @@ async fn metrics_count_real_traffic() {
 
     drop(stream);
 }
+
+/// D5 (#25): a listener reaps a completed connection task while otherwise idle
+/// (the `tasks.join_next()` arm in the accept select) and stays healthy for the
+/// next connection. Observably: after a connection completes and an idle gap,
+/// `active_connections` returns to 0 and a fresh connection still round-trips.
+#[tokio::test]
+async fn idle_listener_reaps_and_stays_healthy() {
+    use tokio::net::TcpStream;
+
+    let (backend_addr, _echo) = common::start_echo_server().await;
+    let metrics_port = common::PortGuard::new();
+    let metrics_addr = metrics_port.release();
+    let service = common::unique_service_name("d5_idle");
+    let bridge = common::BridgePair::tcp_with_args(
+        &service,
+        backend_addr,
+        &[],
+        &["--metrics-addr", &metrics_addr.to_string()],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // First connection: round-trip, then close.
+    {
+        let mut c = TcpStream::connect(bridge.import_addr).await.unwrap();
+        c.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .expect("read timed out")
+            .expect("read failed");
+        assert_eq!(&buf[..n], b"ping");
+    }
+
+    // While the listener sits idle in accept(), the join_next arm reaps the
+    // completed task and the connection's guard drops active back to 0.
+    common::wait_for(
+        || {
+            let url = format!("http://{metrics_addr}/metrics");
+            let needle = format!("zbridge_active_connections{{service=\"{service}\"}} 0");
+            async move {
+                match reqwest::get(url).await {
+                    Ok(r) => r.text().await.map(|b| b.contains(&needle)).unwrap_or(false),
+                    Err(_) => false,
+                }
+            }
+        },
+        Duration::from_secs(10),
+        "active_connections returns to 0 while idle",
+    )
+    .await
+    .expect("active_connections did not return to 0 after the connection closed");
+
+    // The listener is still healthy after reaping while idle: a second connection
+    // round-trips.
+    let mut c2 = TcpStream::connect(bridge.import_addr).await.unwrap();
+    c2.write_all(b"pong").await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(5), c2.read(&mut buf))
+        .await
+        .expect("second read timed out")
+        .expect("second read failed");
+    assert_eq!(&buf[..n], b"pong");
+}

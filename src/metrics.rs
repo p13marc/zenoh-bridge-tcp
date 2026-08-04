@@ -462,4 +462,19 @@ mod tests {
         let m = Metrics::new();
         assert!(!m.render_prometheus().contains("zbridge_grpc_status_total"));
     }
+
+    #[test]
+    fn readyz_maps_readiness_to_status() {
+        // `route` consults the global registry (nextest isolates each test in its
+        // own process). Set the flag explicitly so the transition is deterministic.
+        metrics().set_ready(false);
+        assert_eq!(
+            route("/readyz").0,
+            "503 Service Unavailable",
+            "/readyz is 503 before bridges are ready"
+        );
+        metrics().set_ready(true);
+        assert_eq!(route("/readyz").0, "200 OK", "/readyz is 200 once ready");
+        metrics().set_ready(false); // leave the global as found
+    }
 }

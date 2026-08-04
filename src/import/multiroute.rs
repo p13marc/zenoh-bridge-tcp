@@ -438,8 +438,20 @@ async fn run_exchange(
         .declare_token(&liveliness_key)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
+    // D2: drain this request's response subscriber through a bounded, non-blocking
+    // channel so a slow client cannot fill the default FIFO handler and block the
+    // shared session's reception thread — head-of-line-blocking every other client
+    // (the same protection the plain import/export paths already have).
+    let rx_cancel = CancellationToken::new();
+    let (rx_callback, mut rx) = crate::backpressure::rx_channel(
+        config.rx_channel_capacity,
+        config.reliability,
+        rx_cancel.clone(),
+        request_id.to_string(),
+    );
     let rx_subscriber = session
         .declare_subscriber(&rx_key)
+        .callback(rx_callback)
         .history(HistoryConfig::default().detect_late_publishers())
         .subscriber_detection()
         .recovery(RecoveryConfig::default())
@@ -599,9 +611,9 @@ async fn run_exchange(
                     Err(e) => return Err(anyhow::anyhow!("client read error: {}", e)),
                 }
             }
-            s = tokio::time::timeout_at(deadline, rx_subscriber.recv_async()) => {
+            s = tokio::time::timeout_at(deadline, rx.recv()) => {
                 match s {
-                    Ok(Ok(sample)) => {
+                    Ok(Some(sample)) => {
                         let payload = sample.payload().to_bytes();
                         if payload.is_empty() {
                             parser.fin(FlowSide::Responder);
@@ -611,7 +623,7 @@ async fn run_exchange(
                             drain_events(parser, events);
                         }
                     }
-                    Ok(Err(_)) => break, // subscriber closed
+                    Ok(None) => break, // subscriber closed
                     Err(_) => {
                         warn!(request_id = %request_id, "Response timeout");
                         if bytes_written == 0 {
@@ -621,6 +633,13 @@ async fn run_exchange(
                         break;
                     }
                 }
+            }
+            _ = rx_cancel.cancelled() => {
+                // D2 overflow (Stream mode): this client is too slow to drain its
+                // response — reset the exchange rather than block the session.
+                warn!(request_id = %request_id, "Reception buffer full — resetting slow multiroute exchange");
+                keep_alive = false;
+                break;
             }
         }
     }
@@ -644,18 +663,19 @@ async fn run_exchange(
                         Err(_) => break,
                     }
                 }
-                s = rx_subscriber.recv_async() => {
+                s = rx.recv() => {
                     match s {
-                        Ok(sample) => {
+                        Some(sample) => {
                             let payload = sample.payload().to_bytes();
                             if payload.is_empty() || stream.write_all(&payload).await.is_err() {
                                 break;
                             }
                             svc.add_down(payload.len());
                         }
-                        Err(_) => break,
+                        None => break,
                     }
                 }
+                _ = rx_cancel.cancelled() => break,
             }
         }
     }
