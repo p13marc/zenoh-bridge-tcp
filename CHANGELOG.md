@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased] — 0.7.0
+## [0.7.0] - 2026-08-04
 
 ### Breaking
 
@@ -51,6 +51,25 @@
 
 ### Fixed
 
+- **`route=request` no longer busy-spins on a plaintext-h2 client** (PR #94):
+  an h2 preface where a request line was expected tunnelled the parser and
+  the re-offer loop pinned a tokio worker thread at 100% CPU, unabortable.
+  The connection now closes promptly and the listener stays healthy.
+- **Multiroute protocol switches keep the coalesced first bytes** (PR #94 +
+  flowscope 0.24.1): a backend flushing the `101` together with the first
+  WebSocket frame lost that frame inside the parser; the tunnel residue is
+  now spliced to the client before the opaque relay.
+- Host-routed WebSocket routing no longer folds a Zenoh liveliness *error*
+  into its bare-key fallback (silent wrong-backend risk); only a genuinely
+  un-announced host falls back, and it is logged (PR #94).
+- `--backend 'svc@*/…'` (or any Zenoh keyexpr metacharacter in a host) is
+  rejected at validation — a `*` host would have registered a live wildcard
+  capturing the whole service's routing (PR #94).
+- flowscope's internal 64 KiB head cap no longer silently overrides a larger
+  `--max-header-size`; the parsers are built from the configured cap (PR #94).
+- Spec options with empty values (`cert=`), duplicates, and trailing commas
+  are rejected at parse time; a displayed `ListenSpec` now round-trips
+  through its own parser (PR #94).
 - **WS upgrade detection survives a head split across TCP segments** (#77
   part 1): the single 4096-byte peek misrouted split handshakes to the
   plain-HTTP path (clients got 502 instead of 101); detection now re-peeks
