@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
 use zenoh::qos::CongestionControl;
@@ -213,10 +213,57 @@ async fn dispatch_client_connect(
     }
 }
 
+/// How one direction of a client bridge ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectionEnd {
+    /// Clean directional EOF / half-close.
+    Eof,
+    /// Torn down because the connection was reset (external teardown, sample
+    /// miss, or the peer direction's error) — no error on this direction itself.
+    Reset,
+    /// This direction hit a hard error (read/write/publish/subscriber failure).
+    Error,
+}
+
+/// The observable outcome of a whole client connection (C3 #18).
+///
+/// Returned by `handle_client_bridge` so callers — and a future metrics layer
+/// (#43) — can count how connections end instead of only seeing `error!` logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConnectionOutcome {
+    /// Both directions reached a clean EOF.
+    Completed,
+    /// The connection was reset without a direction erroring (external teardown
+    /// or an unrecoverable sample miss).
+    Reset,
+    /// At least one direction failed with an error, or a direction task did not
+    /// join cleanly (panic/abort).
+    Failed,
+}
+
+/// Fold the two directional ends into a connection outcome. `None` means that
+/// direction's task failed to join (panic/abort), which counts as a failure.
+fn fold_outcome(b2z: Option<DirectionEnd>, z2b: Option<DirectionEnd>) -> ConnectionOutcome {
+    let ends = [b2z, z2b];
+    if ends
+        .iter()
+        .any(|e| matches!(e, None | Some(DirectionEnd::Error)))
+    {
+        ConnectionOutcome::Failed
+    } else if ends.iter().any(|e| matches!(e, Some(DirectionEnd::Reset))) {
+        ConnectionOutcome::Reset
+    } else {
+        ConnectionOutcome::Completed
+    }
+}
+
 /// Handle the bridge logic for a single client connection.
 ///
 /// Generic over `TransportReader`/`TransportWriter` so the same function
 /// serves both TCP and WebSocket export paths.
+///
+/// Returns the [`ConnectionOutcome`] so the spawning task can log/count how the
+/// connection ended (C3 #18).
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_client_bridge<R, W>(
     session: Arc<Session>,
@@ -227,7 +274,7 @@ pub(super) async fn handle_client_bridge<R, W>(
     mut cancel_rx: mpsc::Receiver<()>,
     dns_suffix: Option<&str>,
     config: Arc<BridgeConfig>,
-) -> Result<()>
+) -> Result<ConnectionOutcome>
 where
     R: crate::transport::TransportReader,
     W: crate::transport::TransportWriter,
@@ -308,23 +355,24 @@ where
     // Direction: backend -> Zenoh. A clean EOF publishes the empty EOF marker so
     // the import half-closes the client and ends this direction only. A read or
     // publish error resets the whole connection.
-    let buffer_size = config.buffer_size;
     let b2z_cancel = conn_cancel.clone();
     let backend_to_zenoh_handle = tokio::spawn(async move {
-        loop {
+        let end = loop {
             tokio::select! {
-                result = backend_reader.read_data(buffer_size) => {
+                result = backend_reader.read_data() => {
                     match result {
                         Ok(data) if data.is_empty() => {
                             debug!("Backend half-close -> EOF for client {}", client_id_for_reader);
                             let _ = publisher.put(Vec::<u8>::new()).await;
-                            break;
+                            break DirectionEnd::Eof;
                         }
                         Ok(data) => {
-                            if let Err(e) = publisher.put(&data[..]).await {
+                            // Zero-copy: `data` is `Bytes`, published via Zenoh's
+                            // `From<bytes::Bytes>` without a further copy.
+                            if let Err(e) = publisher.put(data).await {
                                 error!("Failed to publish for client {}: {:?}", client_id_for_reader, e);
                                 b2z_cancel.cancel();
-                                break;
+                                break DirectionEnd::Error;
                             }
                         }
                         Err(e) => {
@@ -332,23 +380,23 @@ where
                             // C1: emit EOF so the import side doesn't hang, then reset.
                             let _ = publisher.put(Vec::<u8>::new()).await;
                             b2z_cancel.cancel();
-                            break;
+                            break DirectionEnd::Error;
                         }
                     }
                 }
-                _ = b2z_cancel.cancelled() => break,
+                _ = b2z_cancel.cancelled() => break DirectionEnd::Reset,
             }
-        }
+        };
         // Return the publisher so it (and its cache) stays alive until the whole
         // connection ends, letting a late-joining import subscriber recover.
-        publisher
+        (publisher, end)
     });
 
     // Direction: Zenoh -> backend. An empty payload is the client's half-close;
     // propagate it as a FIN on the backend's write side and end this direction only.
     let z2b_cancel = conn_cancel.clone();
     let zenoh_to_backend_handle = tokio::spawn(async move {
-        loop {
+        let end = loop {
             tokio::select! {
                 result = subscriber.recv_async() => {
                     match result {
@@ -357,29 +405,29 @@ where
                             if payload.is_empty() {
                                 debug!("Client {}: client half-close -> FIN to backend", client_id_for_writer);
                                 let _ = backend_writer.send_eof().await;
-                                break;
+                                break DirectionEnd::Eof;
                             }
                             if let Err(e) = backend_writer.write_data(&payload).await {
                                 error!("Failed to write to backend for client {}: {:?}", client_id_for_writer, e);
                                 z2b_cancel.cancel();
-                                break;
+                                break DirectionEnd::Error;
                             }
                         }
                         Err(e) => {
                             error!("Subscriber error for client {}: {:?}", client_id_for_writer, e);
                             z2b_cancel.cancel();
-                            break;
+                            break DirectionEnd::Error;
                         }
                     }
                 }
                 _ = z2b_cancel.cancelled() => {
                     let _ = backend_writer.shutdown().await;
-                    break;
+                    break DirectionEnd::Reset;
                 }
             }
-        }
+        };
         // Return the subscriber; the coordinator undeclares it after both ends.
-        subscriber
+        (subscriber, end)
     });
 
     // External teardown (liveliness delete / duplicate connect) resets the connection.
@@ -407,16 +455,130 @@ where
     watchdog.abort();
     ext_task.abort();
     let _ = ext_task.await;
-    if let Ok(publisher) = b2z_res {
-        let _ = publisher.undeclare().await;
+
+    // Undeclare the entities and capture each direction's end. A join error
+    // (panic/abort past the drain deadline) counts as a failed direction.
+    let b2z_end = match b2z_res {
+        Ok((publisher, end)) => {
+            let _ = publisher.undeclare().await;
+            Some(end)
+        }
+        Err(e) => {
+            warn!(client_id = %client_id, error = %e, "backend->zenoh task did not join cleanly");
+            None
+        }
+    };
+    let z2b_end = match z2b_res {
+        Ok((subscriber, end)) => {
+            let _ = subscriber.undeclare().await;
+            Some(end)
+        }
+        Err(e) => {
+            warn!(client_id = %client_id, error = %e, "zenoh->backend task did not join cleanly");
+            None
+        }
+    };
+
+    let outcome = fold_outcome(b2z_end, z2b_end);
+    info!(client_id = %client_id, ?outcome, "Connection handler stopped");
+
+    Ok(outcome)
+}
+
+/// Remove `client_id` from the map only if its entry is still the one owned by
+/// `own_tx`. Identity is checked with `mpsc::Sender::same_channel`, so a
+/// duplicate-connect that replaced the entry with a fresh channel is never
+/// clobbered by the previous connection's self-cleanup (D1 #21).
+///
+/// Returns `true` if an entry was removed.
+fn remove_if_current(
+    map: &mut HashMap<String, CancellationSender>,
+    client_id: &str,
+    own_tx: &mpsc::Sender<()>,
+) -> bool {
+    if map
+        .get(client_id)
+        .is_some_and(|(tx, _)| tx.same_channel(own_tx))
+    {
+        map.remove(client_id);
+        true
+    } else {
+        false
     }
-    if let Ok(subscriber) = z2b_res {
-        let _ = subscriber.undeclare().await;
+}
+
+/// Spawn the per-client bridge task and record it in the cancellation map.
+///
+/// Shared by the TCP and WebSocket export paths. Cancels any existing connection
+/// for `client_id` first, then spawns the new bridge over the given transport
+/// halves.
+///
+/// D1 (#21): the spawned task removes its **own** map entry when it completes
+/// naturally, so entries no longer live forever after a backend-first close. The
+/// removal is guarded by `mpsc::Sender::same_channel`, so a later duplicate
+/// connect that replaced the entry is never clobbered. The insert is performed
+/// under the same lock the self-removal must acquire, so a fast-completing task
+/// cannot race ahead of its own insert and leave a stale entry behind.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn spawn_and_track<R, W>(
+    session: Arc<Session>,
+    service_name: String,
+    client_id: String,
+    reader: R,
+    writer: W,
+    dns_suffix: Option<String>,
+    config: Arc<BridgeConfig>,
+    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    span: tracing::Span,
+) where
+    R: crate::transport::TransportReader,
+    W: crate::transport::TransportWriter,
+{
+    // Cancel any existing connection for this client ID before spawning the new
+    // one. Take the old entry out under the lock, then drain it without holding
+    // the lock (a drain can take up to drain_timeout).
+    let existing = cancellation_senders.lock().await.remove(&client_id);
+    if let Some((old_cancel_tx, old_handle)) = existing {
+        warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
+        let _ = old_cancel_tx.send(()).await;
+        let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
     }
 
-    info!("Connection handler stopped for client: {}", client_id);
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let self_remove_tx = cancel_tx.clone();
+    let map = cancellation_senders.clone();
+    let client_id_task = client_id.clone();
 
-    Ok(())
+    // Hold the map lock across spawn + insert. The task's self-removal acquires
+    // this same lock, so it cannot run before its entry is recorded.
+    let mut guard = cancellation_senders.lock().await;
+    let main_handle = tokio::spawn(
+        async move {
+            match handle_client_bridge(
+                session,
+                service_name,
+                client_id_task.clone(),
+                reader,
+                writer,
+                cancel_rx,
+                dns_suffix.as_deref(),
+                config,
+            )
+            .await
+            {
+                Ok(ConnectionOutcome::Completed) => {}
+                Ok(outcome) => warn!(?outcome, "Client bridge ended non-cleanly"),
+                Err(e) => error!(error = %e, "Client bridge error"),
+            }
+            // D1: free our own entry on natural completion, but only if it is
+            // still ours (guards against a duplicate-connect replacement).
+            if remove_if_current(&mut *map.lock().await, &client_id_task, &self_remove_tx) {
+                debug!(client_id = %client_id_task, "Freed client map entry on completion");
+            }
+        }
+        .instrument(span),
+    );
+    guard.insert(client_id, (cancel_tx, main_handle));
 }
 
 /// Handle a client disconnection event
@@ -451,5 +613,98 @@ pub(super) async fn handle_client_disconnect(
                 warn!("  Drain timeout for backend connection: {}", client_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dummy completed task handle to pair with a channel in the map.
+    fn dummy_handle() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_frees_own_entry() {
+        // D1: a connection that completes naturally frees its own map entry.
+        let mut map: HashMap<String, CancellationSender> = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<()>(1);
+        map.insert("c1".into(), (tx.clone(), dummy_handle()));
+
+        assert!(remove_if_current(&mut map, "c1", &tx));
+        assert!(map.is_empty(), "entry should be freed on completion");
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_leaves_replacement_untouched() {
+        // D1: a duplicate connect replaces the entry with a fresh channel. When
+        // the OLD connection later completes, its cleanup must not clobber the
+        // live replacement.
+        let mut map: HashMap<String, CancellationSender> = HashMap::new();
+        let (old_tx, _old_rx) = mpsc::channel::<()>(1);
+        let (new_tx, _new_rx) = mpsc::channel::<()>(1);
+
+        // Replacement is now installed under the same client id.
+        map.insert("c1".into(), (new_tx.clone(), dummy_handle()));
+
+        // Old connection's self-cleanup runs with its stale channel handle.
+        assert!(!remove_if_current(&mut map, "c1", &old_tx));
+        assert!(
+            map.get("c1")
+                .is_some_and(|(tx, _)| tx.same_channel(&new_tx)),
+            "the live replacement must survive the old connection's cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_no_entry_is_noop() {
+        let mut map: HashMap<String, CancellationSender> = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<()>(1);
+        assert!(!remove_if_current(&mut map, "absent", &tx));
+    }
+
+    // --- C3 #18: connection outcome folding ---
+
+    #[test]
+    fn fold_outcome_both_eof_is_completed() {
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Eof), Some(DirectionEnd::Eof)),
+            ConnectionOutcome::Completed
+        );
+    }
+
+    #[test]
+    fn fold_outcome_any_error_is_failed() {
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Eof), Some(DirectionEnd::Error)),
+            ConnectionOutcome::Failed
+        );
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Error), Some(DirectionEnd::Reset)),
+            ConnectionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn fold_outcome_join_failure_is_failed() {
+        // A direction whose task panicked/aborted (None) is a failure.
+        assert_eq!(
+            fold_outcome(None, Some(DirectionEnd::Eof)),
+            ConnectionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn fold_outcome_reset_without_error() {
+        // External teardown / sample-miss resets a direction without an error.
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Eof), Some(DirectionEnd::Reset)),
+            ConnectionOutcome::Reset
+        );
+        assert_eq!(
+            fold_outcome(Some(DirectionEnd::Reset), Some(DirectionEnd::Reset)),
+            ConnectionOutcome::Reset
+        );
     }
 }

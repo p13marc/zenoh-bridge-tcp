@@ -103,6 +103,15 @@ pub(super) async fn run_import_mode_internal(
                     }
                 }
             }
+            reaped = tasks.join_next(), if !tasks.is_empty() => {
+                // D5: reap completed connection tasks promptly, even while the
+                // listener is otherwise idle waiting for the next accept.
+                if let Some(Err(e)) = reaped {
+                    error!(error = %e, "Connection task panicked");
+                }
+                drop(permit);
+                continue;
+            }
             _ = shutdown_token.cancelled() => {
                 drop(permit);
                 info!(service = %service_name, "Import bridge shutting down, no new connections");
