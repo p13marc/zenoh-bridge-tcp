@@ -7,13 +7,16 @@ use flowscope::SessionParser;
 use flowscope::Timestamp;
 use flowscope::classify::{Classify, WireProtocol, classify_first_bytes};
 use flowscope::http::{HttpEvent, HttpProxyParser};
-use flowscope::http2::{Http2Config, Http2Event, Http2Parser, StreamHead, grpc_call};
+use flowscope::http2::{
+    GrpcStatus, Http2Config, Http2Event, Http2Parser, StreamHead, grpc_call, grpc_status,
+    grpc_status_of,
+};
 use flowscope::tls::{TlsMessage, TlsParser};
 use flowscope::{FlowSide, http::RequestHead};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zenoh::Session;
 
 /// Handle a single import connection
@@ -163,6 +166,7 @@ pub(super) async fn handle_import_connection(
         &dns_suffix,
         initial_buffer,
         config,
+        None,
     )
     .await
 }
@@ -430,6 +434,77 @@ where
     }
 }
 
+/// Scans a terminated-h2 **response** (Responder) byte stream for each stream's
+/// gRPC completion status (#62), read-only.
+struct GrpcStatusScanner {
+    parser: Http2Parser,
+    seen: std::collections::HashSet<u32>,
+}
+
+impl GrpcStatusScanner {
+    fn new() -> Self {
+        Self {
+            parser: Http2Parser::with_config(Http2Config::default().with_require_preface(false)),
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Feed a response chunk; call `on_status` once per stream as its gRPC status
+    /// becomes known — from `Trailers`, or a Trailers-Only response `Head`
+    /// (a `HEADERS` block that ends the stream, carrying `grpc-status`).
+    fn feed(&mut self, chunk: &[u8], mut on_status: impl FnMut(u32, GrpcStatus)) {
+        let mut pending = Bytes::copy_from_slice(chunk);
+        while !pending.is_empty() {
+            let accepted = self.parser.push(FlowSide::Responder, &pending);
+            pending = pending.slice(accepted..);
+            if accepted == 0 {
+                break;
+            }
+        }
+        while let Some(ev) = self.parser.next_event() {
+            let found = match ev {
+                Http2Event::Trailers {
+                    stream_id,
+                    ref fields,
+                    ..
+                } => grpc_status(fields).map(|s| (stream_id, s)),
+                Http2Event::Head(ref head) if head.end_stream => {
+                    grpc_status_of(head).map(|s| (head.stream_id, s))
+                }
+                _ => None,
+            };
+            if let Some((stream_id, status)) = found
+                && self.seen.insert(stream_id)
+            {
+                on_status(stream_id, status);
+            }
+        }
+    }
+}
+
+/// Build a [`ResponseTap`](super::bridge::ResponseTap) for a terminated-h2
+/// connection that surfaces gRPC completion status (#62): each call is recorded
+/// to the `zbridge_grpc_status_total{service,code}` metric and logged (a non-OK
+/// code at `warn`, since a failed gRPC call still carries HTTP 200).
+pub(super) fn h2_response_tap(service: String) -> super::bridge::ResponseTap {
+    let mut scanner = GrpcStatusScanner::new();
+    Box::new(move |chunk: &[u8]| {
+        scanner.feed(chunk, |stream_id, status| {
+            crate::metrics::metrics().record_grpc_status(&service, status.code);
+            if status.is_ok() {
+                debug!(stream_id, code = status.code, "terminated gRPC call OK");
+            } else {
+                warn!(
+                    stream_id,
+                    code = status.code,
+                    name = status.name().unwrap_or("?"),
+                    "terminated gRPC call returned an error status"
+                );
+            }
+        });
+    })
+}
+
 /// Detect a WebSocket upgrade from peeked (non-consumed) request bytes.
 ///
 /// Feeds the peek into an [`HttpProxyParser`] and inspects the first request
@@ -685,5 +760,83 @@ mod tests {
         let cfg = BridgeConfig::default();
         let (dns, _) = read_h2_head(&mut reader, &cfg).await.unwrap();
         assert_eq!(dns, "svc.example");
+    }
+
+    // --- gRPC status trailer surfacing (#62) ---
+
+    /// Encode a response HEADERS/Trailers field block into HEADERS frame(s).
+    fn h2_headers_frame(fields: &[(&[u8], &[u8])], end_stream: bool) -> Vec<u8> {
+        use flowscope::http2::{HpackEncoder, write_headers};
+        let owned: Vec<(Bytes, Bytes)> = fields
+            .iter()
+            .map(|(n, v)| (Bytes::copy_from_slice(n), Bytes::copy_from_slice(v)))
+            .collect();
+        let block = HpackEncoder::new().encode(&owned).expect("encodable");
+        write_headers(1, &block, end_stream, 16_384).expect("framable")
+    }
+
+    fn h2_data_frame(payload: &[u8], end_stream: bool) -> Vec<u8> {
+        let len = payload.len();
+        let mut f = vec![
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+            0x00,                                 // type: DATA
+            if end_stream { 0x01 } else { 0x00 }, // END_STREAM
+        ];
+        f.extend_from_slice(&1u32.to_be_bytes()); // stream id 1
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn scan(bytes: &[&[u8]]) -> Vec<(u32, u32)> {
+        let mut scanner = GrpcStatusScanner::new();
+        let mut got = Vec::new();
+        for chunk in bytes {
+            scanner.feed(chunk, |sid, st| got.push((sid, st.code)));
+        }
+        got
+    }
+
+    #[test]
+    fn grpc_status_scanner_reads_trailers_only() {
+        // A gRPC error is commonly a single HEADERS block (END_STREAM) with the
+        // status and no body — flowscope reports it as a Head, so grpc_status_of.
+        let resp = h2_headers_frame(
+            &[
+                (b":status", b"200"),
+                (b"content-type", b"application/grpc"),
+                (b"grpc-status", b"5"),
+            ],
+            true,
+        );
+        assert_eq!(scan(&[&resp]), vec![(1, 5)]);
+    }
+
+    #[test]
+    fn grpc_status_scanner_reads_headers_data_trailers() {
+        // The full-success shape: HEADERS(200) + DATA + Trailers(grpc-status: 0).
+        let head = h2_headers_frame(
+            &[(b":status", b"200"), (b"content-type", b"application/grpc")],
+            false,
+        );
+        let data = h2_data_frame(b"\x00\x00\x00\x00\x00", false);
+        let trailers = h2_headers_frame(&[(b"grpc-status", b"0")], true);
+        let full: Vec<u8> = [head, data, trailers].concat();
+        assert_eq!(scan(&[&full]), vec![(1, 0)]);
+    }
+
+    #[test]
+    fn grpc_status_scanner_reassembles_split_stream() {
+        let resp = h2_headers_frame(
+            &[
+                (b":status", b"200"),
+                (b"content-type", b"application/grpc"),
+                (b"grpc-status", b"9"),
+            ],
+            true,
+        );
+        let chunks: Vec<&[u8]> = resp.chunks(3).collect();
+        assert_eq!(scan(&chunks), vec![(1, 9)]);
     }
 }

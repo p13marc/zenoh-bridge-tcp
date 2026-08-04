@@ -11,13 +11,19 @@ use zenoh_ext::{
     MissDetectionConfig, RecoveryConfig,
 };
 
+/// An observer fed each backend->client (response) chunk before it is written,
+/// for read-only inspection of the relayed stream. The terminated-h2 path uses it
+/// to surface gRPC status from response trailers (#62); it never alters the bytes.
+pub(super) type ResponseTap = Box<dyn FnMut(&[u8]) + Send>;
+
 /// Shared bidirectional bridging logic for import connections.
 ///
 /// This function handles the Zenoh pub/sub setup and bidirectional data bridging
 /// for any import connection, regardless of transport (TCP, TLS-terminated, WebSocket).
 ///
 /// Generic over `TransportReader`/`TransportWriter` so the same function serves
-/// TCP, TLS-terminated, and WebSocket import paths.
+/// TCP, TLS-terminated, and WebSocket import paths. `response_tap`, when present,
+/// observes each response chunk (read-only) before it is relayed to the client.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn bridge_import_connection<R, W>(
     session: Arc<Session>,
@@ -28,6 +34,7 @@ pub(super) async fn bridge_import_connection<R, W>(
     dns_suffix: &str,
     initial_buffer: Option<Vec<u8>>,
     config: Arc<BridgeConfig>,
+    mut response_tap: Option<ResponseTap>,
 ) -> Result<()>
 where
     R: crate::transport::TransportReader,
@@ -202,6 +209,11 @@ where
                                 break;
                             }
                             svc_z2c.add_down(payload.len());
+                            // Read-only observation of the response stream (e.g.
+                            // gRPC status trailers, #62) before relaying it on.
+                            if let Some(tap) = response_tap.as_mut() {
+                                tap(&payload);
+                            }
                             if let Err(e) = writer.write_data(&payload).await {
                                 error!("Client {}: Failed to write to client: {:?}", z2c_client, e);
                                 z2c_cancel.cancel();

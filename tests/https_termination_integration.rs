@@ -363,3 +363,141 @@ async fn test_https_terminate_h2_end_to_end() {
     std::fs::remove_file(&cert_path).unwrap();
     std::fs::remove_file(&key_path).unwrap();
 }
+
+/// A plaintext h2 backend that answers with a gRPC-shaped response: HEADERS(200,
+/// content-type application/grpc) + DATA + trailers carrying `grpc-status`.
+async fn start_grpc_backend(
+    grpc_status: &'static str,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
+    use hyper::service::service_fn;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| async move {
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert(
+                        "grpc-status",
+                        hyper::header::HeaderValue::from_static(grpc_status),
+                    );
+                    let frames: Vec<Result<Frame<bytes::Bytes>, std::convert::Infallible>> = vec![
+                        Ok(Frame::data(bytes::Bytes::from_static(
+                            b"\x00\x00\x00\x00\x00",
+                        ))),
+                        Ok(Frame::trailers(trailers)),
+                    ];
+                    let body = StreamBody::new(futures::stream::iter(frames));
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .header("content-type", "application/grpc")
+                            .body(body)
+                            .unwrap(),
+                    )
+                });
+                let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// End-to-end (#62): a terminated gRPC call's `grpc-status` is surfaced on the
+/// import bridge's `/metrics` (`zbridge_grpc_status_total{service,code}`).
+#[tokio::test]
+async fn test_https_terminate_grpc_status_surfaced() {
+    use http_body_util::Empty;
+    use hyper_util::rt::{TokioExecutor, TokioIo};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Backend returns gRPC status 5 (NOT_FOUND) in trailers.
+    let (backend_addr, _backend) = start_grpc_backend("5").await;
+    let authority = "grpc.test";
+    let service = common::unique_service_name("grpcstatus");
+
+    let export_spec = format!("{service}/{authority}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = std::env::temp_dir();
+    let cert_path = dir.join("test_grpcstatus_cert.pem");
+    let key_path = dir.join("test_grpcstatus_key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let metrics_port = common::PortGuard::new();
+    let metrics_addr = metrics_port.release();
+    let import_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&[
+        "--https-terminate",
+        &import_spec,
+        "--tls-cert",
+        cert_path.to_str().unwrap(),
+        "--tls-key",
+        key_path.to_str().unwrap(),
+        "--metrics-addr",
+        &metrics_addr.to_string(),
+    ])
+    .await;
+
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("terminate listener did not start");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Make the terminated gRPC call.
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(&[b"h2"])));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tcp = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+            .await
+            .unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = hyper::Request::builder()
+        .uri(format!("https://{authority}/pkg.Svc/Method"))
+        .body(Empty::<bytes::Bytes>::new())
+        .unwrap();
+    let resp = tokio::time::timeout(Duration::from_secs(10), sender.send_request(req))
+        .await
+        .expect("gRPC request timed out")
+        .expect("gRPC request failed");
+    // gRPC keeps HTTP 200 even on error — the meaningful code is in trailers.
+    assert_eq!(resp.status(), 200);
+    let _ = resp.into_body();
+
+    // The tap records the status as the trailers pass through; poll /metrics.
+    let needle = format!("zbridge_grpc_status_total{{service=\"{service}\",code=\"5\"}} ");
+    common::wait_for(
+        || {
+            let url = format!("http://{metrics_addr}/metrics");
+            let needle = needle.clone();
+            async move {
+                match reqwest::get(url).await {
+                    Ok(r) => r.text().await.map(|b| b.contains(&needle)).unwrap_or(false),
+                    Err(_) => false,
+                }
+            }
+        },
+        Duration::from_secs(10),
+        "grpc-status metric surfaced",
+    )
+    .await
+    .expect("terminated gRPC status 5 was not surfaced in /metrics");
+
+    std::fs::remove_file(&cert_path).unwrap();
+    std::fs::remove_file(&key_path).unwrap();
+}

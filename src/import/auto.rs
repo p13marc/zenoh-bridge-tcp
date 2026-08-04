@@ -229,6 +229,7 @@ async fn handle_auto_http_connection(
                         "",
                         None,
                         config,
+                        None,
                     )
                     .await;
                 }
