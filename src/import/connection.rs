@@ -39,7 +39,7 @@ pub(super) async fn handle_import_connection(
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
     // Parse HTTP/HTTPS request if in HTTP mode to extract DNS
-    let (dns_suffix, initial_buffer) = if http_mode {
+    let (dns, initial_buffer) = if http_mode {
         // Peek at the first few bytes to detect HTTP vs HTTPS/TLS.
         // Bound the wait so an idle client cannot pin a task+fd forever (F4).
         let mut peek_buffer = vec![0u8; 16];
@@ -70,22 +70,7 @@ pub(super) async fn handle_import_connection(
                         client_id, dns, service_name
                     );
 
-                    // Check if backend is available by querying service liveliness
-                    let service_key = format!("{}/{}/available", service_name, dns);
-                    let liveliness_replies =
-                        session.liveliness().get(&service_key).await.map_err(|e| {
-                            anyhow::anyhow!("Failed to query service liveliness: {}", e)
-                        })?;
-
-                    // Check if any backend is alive
-                    let backend_available =
-                        tokio::time::timeout(config.availability_timeout, async {
-                            liveliness_replies.recv_async().await.is_ok()
-                        })
-                        .await
-                        .unwrap_or(false);
-
-                    if !backend_available {
+                    if !backend_available(&session, service_name, &dns, &config).await? {
                         warn!(
                             "Client {}: No backend available for DNS: {}",
                             client_id, dns
@@ -95,7 +80,7 @@ pub(super) async fn handle_import_connection(
                     }
 
                     info!("Client {}: Backend available for DNS: {}", client_id, dns);
-                    (format!("/{}", dns), Some(buffer))
+                    (Some(dns), Some(buffer))
                 }
                 Err(e) => {
                     warn!(
@@ -116,22 +101,7 @@ pub(super) async fn handle_import_connection(
                         client_id, dns, service_name
                     );
 
-                    // Check if backend is available by querying service liveliness
-                    let service_key = format!("{}/{}/available", service_name, dns);
-                    let liveliness_replies =
-                        session.liveliness().get(&service_key).await.map_err(|e| {
-                            anyhow::anyhow!("Failed to query service liveliness: {}", e)
-                        })?;
-
-                    // Check if any backend is alive
-                    let backend_available =
-                        tokio::time::timeout(config.availability_timeout, async {
-                            liveliness_replies.recv_async().await.is_ok()
-                        })
-                        .await
-                        .unwrap_or(false);
-
-                    if !backend_available {
+                    if !backend_available(&session, service_name, &dns, &config).await? {
                         warn!(
                             "Client {}: No backend available for DNS: {}",
                             client_id, dns
@@ -142,7 +112,7 @@ pub(super) async fn handle_import_connection(
                     }
 
                     info!("Client {}: Backend available for DNS: {}", client_id, dns);
-                    (format!("/{}", dns), Some(buffer))
+                    (Some(dns), Some(buffer))
                 }
                 Err(e) => {
                     warn!("Client {}: Failed to parse HTTP request: {}", client_id, e);
@@ -153,7 +123,7 @@ pub(super) async fn handle_import_connection(
             }
         }
     } else {
-        (String::new(), None)
+        (None, None)
     };
 
     let (tcp_reader, tcp_writer) = stream.into_split();
@@ -166,7 +136,7 @@ pub(super) async fn handle_import_connection(
         writer,
         service_name,
         client_id,
-        &dns_suffix,
+        dns.as_deref(),
         initial_buffer,
         config,
         None,
@@ -515,12 +485,14 @@ pub(super) fn h2_response_tap(service: String) -> super::bridge::ResponseTap {
     })
 }
 
-/// Detect a WebSocket upgrade from peeked (non-consumed) request bytes.
+/// Detect a WebSocket upgrade from peeked (non-consumed) request bytes,
+/// returning the parsed head so the caller can route on its Host.
 ///
 /// Feeds the peek into an [`HttpProxyParser`] and inspects the first request
-/// head's `Upgrade` header. A partial head simply yields `false` (the caller
-/// treats it as ordinary HTTP).
-pub(super) fn peek_is_websocket(peek: &[u8]) -> bool {
+/// head's `Upgrade` header. A partial head simply yields `None` (the caller
+/// treats it as ordinary HTTP). RFC-strict upgrade semantics (Connection
+/// token, Sec-WebSocket-*) arrive with #77.
+pub(super) fn peek_websocket_head(peek: &[u8]) -> Option<RequestHead> {
     let mut parser = HttpProxyParser::new();
     let mut pending = Bytes::copy_from_slice(peek);
     while !pending.is_empty() {
@@ -534,10 +506,32 @@ pub(super) fn peek_is_websocket(peek: &[u8]) -> bool {
         if let HttpEvent::RequestHead(head) = ev {
             return head
                 .header("upgrade")
-                .is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"));
+                .is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"))
+                .then_some(head);
         }
     }
-    false
+    None
+}
+
+/// Query whether a backend has announced `{service}/{dns}/available`, bounded
+/// by `config.availability_timeout`.
+pub(super) async fn backend_available(
+    session: &Session,
+    service_name: &str,
+    dns: &str,
+    config: &BridgeConfig,
+) -> Result<bool> {
+    let service_key = format!("{}/{}/available", service_name, dns);
+    let replies = session
+        .liveliness()
+        .get(&service_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to query service liveliness: {}", e))?;
+    Ok(tokio::time::timeout(config.availability_timeout, async {
+        replies.recv_async().await.is_ok()
+    })
+    .await
+    .unwrap_or(false))
 }
 
 #[cfg(test)]

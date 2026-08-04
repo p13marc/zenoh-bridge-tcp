@@ -133,32 +133,48 @@ async fn handle_auto_http_connection(
     let mut peek_buf = vec![0u8; 4096];
     let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
 
-    if peek_len > 0 {
-        let looks_like_ws = super::connection::peek_is_websocket(&peek_buf[..peek_len]);
+    if peek_len > 0
+        && let Some(head) = super::connection::peek_websocket_head(&peek_buf[..peek_len])
+    {
+        // Host-routed WS (#75): if a backend announced itself for this
+        // upgrade's Host, scope the connection to it; otherwise fall back
+        // to the bare service key (a plain `--backend svc/ws://…`).
+        let dns = match super::connection::routing_key_from_head(&head) {
+            Ok(dns)
+                if super::connection::backend_available(&session, service_name, &dns, &config)
+                    .await
+                    .unwrap_or(false) =>
+            {
+                Some(dns)
+            }
+            _ => None,
+        };
+        info!(
+            client_id = %client_id,
+            dns = %dns.as_deref().unwrap_or("-"),
+            "Detected WebSocket upgrade request"
+        );
 
-        if looks_like_ws {
-            info!(client_id = %client_id, "Detected WebSocket upgrade request");
-            match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws_stream) => {
-                    let (ws_sender, ws_receiver) = ws_stream.split();
-                    let reader = crate::transport::WsReader::new(ws_receiver);
-                    let writer = crate::transport::WsWriter::new(ws_sender);
-                    return super::bridge::bridge_import_connection(
-                        session,
-                        reader,
-                        writer,
-                        service_name,
-                        client_id,
-                        "",
-                        None,
-                        config,
-                        None,
-                    )
-                    .await;
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("WebSocket upgrade failed: {}", e));
-                }
+        match tokio_tungstenite::accept_async(stream).await {
+            Ok(ws_stream) => {
+                let (ws_sender, ws_receiver) = ws_stream.split();
+                let reader = crate::transport::WsReader::new(ws_receiver);
+                let writer = crate::transport::WsWriter::new(ws_sender);
+                return super::bridge::bridge_import_connection(
+                    session,
+                    reader,
+                    writer,
+                    service_name,
+                    client_id,
+                    dns.as_deref(),
+                    None,
+                    config,
+                    None,
+                )
+                .await;
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("WebSocket upgrade failed: {}", e));
             }
         }
     }

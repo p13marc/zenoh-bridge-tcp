@@ -57,7 +57,7 @@ async fn handle_ws_import_connection(
         writer,
         &service_name,
         &client_id,
-        "",
+        None,
         None,
         config,
         None,
