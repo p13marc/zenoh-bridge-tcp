@@ -364,6 +364,127 @@ async fn test_https_terminate_h2_end_to_end() {
     std::fs::remove_file(&key_path).unwrap();
 }
 
+/// A plaintext WebSocket echo backend: accepts the upgrade and echoes every
+/// text/binary message back.
+async fn start_ws_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use futures::{SinkExt, StreamExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    while let Some(Ok(msg)) = ws.next().await {
+                        if msg.is_text() || msg.is_binary() {
+                            if ws.send(msg).await.is_err() {
+                                break;
+                            }
+                        } else if msg.is_close() {
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    (addr, handle)
+}
+
+/// End-to-end (#71): a wss client -> `--https-terminate` (TLS ends at the bridge,
+/// routes the upgrade request by Host) -> Zenoh -> `--http-export` -> plaintext
+/// WebSocket backend. The upgrade and both frame types must round-trip — the
+/// terminated relay carries the 101 and subsequent frames opaquely.
+#[tokio::test]
+async fn test_https_terminate_wss_end_to_end() {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let (backend_addr, _backend) = start_ws_echo_backend().await;
+    let host = "ws.test";
+    let service = common::unique_service_name("wssterm");
+
+    // Export the plaintext WS backend for this host.
+    let export_spec = format!("{service}/{host}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Cert + terminating import.
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = std::env::temp_dir();
+    let cert_path = dir.join("test_wsse2e_cert.pem");
+    let key_path = dir.join("test_wsse2e_key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let import_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&[
+        "--https-terminate",
+        &import_spec,
+        "--tls-cert",
+        cert_path.to_str().unwrap(),
+        "--tls-key",
+        key_path.to_str().unwrap(),
+    ])
+    .await;
+
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("terminate listener did not start");
+    // Liveliness propagation: import declares -> export connects to backend.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // TLS to the terminating listener (http/1.1 — the upgrade is an h1 request),
+    // then the WebSocket handshake over the established TLS stream. The request
+    // URL's host is the routing key the bridge reads from the decrypted Host.
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(&[b"http/1.1"])));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tcp = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    let tls = connector.connect(server_name, tcp).await.unwrap();
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+
+    let (mut ws, resp) = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio_tungstenite::client_async(format!("wss://{host}/echo"), tls),
+    )
+    .await
+    .expect("wss handshake timed out")
+    .expect("wss handshake failed");
+    assert_eq!(
+        resp.status(),
+        101,
+        "terminated wss upgrade should complete with 101"
+    );
+
+    ws.send(Message::Text("hello-wss".into())).await.unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("text echo timed out")
+        .expect("stream closed before text echo")
+        .expect("text echo errored");
+    assert_eq!(echoed, Message::Text("hello-wss".into()));
+
+    ws.send(Message::Binary(vec![1u8, 2, 3, 250].into()))
+        .await
+        .unwrap();
+    let echoed = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("binary echo timed out")
+        .expect("stream closed before binary echo")
+        .expect("binary echo errored");
+    assert_eq!(echoed, Message::Binary(vec![1u8, 2, 3, 250].into()));
+
+    let _ = ws.close(None).await;
+
+    std::fs::remove_file(&cert_path).unwrap();
+    std::fs::remove_file(&key_path).unwrap();
+}
+
 /// A plaintext h2 backend that answers with a gRPC-shaped response: HEADERS(200,
 /// content-type application/grpc) + DATA + trailers carrying `grpc-status`.
 async fn start_grpc_backend(
