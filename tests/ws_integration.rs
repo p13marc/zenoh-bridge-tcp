@@ -472,3 +472,57 @@ async fn test_ws_host_routed_backends() -> Result<()> {
 
     Ok(())
 }
+
+/// #77 (peek-retry half): a WS handshake split across TCP segments must still
+/// be detected as an upgrade. Before the fix a single 4096-byte peek saw a
+/// partial head, misrouted the connection to the plain-HTTP path, and the
+/// client got a 502 (Host-routed availability check fails for a bare WS
+/// backend) instead of its 101.
+#[tokio::test]
+async fn test_ws_upgrade_split_across_segments() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ws_server_url = start_ws_echo_server("127.0.0.1:0").await?;
+    let service = common::unique_service_name("wssplit");
+
+    let export_spec = format!("{service}/{ws_server_url}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Hand-rolled upgrade request, written in two segments with a pause that
+    // guarantees the bridge's first peek sees only a partial head.
+    let request = concat!(
+        "GET /chat HTTP/1.1\r\n",
+        "Host: split.test\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        "Sec-WebSocket-Version: 13\r\n",
+        "\r\n"
+    );
+    let (first, second) = request.as_bytes().split_at(40);
+
+    let mut tcp = tokio::net::TcpStream::connect(import_addr).await?;
+    tcp.write_all(first).await?;
+    tcp.flush().await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    tcp.write_all(second).await?;
+    tcp.flush().await?;
+
+    let mut response = vec![0u8; 256];
+    let n = timeout(Duration::from_secs(10), tcp.read(&mut response)).await??;
+    let response = String::from_utf8_lossy(&response[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 101"),
+        "a split WS handshake must still upgrade (got: {response:.60})"
+    );
+
+    Ok(())
+}

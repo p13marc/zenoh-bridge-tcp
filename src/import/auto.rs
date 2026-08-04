@@ -122,6 +122,51 @@ async fn handle_auto_import_connection(
     }
 }
 
+/// Peek (never consume) until a complete HTTP request head is buffered, the
+/// peek window is exhausted at `max_header_size`, or `read_timeout` passes.
+///
+/// `TcpStream::peek` returns whatever is already buffered, so waiting for
+/// *more* bytes than currently available is a short poll loop rather than an
+/// await — bounded by the same deadline. `None` means "no complete head":
+/// the caller falls through to the plain-HTTP path, whose consuming reader
+/// produces the proper 400 on genuinely broken requests.
+async fn peek_full_http_head(
+    stream: &TcpStream,
+    config: &BridgeConfig,
+) -> Option<flowscope::http::RequestHead> {
+    let deadline = tokio::time::Instant::now() + config.read_timeout;
+    let mut size = 4096usize;
+    loop {
+        let mut buf = vec![0u8; size];
+        let n = match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
+            Err(_) | Ok(Err(_)) => return None,
+            Ok(Ok(0)) => return None,
+            Ok(Ok(n)) => n,
+        };
+        if let Some(head) = super::connection::peek_http_head(&buf[..n]) {
+            return Some(head);
+        }
+        if n == size {
+            // The window is full and still no head: widen it, up to the cap.
+            if size >= config.max_header_size {
+                return None;
+            }
+            size = (size * 2).min(config.max_header_size);
+        } else {
+            // Partial head and nothing new buffered yet — poll again shortly.
+            if tokio::time::timeout_at(
+                deadline,
+                tokio::time::sleep(std::time::Duration::from_millis(10)),
+            )
+            .await
+            .is_err()
+            {
+                return None;
+            }
+        }
+    }
+}
+
 /// Handle a prior-knowledge HTTP/2 (h2c) connection: peek the first request
 /// stream's `:authority`, mint the routing key, and relay everything verbatim.
 ///
@@ -198,12 +243,12 @@ async fn handle_auto_http_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
-    // Peek enough to detect WebSocket upgrade via proper HTTP parsing
-    let mut peek_buf = vec![0u8; 4096];
-    let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
-
-    if peek_len > 0
-        && let Some(head) = super::connection::peek_websocket_head(&peek_buf[..peek_len])
+    // Peek until the request head is complete (a WS handshake split across
+    // TCP segments must not be misrouted to the plain-HTTP path, #77), bounded
+    // by read_timeout and max_header_size. Peeking never consumes — the WS
+    // acceptor and the plain-HTTP reader both need the pristine stream.
+    if let Some(head) = peek_full_http_head(&stream, &config).await
+        && super::connection::head_is_websocket_upgrade(&head)
     {
         // Host-routed WS (#75): if a backend announced itself for this
         // upgrade's Host, scope the connection to it; otherwise fall back

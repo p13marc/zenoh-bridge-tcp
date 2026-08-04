@@ -496,14 +496,9 @@ pub(super) fn h2_response_tap(service: String) -> super::bridge::ResponseTap {
     })
 }
 
-/// Detect a WebSocket upgrade from peeked (non-consumed) request bytes,
-/// returning the parsed head so the caller can route on its Host.
-///
-/// Feeds the peek into an [`HttpProxyParser`] and inspects the first request
-/// head's `Upgrade` header. A partial head simply yields `None` (the caller
-/// treats it as ordinary HTTP). RFC-strict upgrade semantics (Connection
-/// token, Sec-WebSocket-*) arrive with #77.
-pub(super) fn peek_websocket_head(peek: &[u8]) -> Option<RequestHead> {
+/// Parse the first request head out of peeked (non-consumed) bytes, if one is
+/// complete. A partial head yields `None` — callers re-peek with more bytes.
+pub(super) fn peek_http_head(peek: &[u8]) -> Option<RequestHead> {
     let mut parser = HttpProxyParser::new();
     let mut pending = Bytes::copy_from_slice(peek);
     while !pending.is_empty() {
@@ -515,13 +510,20 @@ pub(super) fn peek_websocket_head(peek: &[u8]) -> Option<RequestHead> {
     }
     while let Some(ev) = parser.next_event() {
         if let HttpEvent::RequestHead(head) = ev {
-            return head
-                .header("upgrade")
-                .is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"))
-                .then_some(head);
+            return Some(head);
         }
     }
     None
+}
+
+/// Whether a request head asks for a WebSocket upgrade.
+///
+/// Single-header check for now; RFC-strict semantics (Connection token,
+/// comma lists, Sec-WebSocket-*) arrive with flowscope 0.24's
+/// `RequestHead::is_websocket_upgrade` (#77).
+pub(super) fn head_is_websocket_upgrade(head: &RequestHead) -> bool {
+    head.header("upgrade")
+        .is_some_and(|v| v.eq_ignore_ascii_case(b"websocket"))
 }
 
 /// Query whether a backend has announced `{service}/{dns}/available`, bounded
