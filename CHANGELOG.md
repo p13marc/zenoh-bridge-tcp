@@ -5,7 +5,7 @@
 ### Breaking
 
 - **The 9 routing flags are replaced by 2** (epic #81, design in
-  `docs/ROUTING-SIMPLIFICATION.md`):
+  `docs/routing.md`):
   `--listen '<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]'`
   and `--backend '<service>[@<host>]/<target>'`. Auto-detection is the default
   door; **cert presence implies TLS termination** (no cert = passthrough, zero
@@ -88,7 +88,7 @@
 - flowscope `http2` is a base dependency (#74); the `tls-termination` feature
   now gates only the rustls stack.
 - `docs/HTTP_ROUTING_GUIDE.md` removed — superseded by the README's routing
-  sections and `docs/ROUTING-SIMPLIFICATION.md`.
+  sections and `docs/routing.md`.
 
 ## [0.5.0] - 2026-04-08
 

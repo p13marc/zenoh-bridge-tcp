@@ -4,7 +4,7 @@
 //! that accept clients) and `--backend` (local services exposed onto the bus)
 //! — with the grammar in [`crate::spec`]. Zenoh session flags carry a
 //! `zenoh-` prefix. The route table itself is never configured: it lives on
-//! the Zenoh key space (`docs/ROUTING-SIMPLIFICATION.md`).
+//! the Zenoh key space (`docs/routing.md`).
 
 use crate::config::BridgeConfig;
 use crate::spec::{BackendSpec, ListenSpec};

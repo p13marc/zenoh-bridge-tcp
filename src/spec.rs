@@ -1,5 +1,4 @@
-//! The 0.7.0 unified routing spec grammar (`docs/ROUTING-SIMPLIFICATION.md` §5,
-//! epic #81):
+//! The 0.7.0 unified routing spec grammar (`docs/routing.md`, epic #81):
 //!
 //! ```text
 //! --listen  '<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]'
@@ -226,7 +225,7 @@ impl FromStr for ListenSpec {
         // The combinations that contradict themselves. proto=raw reads no
         // heads, so it can neither terminate for Host routing nor re-route
         // per request; route=request is the plaintext HTTP/1.1 proxy plane
-        // (docs/ROUTING-SIMPLIFICATION.md §5.5), so it cannot terminate.
+        // (docs/routing.md), so it cannot terminate.
         if proto == ProtoMode::Raw && route == RouteMode::Request {
             return Err(anyhow::anyhow!(
                 "proto=raw and route=request are contradictory: an opaque tunnel \
