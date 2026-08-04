@@ -292,6 +292,17 @@ pub(super) fn routing_key_from_head(head: &RequestHead) -> Result<String> {
 /// returned buffer is every byte read from the socket so far (head plus any body
 /// bytes that arrived in the same reads), forwarded verbatim to the backend as
 /// the connection's initial payload — the bridge relays, it does not rewrite.
+/// An [`HttpProxyParser`] whose caps honour `--max-header-size` — without
+/// this, flowscope's own 64 KiB head default silently overrides a larger
+/// configured cap (and a smaller one is enforced later than it could be).
+pub(super) fn http_head_parser(config: &BridgeConfig) -> HttpProxyParser {
+    HttpProxyParser::with_config(
+        flowscope::http::HttpProxyConfig::default()
+            .with_max_head_bytes(config.max_header_size)
+            .with_max_buffered_bytes(config.max_header_size.max(256 * 1024)),
+    )
+}
+
 pub(super) async fn read_http_head<R>(
     stream: &mut R,
     config: &BridgeConfig,
@@ -299,7 +310,7 @@ pub(super) async fn read_http_head<R>(
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut parser = HttpProxyParser::new();
+    let mut parser = http_head_parser(config);
     let outcome = read_until(stream, config, "HTTP request head", |chunk| {
         // Offer the new bytes to the parser, re-offering the tail on a short
         // count (the backpressure signal). The head fits well within the
@@ -507,8 +518,8 @@ pub(super) fn h2_response_tap(service: String) -> super::bridge::ResponseTap {
 
 /// Parse the first request head out of peeked (non-consumed) bytes, if one is
 /// complete. A partial head yields `None` — callers re-peek with more bytes.
-pub(super) fn peek_http_head(peek: &[u8]) -> Option<RequestHead> {
-    let mut parser = HttpProxyParser::new();
+pub(super) fn peek_http_head(peek: &[u8], config: &BridgeConfig) -> Option<RequestHead> {
+    let mut parser = http_head_parser(config);
     let mut pending = Bytes::copy_from_slice(peek);
     while !pending.is_empty() {
         let accepted = parser.push(FlowSide::Initiator, &pending);
@@ -626,12 +637,51 @@ mod tests {
     // #76: on read timeout the shared reader surfaces the bytes it consumed,
     // so a caller can fall back to relaying them opaquely (the h2c path, #74)
     // instead of silently dropping them on the floor.
+    // #76: a client that closes mid-head is a hard error naming the head kind,
+    // not a hang or a silent empty route.
+    #[tokio::test]
+    async fn read_until_eof_mid_head_errors() {
+        let hello = build_client_hello_with_sni("eof.example.com");
+        let half = hello[..hello.len() / 2].to_vec();
+        // ChunkedReader yields a zero-byte read once its queue empties -> EOF.
+        let mut reader = ChunkedReader::new(vec![half]);
+        let cfg = BridgeConfig::default();
+        let err = read_tls_sni(&mut reader, &cfg)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("closed before complete"), "{err}");
+    }
+
+    // #76: a head that never completes within max_header_size trips the size
+    // cap instead of buffering without bound.
+    #[tokio::test]
+    async fn read_until_oversized_head_errors() {
+        // A TLS record header declaring a large handshake, then filler that
+        // never completes a ClientHello.
+        let mut chunks = vec![vec![0x16, 0x03, 0x01, 0x40, 0x00, 0x01]];
+        for _ in 0..8 {
+            chunks.push(vec![0u8; 512]);
+        }
+        let mut reader = ChunkedReader::new(chunks);
+        let cfg = BridgeConfig {
+            max_header_size: 2048,
+            ..Default::default()
+        };
+        let err = read_tls_sni(&mut reader, &cfg)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds maximum size"), "{err}");
+    }
+
     // #77: WS-upgrade detection delegates to flowscope 0.24's RFC-strict
     // check — the shapes the old single-header check got wrong must now
     // resolve correctly.
     #[test]
     fn ws_upgrade_detection_is_rfc_strict() {
-        let ws = |wire: &[u8]| head_is_websocket_upgrade(&peek_http_head(wire).unwrap());
+        let cfg = BridgeConfig::default();
+        let ws = |wire: &[u8]| head_is_websocket_upgrade(&peek_http_head(wire, &cfg).unwrap());
 
         // Comma-listed Connection token + case variants: an upgrade.
         assert!(ws(

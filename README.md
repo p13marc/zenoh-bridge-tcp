@@ -186,7 +186,7 @@ Options:
       --buffer-size <BYTES>    Buffer size for read operations [default: 65536]
       --read-timeout <SECS>    Timeout for reading headers [default: 10]
       --drain-timeout <SECS>   Connection drain timeout [default: 5]
-      --log-level <LEVEL>      Log level: trace, debug, info, warn, error [default: info]
+      --log-level <LEVEL>      Log level: trace, debug, info, warn, error, off [default: info]
       --log-format <FORMAT>    Log format: pretty, compact, json [default: pretty]
   -h, --help                   Print help
   -V, --version                Print version
@@ -206,7 +206,7 @@ Options:
 | 0.6.x | 0.7.0 |
 |---|---|
 | `--import s/a` | `--listen s/a,proto=raw` |
-| `--http-import s/a` · `--auto-import s/a` | `--listen s/a` |
+| `--http-import s/a` · `--auto-import s/a` | `--listen s/a` (auto-detect: non-HTTP bytes now relay opaquely instead of 400ing) |
 | `--ws-import s/a` | `--listen s/a` (upgrade auto-detected) |
 | `--http-multiroute-import s/a` | `--listen s/a,route=request` |
 | `--https-terminate s/a --tls-cert C --tls-key K` | `--listen s/a,cert=C,key=K` |

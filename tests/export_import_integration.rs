@@ -1255,3 +1255,127 @@ async fn test_backend_restart_recovery() -> Result<()> {
 
     Ok(())
 }
+
+/// The entire reason `proto=raw` exists: a server-speaks-first protocol
+/// (SMTP-style banner) must flow through a raw listener whose client has not
+/// sent a single byte — i.e. the listener declares liveliness on connect, not
+/// on first read, and the auto-detect peek is genuinely skipped.
+#[tokio::test]
+async fn test_raw_listener_relays_server_first_banner() {
+    // Backend greets immediately on accept, then echoes one line.
+    let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = backend.accept().await {
+            tokio::spawn(async move {
+                let _ = s.write_all(b"220 bridge.test SMTP ready\r\n").await;
+                let mut buf = vec![0u8; 256];
+                if let Ok(n) = s.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = s.write_all(&buf[..n]).await;
+                }
+            });
+        }
+    });
+
+    let service = common::unique_service_name("smtpish");
+    let export_spec = format!("{}/{}", service, backend_addr);
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!("{}/{},proto=raw", service, import_addr);
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Connect and WRITE NOTHING: the banner must arrive anyway.
+    let mut client = TcpStream::connect(import_addr).await.unwrap();
+    let mut banner = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut banner))
+        .await
+        .expect("banner timed out — raw listener must not wait for client bytes")
+        .unwrap();
+    assert!(
+        banner[..n].starts_with(b"220 "),
+        "expected the SMTP-style banner, got {:?}",
+        String::from_utf8_lossy(&banner[..n])
+    );
+
+    // The connection still relays client bytes afterwards.
+    client.write_all(b"EHLO x\r\n").await.unwrap();
+    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut banner))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+    assert_eq!(&banner[..n], b"EHLO x\r\n");
+}
+
+/// The renamed Zenoh session flags actually reach the session config: two
+/// bridges peered explicitly via --zenoh-listen / --zenoh-connect (no
+/// multicast dependence for this pair) relay bytes end to end.
+#[tokio::test]
+async fn test_zenoh_endpoint_flags_wire_a_pair() {
+    let (backend_addr, _echo) = common::start_echo_server().await;
+    let service = common::unique_service_name("zflags");
+
+    let zenoh_port = common::PortGuard::new();
+    let zenoh_addr = zenoh_port.release();
+    let zenoh_listen = format!("tcp/{zenoh_addr}");
+    let zenoh_connect = format!("tcp/{zenoh_addr}");
+
+    let export_spec = format!("{}/{}", service, backend_addr);
+    let _export =
+        common::BridgeProcess::new(&["--backend", &export_spec, "--zenoh-listen", &zenoh_listen])
+            .await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!("{}/{},proto=raw", service, import_addr);
+    let _import = common::BridgeProcess::new(&[
+        "--listen",
+        &listen_spec,
+        "--zenoh-connect",
+        &zenoh_connect,
+        "--zenoh-mode",
+        "peer",
+    ])
+    .await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let mut client = TcpStream::connect(import_addr).await.unwrap();
+    client
+        .write_all(b"ping-via-explicit-endpoints")
+        .await
+        .unwrap();
+    let mut buf = vec![0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
+        .await
+        .expect("echo timed out")
+        .unwrap();
+    assert_eq!(&buf[..n], b"ping-via-explicit-endpoints");
+}
+
+/// --zenoh-config with an unreadable file fails fast with a clean error.
+#[tokio::test]
+async fn test_zenoh_config_missing_file_fails_fast() {
+    let out = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+        .args([
+            "--listen",
+            "svc/127.0.0.1:0,proto=raw",
+            "--zenoh-config",
+            "/nonexistent/zenoh.json5",
+        ])
+        .output()
+        .await
+        .expect("spawn bridge");
+    assert!(!out.status.success(), "missing zenoh config must be fatal");
+}

@@ -96,8 +96,10 @@ impl std::fmt::Display for ListenSpec {
         if self.proto == ProtoMode::Raw {
             write!(f, ",proto=raw")?;
         }
-        if matches!(self.tls, TlsMode::Terminate { .. }) {
-            write!(f, ",tls=terminate")?;
+        if let TlsMode::Terminate { cert, key } = &self.tls {
+            // Verbatim, so the displayed spec round-trips through the parser
+            // (it appears in error messages users copy-paste).
+            write!(f, ",cert={},key={}", cert.display(), key.display())?;
         }
         if self.route == RouteMode::Request {
             write!(f, ",route=request")?;
@@ -143,9 +145,19 @@ impl FromStr for ListenSpec {
         let mut key: Option<PathBuf> = None;
 
         for opt in parts {
+            if opt.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "empty option in --listen spec '{spec}' (trailing or doubled comma?)"
+                ));
+            }
             let (name, value) = opt.split_once('=').ok_or_else(|| {
                 anyhow::anyhow!("invalid --listen option '{opt}': expected 'key=value'")
             })?;
+            if value.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "--listen option '{name}=' has an empty value"
+                ));
+            }
             let duplicate = |name: &str| anyhow::anyhow!("duplicate --listen option '{name}='");
             match name {
                 "proto" => {
@@ -263,7 +275,20 @@ impl FromStr for BackendSpec {
                         "invalid --backend spec '{spec}': '@' with an empty host"
                     ));
                 }
-                (service, Some(normalize_dns(host)))
+                let host = normalize_dns(host);
+                // The host becomes a Zenoh key segment ({service}/{host}/…):
+                // without a charset check, '@*/…' would register a live
+                // wildcard capturing the whole service's routing, and other
+                // keyexpr metacharacters would fail late and confusingly.
+                for c in host.chars() {
+                    if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')) {
+                        return Err(anyhow::anyhow!(
+                            "backend host '{host}' contains an invalid character {c:?} \
+                             (allowed: alphanumerics, '-', '_', '.', ':')"
+                        ));
+                    }
+                }
+                (service, Some(host))
             }
             None => (head, None),
         };
@@ -435,6 +460,60 @@ mod tests {
     }
 
     #[test]
+    fn listen_trailing_comma_rejected() {
+        let err = "web/0.0.0.0:8080,"
+            .parse::<ListenSpec>()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("comma"), "{err}");
+    }
+
+    #[test]
+    fn listen_empty_option_value_rejected() {
+        // An empty cert path would otherwise surface only when the listener
+        // starts and fails to open "".
+        for spec in [
+            "web/0.0.0.0:8080,proto=",
+            "web/0.0.0.0:8443,cert=,key=/k.pem",
+            "web/0.0.0.0:8443,cert=/c.pem,key=",
+            "web/0.0.0.0:8080,route=",
+        ] {
+            let err = spec.parse::<ListenSpec>().unwrap_err().to_string();
+            assert!(err.contains("empty value"), "{spec}: {err}");
+        }
+    }
+
+    #[test]
+    fn listen_duplicate_cert_key_route_rejected() {
+        for spec in [
+            "web/0.0.0.0:8443,cert=/a.pem,cert=/b.pem,key=/k.pem",
+            "web/0.0.0.0:8443,cert=/c.pem,key=/a.pem,key=/b.pem",
+            "web/0.0.0.0:8080,route=request,route=request",
+        ] {
+            let err = spec.parse::<ListenSpec>().unwrap_err().to_string();
+            assert!(err.contains("duplicate"), "{spec}: {err}");
+        }
+    }
+
+    #[test]
+    fn listen_empty_service_rejected() {
+        assert!("/0.0.0.0:8080".parse::<ListenSpec>().is_err());
+    }
+
+    #[test]
+    fn backend_empty_target_rejected() {
+        assert!("web/".parse::<BackendSpec>().is_err());
+    }
+
+    #[test]
+    fn listen_display_shows_raw_and_request() {
+        let s: ListenSpec = "smtp/0.0.0.0:2525,proto=raw".parse().unwrap();
+        assert_eq!(s.to_string(), "smtp/0.0.0.0:2525,proto=raw");
+        let s: ListenSpec = "api/0.0.0.0:8080,route=request".parse().unwrap();
+        assert_eq!(s.to_string(), "api/0.0.0.0:8080,route=request");
+    }
+
+    #[test]
     fn listen_missing_slash_rejected() {
         assert!("just-a-service".parse::<ListenSpec>().is_err());
     }
@@ -516,6 +595,24 @@ mod tests {
     }
 
     #[test]
+    fn backend_wildcard_or_metachar_host_rejected() {
+        // '*' would become a live Zenoh key wildcard capturing the whole
+        // service's routing.
+        for spec in [
+            "web@*/127.0.0.1:8003",
+            "web@a*b/127.0.0.1:8003",
+            "web@host?x/127.0.0.1:8003",
+            "web@ho$t/127.0.0.1:8003",
+        ] {
+            let err = spec.parse::<BackendSpec>().unwrap_err().to_string();
+            assert!(err.contains("invalid character"), "{spec}: {err}");
+        }
+        // Legitimate host:port survives.
+        let s: BackendSpec = "web@api.example.com:8443/127.0.0.1:8003".parse().unwrap();
+        assert_eq!(s.host.as_deref(), Some("api.example.com:8443"));
+    }
+
+    #[test]
     fn backend_empty_host_rejected() {
         assert!("web@/127.0.0.1:8003".parse::<BackendSpec>().is_err());
     }
@@ -543,9 +640,17 @@ mod tests {
     // --- Display round-trips the routing-relevant shape ---
 
     #[test]
-    fn listen_display_shows_options() {
-        let s: ListenSpec = "web/0.0.0.0:8443,cert=/c.pem,key=/k.pem".parse().unwrap();
-        assert_eq!(s.to_string(), "web/0.0.0.0:8443,tls=terminate");
+    fn listen_display_round_trips_through_the_parser() {
+        for spec in [
+            "web/0.0.0.0:8080",
+            "smtp/0.0.0.0:2525,proto=raw",
+            "api/0.0.0.0:8080,route=request",
+            "web/0.0.0.0:8443,cert=/c.pem,key=/k.pem",
+        ] {
+            let parsed: ListenSpec = spec.parse().unwrap();
+            let reparsed: ListenSpec = parsed.to_string().parse().unwrap();
+            assert_eq!(parsed, reparsed, "{spec}");
+        }
     }
 
     #[test]
