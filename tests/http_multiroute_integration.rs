@@ -483,3 +483,117 @@ async fn test_multiroute_head_completes_promptly() {
 
     shutdown_token.cancel();
 }
+
+/// E2 (#27): two pipelined requests sent in a single write must both be routed
+/// and answered, in order, on one connection. The previous framing loop dropped
+/// bytes past the first request's body and could not locate the second request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_pipelined_requests() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
+
+    let backend_a_addr = start_backend("backend-a").await;
+    let backend_b_addr = start_backend("backend-b").await;
+
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let service = "mr-pipeline";
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec_a = format!("{}/host-a.test/{}", service, backend_a_addr);
+    let bridge_config = config.clone();
+    let export_a = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec_a, bridge_config, t1)
+            .await
+            .unwrap();
+    });
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec_b = format!("{}/host-b.test/{}", service, backend_b_addr);
+    let bridge_config = config.clone();
+    let export_b = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec_b, bridge_config, t1)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(500)).await;
+
+    let import_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let import_addr = import_listener.local_addr().unwrap();
+    drop(import_listener);
+
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let spec_import = format!("{}/{}", service, import_addr);
+    let bridge_config = config.clone();
+    let import_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
+            s2,
+            &spec_import,
+            bridge_config,
+            t2,
+        )
+        .await
+        .unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+
+    // Both requests in ONE write — classic pipelining.
+    let pipelined = "GET / HTTP/1.1\r\nHost: host-a.test\r\n\r\n\
+                     GET / HTTP/1.1\r\nHost: host-b.test\r\n\r\n";
+    stream.write_all(pipelined.as_bytes()).await.unwrap();
+
+    // Read until both backends have answered (or time out).
+    let mut response = Vec::new();
+    let mut buf = vec![0u8; 8192];
+    let collected = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let n = stream.read(&mut buf).await.expect("read error");
+            if n == 0 {
+                break;
+            }
+            response.extend_from_slice(&buf[..n]);
+            let s = String::from_utf8_lossy(&response);
+            if s.contains("backend-a") && s.contains("backend-b") {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        collected.is_ok(),
+        "timed out waiting for pipelined responses"
+    );
+
+    let s = String::from_utf8_lossy(&response);
+    // Two responses, both 200, and in request order (a before b).
+    assert_eq!(
+        s.matches("200 OK").count(),
+        2,
+        "expected two 200 responses, got: {}",
+        s
+    );
+    let a = s.find("backend-a").expect("missing backend-a response");
+    let b = s.find("backend-b").expect("missing backend-b response");
+    assert!(
+        a < b,
+        "responses out of order (a at {}, b at {}): {}",
+        a,
+        b,
+        s
+    );
+
+    drop(stream);
+    shutdown_token.cancel();
+    export_a.abort();
+    export_b.abort();
+    import_task.abort();
+}

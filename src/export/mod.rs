@@ -22,7 +22,7 @@ mod ws;
 mod tests;
 
 use crate::config::BridgeConfig;
-use crate::http_parser::normalize_dns;
+use crate::dns::normalize_dns;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;

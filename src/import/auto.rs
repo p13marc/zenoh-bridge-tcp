@@ -114,11 +114,15 @@ async fn handle_auto_import_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
-    use crate::protocol_detect::{DetectedProtocol, detect_protocol};
+    use flowscope::classify::{Classify, WireProtocol, classify_first_bytes};
 
-    // Peek at the first bytes to detect the protocol. Bound the wait so an idle
-    // client cannot pin a task+fd forever (F4).
-    let mut peek_buf = vec![0u8; 16];
+    // Peek at the first bytes to classify the protocol. `classify_first_bytes`
+    // is prefix-stable: a short read returns `NeedMore` rather than a wrong
+    // guess. 64 bytes comfortably covers the largest signature it needs (the
+    // 24-byte HTTP/2 preface); anything real (TLS record header, HTTP request
+    // line) decides from its first segment. Bound the wait so an idle client
+    // cannot pin a task+fd forever (F4).
+    let mut peek_buf = vec![0u8; 64];
     let peek_len = match tokio::time::timeout(config.read_timeout, stream.peek(&mut peek_buf)).await
     {
         Ok(Ok(n)) => n,
@@ -134,17 +138,21 @@ async fn handle_auto_import_connection(
         return Err(anyhow::anyhow!("Connection closed before sending any data"));
     }
 
-    let protocol = detect_protocol(&peek_buf[..peek_len]);
+    // `NeedMore` (a sub-signature fragment) falls back to opaque relay, matching
+    // the previous "unknown protocol -> raw TCP" behavior.
+    let protocol = match classify_first_bytes(&peek_buf[..peek_len]) {
+        Classify::Decided(p) => p,
+        _ => WireProtocol::Raw,
+    };
     info!(
         client_id = %client_id,
-        protocol = ?protocol,
-        "Auto-detected protocol"
+        protocol = %protocol,
+        "Auto-classified protocol"
     );
 
     match protocol {
-        DetectedProtocol::Tls => {
-            // Delegate to HTTP mode which already handles TLS detection
-            // via is_tls_handshake + parse_tls_client_hello
+        WireProtocol::Tls => {
+            // TLS/HTTPS — route by SNI (connection handler detects + parses it).
             super::connection::handle_import_connection(
                 session,
                 stream,
@@ -155,12 +163,19 @@ async fn handle_auto_import_connection(
             )
             .await
         }
-        DetectedProtocol::Http => {
-            // Could be regular HTTP or WebSocket upgrade
+        WireProtocol::Http1 => {
+            // Could be regular HTTP or a WebSocket upgrade.
             handle_auto_http_connection(session, stream, service_name, client_id, config).await
         }
-        DetectedProtocol::RawTcp => {
-            // Raw TCP passthrough — no DNS routing
+        WireProtocol::Http2Preface => {
+            // Prior-knowledge HTTP/2 has no routing path yet (flowscope Phase C, #50).
+            Err(anyhow::anyhow!(
+                "HTTP/2 prior-knowledge connection is not supported in auto-import mode"
+            ))
+        }
+        // SSH, raw, or an unrecognized first-byte class -> opaque passthrough,
+        // no DNS routing.
+        _ => {
             super::connection::handle_import_connection(
                 session,
                 stream,
@@ -187,8 +202,7 @@ async fn handle_auto_http_connection(
     let peek_len = stream.peek(&mut peek_buf).await.unwrap_or(0);
 
     if peek_len > 0 {
-        let looks_like_ws = matches!(crate::http_parser::try_parse_request(&peek_buf[..peek_len]),
-                Ok(Some(parsed)) if parsed.is_websocket_upgrade);
+        let looks_like_ws = super::connection::peek_is_websocket(&peek_buf[..peek_len]);
 
         if looks_like_ws {
             info!(client_id = %client_id, "Detected WebSocket upgrade request");

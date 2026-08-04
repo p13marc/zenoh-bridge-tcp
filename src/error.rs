@@ -8,8 +8,9 @@
 //! - **Public API** (`run_export_mode`, `run_import_mode`, spec parsers, config):
 //!   Returns `anyhow::Result<T>` for ergonomic error propagation and context.
 //!
-//! - **Internal parsing** (`http_parser`, `tls_parser`):
+//! - **Internal routing** (`import::connection`, `import::multiroute`):
 //!   Uses `BridgeError` / `error::Result<T>` for structured, matchable errors.
+//!   (L7 parsing itself is delegated to the `flowscope` crate.)
 //!
 //! `BridgeError` implements `std::error::Error` via `thiserror`, so it converts
 //! into `anyhow::Error` automatically through the `?` operator at module boundaries.

@@ -1,5 +1,4 @@
 use crate::config::BridgeConfig;
-use crate::http_parser::parse_http_request;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -140,12 +139,14 @@ async fn handle_tls_terminated_connection(
 ) -> Result<()> {
     let (mut tls_reader, tls_writer) = tokio::io::split(tls_stream);
 
-    // After TLS termination, we have plaintext HTTP. Parse Host header for routing.
-    let parsed = parse_http_request(&mut tls_reader).await.map_err(|e| {
-        anyhow::anyhow!("Failed to parse HTTP request after TLS termination: {}", e)
-    })?;
+    // After TLS termination, we have plaintext HTTP. Parse the request head for
+    // Host-based routing (flowscope streaming parser, same as the plain-HTTP path).
+    let (dns, buffer) = super::connection::read_http_head(&mut tls_reader, &config)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to parse HTTP request after TLS termination: {}", e)
+        })?;
 
-    let dns = parsed.dns.clone();
     let dns_suffix = format!("/{}", dns);
     info!(
         "Client {}: TLS-terminated HTTP routing to DNS: {}",
@@ -185,7 +186,7 @@ async fn handle_tls_terminated_connection(
         service_name,
         client_id,
         &dns_suffix,
-        Some(parsed.buffer),
+        Some(buffer),
         config,
     )
     .await
