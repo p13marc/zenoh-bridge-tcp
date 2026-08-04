@@ -179,6 +179,11 @@ async fn handle_multiroute_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
+    // Metrics (G7): count the connection; the guard decrements the active gauge
+    // on every exit path. Per-request byte accounting for multiroute is a
+    // follow-up — the counters here are connection-level (active/total).
+    let _conn_metrics = crate::metrics::conn_start(service_name);
+
     let mut parser = HttpProxyParser::new();
     let mut events: VecDeque<HttpEvent> = VecDeque::new();
     let mut client_eof = false;

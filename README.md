@@ -221,6 +221,8 @@ Options:
   -m, --mode <MODE>                          Zenoh mode: peer, client, or router [default: peer]
   -e, --connect <ENDPOINT>                   Zenoh connect endpoint (e.g., tcp/localhost:7447)
   -l, --listen <ENDPOINT>                    Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
+      --metrics-addr <ADDR>                  Expose /healthz, /readyz, /metrics on this address
+                                             Example: '0.0.0.0:9100' (disabled when unset)
       --buffer-size <BYTES>                  Buffer size for read operations [default: 65536]
       --read-timeout <SECS>                  Timeout for reading headers [default: 10]
       --drain-timeout <SECS>                 Connection drain timeout [default: 5]
@@ -503,6 +505,42 @@ RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --export 'service/12
 - **pretty** (default): Human-readable with colors
 - **compact**: Single-line format, less verbose
 - **json**: Structured JSON, ideal for log aggregation (ELK, Loki, etc.)
+
+## Observability
+
+Pass `--metrics-addr <addr>` to expose a small HTTP surface (disabled by default),
+suitable for Kubernetes probes and Prometheus scraping:
+
+```bash
+zenoh-bridge-tcp --export 'api/127.0.0.1:3000' --metrics-addr 0.0.0.0:9100
+```
+
+| Endpoint | Purpose | Response |
+|---|---|---|
+| `GET /healthz` | Liveness | `200 ok` while the process runs |
+| `GET /readyz`  | Readiness | `200 ready` once bridges are started, else `503 not ready` |
+| `GET /metrics` | Metrics | Prometheus text exposition (v0.0.4) |
+
+Counters are labelled per **service** (`service="…"`):
+
+- `zbridge_ready` — gauge, 1 when ready
+- `zbridge_active_connections{service}` — gauge of open connections
+- `zbridge_connections_total{service}` — counter of connections opened
+- `zbridge_bytes_total{service,direction="up|down"}` — bytes relayed (`up` =
+  client→backend, `down` = backend→client)
+- `zbridge_connections_outcome_total{service,outcome="completed|reset|failed"}`
+  — how connections ended
+
+Wire up a Kubernetes probe:
+
+```yaml
+livenessProbe:  { httpGet: { path: /healthz, port: 9100 } }
+readinessProbe: { httpGet: { path: /readyz,  port: 9100 } }
+```
+
+> Byte and outcome counters are recorded on the raw/HTTP/HTTPS/WebSocket data
+> planes; the `--http-multiroute-import` path currently reports connection-level
+> counters only (active/total).
 
 ## Performance Considerations
 

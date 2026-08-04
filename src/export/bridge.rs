@@ -343,6 +343,13 @@ where
     let client_id_for_reader = client_id.clone();
     let client_id_for_writer = client_id.clone();
 
+    // Metrics (G7): count this connection for the service; the guard decrements
+    // the active gauge on every exit path. `svc` is resolved once and cloned into
+    // each direction for lock-free per-chunk byte accounting.
+    let conn_metrics = crate::metrics::conn_start(&service_name);
+    let svc_b2z = conn_metrics.counters();
+    let svc_z2b = conn_metrics.counters();
+
     // Stream reliability: an unrecoverable sample miss means the byte stream has a
     // gap that cannot be delivered faithfully. Reset the connection rather than
     // hand corrupted bytes to the backend. The listener runs in the background for
@@ -382,6 +389,7 @@ where
                         Ok(data) => {
                             // Zero-copy: `data` is `Bytes`, published via Zenoh's
                             // `From<bytes::Bytes>` without a further copy.
+                            svc_b2z.add_down(data.len());
                             if let Err(e) = publisher.put(data).await {
                                 error!("Failed to publish for client {}: {:?}", client_id_for_reader, e);
                                 b2z_cancel.cancel();
@@ -423,6 +431,7 @@ where
                                 let _ = backend_writer.send_eof().await;
                                 break DirectionEnd::Eof;
                             }
+                            svc_z2b.add_up(payload.len());
                             if let Err(e) = backend_writer.write_data(&payload).await {
                                 error!("Failed to write to backend for client {}: {:?}", client_id_for_writer, e);
                                 z2b_cancel.cancel();
@@ -496,6 +505,11 @@ where
     };
 
     let outcome = fold_outcome(b2z_end, z2b_end);
+    conn_metrics.set_outcome(match outcome {
+        ConnectionOutcome::Completed => crate::metrics::ConnOutcome::Completed,
+        ConnectionOutcome::Reset => crate::metrics::ConnOutcome::Reset,
+        ConnectionOutcome::Failed => crate::metrics::ConnOutcome::Failed,
+    });
     info!(client_id = %client_id, ?outcome, "Connection handler stopped");
 
     Ok(outcome)

@@ -174,6 +174,13 @@ where
         }
     });
 
+    // Metrics (G7): count this connection for the service; the guard decrements
+    // the active gauge on every exit path. `svc` is resolved once and cloned into
+    // each direction for lock-free per-chunk byte accounting.
+    let conn_metrics = crate::metrics::conn_start(service_name);
+    let svc_z2c = conn_metrics.counters();
+    let svc_c2z = conn_metrics.counters();
+
     // Direction: Zenoh -> client. An empty payload is the backend's half-close;
     // propagate it as a FIN on the client's write side and end this direction
     // only. The reverse direction keeps flowing. Samples arrive via the bounded
@@ -194,6 +201,7 @@ where
                                 let _ = writer.send_eof().await;
                                 break;
                             }
+                            svc_z2c.add_down(payload.len());
                             if let Err(e) = writer.write_data(&payload).await {
                                 error!("Client {}: Failed to write to client: {:?}", z2c_client, e);
                                 z2c_cancel.cancel();
@@ -236,6 +244,7 @@ where
                         Ok(data) => {
                             // Zero-copy: `data` is `Bytes`, published via Zenoh's
                             // `From<bytes::Bytes>` without a further copy.
+                            svc_c2z.add_up(data.len());
                             if let Err(e) = publisher.put(data).await {
                                 error!("Client {}: Failed to publish to Zenoh: {:?}", c2z_client, e);
                                 c2z_cancel.cancel();
@@ -294,6 +303,15 @@ where
             client_id, e
         );
     }
+
+    // Metrics (G7): a tripped cancel token means the connection was reset
+    // (error or external teardown); otherwise both directions reached a clean
+    // half-close. Import lacks the export side's finer error/reset split.
+    conn_metrics.set_outcome(if conn_cancel.is_cancelled() {
+        crate::metrics::ConnOutcome::Reset
+    } else {
+        crate::metrics::ConnOutcome::Completed
+    });
 
     Ok(())
 }
