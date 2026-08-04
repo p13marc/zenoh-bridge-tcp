@@ -5,47 +5,30 @@ A bidirectional bridge that connects TCP services to the Zenoh distributed data 
 ## Overview
 
 This bridge enables:
-- **Export Mode**: Expose TCP backend services (e.g., databases, APIs) over Zenoh
-- **Import Mode**: Make Zenoh services accessible via TCP listeners
-- **Multiple Services**: Run multiple exports and imports simultaneously in a single bridge instance
-- **Automatic Connection Management**: Lazy connections with liveliness detection
+- **`--backend`**: expose local TCP/WebSocket services onto the Zenoh bus
+- **`--listen`**: accept clients on a local port and bridge them to services on the bus
+- **Multiple Services**: run many listeners and backends in a single bridge instance
+- **Automatic Connection Management**: lazy connections with liveliness detection
 
-## Protocol Support Matrix
+## How routing works
 
-The bridge relays raw bytes; some modes additionally **parse the L7 head to route**
-by hostname. HTTPS and gRPC-over-TLS work **today** via **SNI passthrough** — the
-bridge routes on the TLS SNI and never decrypts the traffic, so any TLS-based
-protocol (including HTTP/2 / gRPC) rides through unchanged.
+A listener needs no protocol configuration. It peeks the first bytes of each
+connection, classifies the protocol, and **mints a Zenoh key** from what it
+finds: the TLS **SNI** (passthrough — the bridge never decrypts), the HTTP/1
+**Host**, the HTTP/2 **`:authority`** (plaintext h2c, or decrypted when the
+listener holds a cert), a WebSocket upgrade's Host, or nothing at all for
+opaque traffic. Backends **self-announce** on the bus
+(`{service}/{host}/available` liveliness tokens), so the route table is never
+written anywhere — N listener bridges and M backend bridges form a
+many-to-many mesh with zero per-route configuration. HTTP/1.1, HTTP/2, and
+gRPC all ride through the same door: the codec is detected, never configured.
 
-| Import mode | Carries | Routes by | TLS handling | Protocol constraint |
-|---|---|---|---|---|
-| `--import` (raw) | **anything** — rsync, scp, SSH, Postgres, Redis, gRPC, HTTP(S), custom | nothing (opaque, one backend) | passthrough (never decrypted) | none — pure L4 tunnel |
-| `--http-import` | HTTP | Host header | plaintext (no TLS) | HTTP/1.1 |
-| `--http-multiroute-import` | HTTP, per-request routing on one keep-alive conn | Host header | plaintext (no TLS) | **HTTP/1.1 only** |
-| `--auto-import` | TLS/HTTPS, HTTP, WebSocket, or raw — detected from first bytes | TLS→**SNI**, HTTP→Host, else opaque | passthrough for TLS | routes HTTP/1.1; TLS (incl. h2/gRPC) passes through |
-| `--https-terminate` | HTTPS or h2/gRPC, decrypted at the bridge | **HTTP/1.1** → Host; **h2** → `:authority` (ALPN-selected) | **terminated** (needs `--tls-cert`/`--tls-key`, `tls-termination` feature; ALPN advertises `h2` + `http/1.1`) | HTTP/1.1 or HTTP/2 — an h2 connection is routed by its first stream's `:authority` and its multiplexed streams relayed opaquely (single-authority proxy, not per-stream demux) |
-| `--ws-import` | WebSocket | nothing (one backend) | n/a | WebSocket |
-
-Export counterparts: `--export` (raw), `--http-export` (Host-routed HTTP), `--ws-export`
-(WebSocket). SNI-routed HTTPS/gRPC needs no special export flag — export the TLS
-backend with a plain `--export` (or `--http-export` keyed by the SNI hostname).
-
-### Which mode do I use?
-
-- **gRPC (HTTP/2 over TLS)** → **SNI passthrough** (`--auto-import` by SNI, or raw
-  `--import` for a single backend) keeps the traffic encrypted end-to-end and is the
-  simplest option. Alternatively, `--https-terminate` now **decrypts** h2 and routes by
-  the request `:authority` (multiplexed streams relayed opaquely to one backend) — use
-  this when the bridge must hold the certificate. `--http-multiroute-import` remains
-  HTTP/1.1-only.
-- **HTTPS (browsers, REST-over-TLS)** → `--auto-import` for SNI routing to multiple
-  backends, raw `--import` for a single backend, or `--https-terminate` to have the
-  bridge hold the certificate and route the decrypted request (HTTP/1.1 by Host, h2 by
-  `:authority`).
-- **Plaintext HTTP with host routing** → `--http-import`, or `--http-multiroute-import`
-  when one keep-alive connection should reach different backends per request.
-- **rsync / scp / SSH / Postgres / Redis / any opaque TCP** → raw `--import` / `--export`.
-- **WebSocket** → `--ws-import` / `--ws-export`.
+The only decisions left to the operator are the ones the wire cannot answer
+(see [Listener options](#listener-options)): `proto=raw` for
+server-speaks-first protocols, `cert=`/`key=` when the bridge should be the
+TLS endpoint, and `route=request` for per-request HTTP/1.1 routing. The full
+design rationale lives in
+[docs/ROUTING-SIMPLIFICATION.md](docs/ROUTING-SIMPLIFICATION.md).
 
 ## Features
 
@@ -68,10 +51,10 @@ backend with a plain `--export` (or `--http-export` keyed by the SNI hostname).
 - **Multiple Backends**: One listener can route to N different HTTP/HTTPS servers
 - **End-to-End TLS**: HTTPS traffic is never decrypted by the bridge
 - **Per-Request Multiroute**: HTTP/1.1 keep-alive connections can route to different backends per request
-- **Optional TLS Termination**: Decrypt HTTPS at the bridge with `--https-terminate` (requires `tls-termination` feature)
+- **Optional TLS Termination**: decrypt at the bridge with `--listen …,cert=,key=` (requires `tls-termination` feature)
 
 ### Protocol Auto-Detection
-- **Auto-Import Mode**: Single listener detects TLS/HTTPS, HTTP, WebSocket, or raw TCP from the first bytes
+- **Auto-Detection**: a single listener detects TLS/HTTPS, HTTP, h2c, WebSocket, or raw TCP from the first bytes
 - **Zero Configuration**: No need to pre-declare protocol per listener
 
 ### Liveliness Detection
@@ -86,29 +69,29 @@ backend with a plain `--export` (or `--http-export` keyed by the SNI hostname).
 
 ## Architecture
 
-### Export Mode
+### Backend side (`--backend`)
 ```
 TCP Backend (e.g., HTTP server on :8003)
     ↕
-Zenoh Bridge (Export)
+Zenoh Bridge (--backend)
     ↕
 Zenoh Network
     ↕
-Zenoh Bridge (Import)
+Zenoh Bridge (--listen)
     ↕
 TCP Client connects to :8002
 ```
 
-The exporter:
+The backend bridge:
 1. Monitors for client liveliness tokens on `{service}/clients/{client_id}`
 2. Creates backend connection when client appears
 3. Subscribes to `{service}/tx/{client_id}` (data from client)
 4. Publishes to `{service}/rx/{client_id}` (data to client)
 5. Cleans up when client disconnects
 
-### Import Mode
+### Listener side (`--listen`)
 
-The importer:
+The listener bridge:
 1. Listens for TCP connections on specified address
 2. For each connection, creates unique client ID
 3. Declares liveliness token at `{service}/clients/{client_id}`
@@ -118,25 +101,21 @@ The importer:
 
 ## Quick Start
 
-### Export a TCP Service
-
-Make a local HTTP server accessible over Zenoh:
+### Expose a service onto the bus
 
 ```bash
 # Terminal 1: Start your HTTP server
 python3 -m http.server 8003
 
-# Terminal 2: Export it as "webserver" service
-zenoh-bridge-tcp --export 'webserver/127.0.0.1:8003'
+# Terminal 2: Expose it as the "webserver" service
+zenoh-bridge-tcp --backend 'webserver/127.0.0.1:8003'
 ```
 
-### Import a Zenoh Service
-
-Make the Zenoh service accessible via TCP:
+### Listen for clients
 
 ```bash
-# Terminal 3: Import "webserver" and listen on :8002
-zenoh-bridge-tcp --import 'webserver/127.0.0.1:8002'
+# Terminal 3: Accept clients for "webserver" on :8002
+zenoh-bridge-tcp --listen 'webserver/127.0.0.1:8002'
 
 # Terminal 4: Test with curl
 curl http://127.0.0.1:8002
@@ -144,20 +123,17 @@ curl http://127.0.0.1:8002
 
 ### Multiple Services
 
-Run multiple exports/imports in one bridge:
-
 ```bash
 zenoh-bridge-tcp \
-  --export 'api/127.0.0.1:3000' \
-  --export 'db/127.0.0.1:5432' \
-  --import 'frontend/0.0.0.0:8080' \
-  --mode peer
+  --backend 'api/127.0.0.1:3000' \
+  --backend 'db/127.0.0.1:5432' \
+  --listen 'frontend/0.0.0.0:8080'
 ```
 
 ## Building
 
 ### Prerequisites
-- Rust 1.85 or later (edition 2024)
+- Rust 1.97 or later (edition 2024; pinned as `rust-version`)
 
 ### Build
 ```bash
@@ -245,130 +221,126 @@ Use a Zenoh configuration file for advanced settings:
 
 ```bash
 zenoh-bridge-tcp \
-  --config zenoh-config.json5 \
-  --export 'myservice/127.0.0.1:8003' \
-  --import 'myservice/0.0.0.0:8002'
+  --zenoh-config zenoh-config.json5 \
+  --backend 'myservice/127.0.0.1:8003' \
+  --listen 'myservice/0.0.0.0:8002'
 ```
 
 ## Examples
 
-### Example 1: Traditional TCP Bridge for HTTP
+### Example 1: Plain TCP bridge for HTTP
 
 ```bash
 # Terminal 1: Start HTTP server
 python3 -m http.server 8003
 
-# Terminal 2: Export side
-zenoh-bridge-tcp --export 'http/127.0.0.1:8003'
+# Terminal 2: Backend side
+zenoh-bridge-tcp --backend 'http/127.0.0.1:8003'
 
-# Terminal 3: Import side (can be on different machine)
-zenoh-bridge-tcp --import 'http/127.0.0.1:8002' --connect tcp/exporter-host:7447
+# Terminal 3: Listener side (can be on a different machine)
+zenoh-bridge-tcp --listen 'http/127.0.0.1:8002' --zenoh-connect tcp/backend-host:7447
 
 # Terminal 4: Test
 curl http://127.0.0.1:8002
 ```
 
-### Example 2: HTTP Routing with Multiple Backends
+### Example 2: Host routing with multiple backends
 
 ```bash
 # Terminal 1: Start multiple HTTP servers
 python3 -m http.server 8001  # API backend
 python3 -m http.server 8002  # Web backend
 
-# Terminal 2: Export API backend for api.example.com
-zenoh-bridge-tcp --http-export 'http-service/api.example.com/127.0.0.1:8001'
+# Terminal 2: Expose the API backend for api.example.com
+zenoh-bridge-tcp --backend 'http-service@api.example.com/127.0.0.1:8001'
 
-# Terminal 3: Export Web backend for web.example.com
-zenoh-bridge-tcp --http-export 'http-service/web.example.com/127.0.0.1:8002'
+# Terminal 3: Expose the Web backend for web.example.com
+zenoh-bridge-tcp --backend 'http-service@web.example.com/127.0.0.1:8002'
 
-# Terminal 4: Import (single listener routes to both backends)
-zenoh-bridge-tcp --http-import 'http-service/0.0.0.0:8080'
+# Terminal 4: One listener routes to both backends
+zenoh-bridge-tcp --listen 'http-service/0.0.0.0:8080'
 
 # Terminal 5: Test routing by Host header
 curl -H "Host: api.example.com" http://127.0.0.1:8080/  # -> API backend
 curl -H "Host: web.example.com" http://127.0.0.1:8080/  # -> Web backend
 ```
 
-### Example 3: HTTPS Routing with SNI
+### Example 3: HTTPS / gRPC routing by SNI (zero-decrypt)
 
 ```bash
-# Start HTTPS backends with certificates
-# (Configure your HTTPS servers for api.example.com and web.example.com)
+# Expose HTTPS (or gRPC-over-TLS) backends by their SNI hostname
+zenoh-bridge-tcp --backend 'edge@api.example.com/127.0.0.1:8443'
+zenoh-bridge-tcp --backend 'edge@web.example.com/127.0.0.1:8444'
 
-# Export HTTPS backends
-zenoh-bridge-tcp --http-export 'https-service/api.example.com/127.0.0.1:8443'
-zenoh-bridge-tcp --http-export 'https-service/web.example.com/127.0.0.1:8444'
+# One listener; TLS is detected and routed by SNI, never decrypted —
+# HTTP/2 and gRPC ride through unchanged, end-to-end encrypted
+zenoh-bridge-tcp --listen 'edge/0.0.0.0:8443'
 
-# Import (automatically detects HTTPS via SNI)
-zenoh-bridge-tcp --http-import 'https-service/0.0.0.0:8443'
-
-# Test - SNI determines routing (no TLS termination!)
+# Test — the SNI picks the backend
 curl https://api.example.com:8443/ --resolve api.example.com:8443:127.0.0.1
 curl https://web.example.com:8443/ --resolve web.example.com:8443:127.0.0.1
 ```
 
-### Example 4: WebSocket Bridge
+### Example 4: TLS termination (cert implies it)
+
+```bash
+# The listener holds the certificate; backends receive plaintext.
+# HTTP/1.1 routes by Host, HTTP/2/gRPC by :authority (ALPN-negotiated).
+# Needs a build with --features tls-termination.
+zenoh-bridge-tcp \
+  --listen 'edge/0.0.0.0:8443,cert=/etc/tls/fullchain.pem,key=/etc/tls/privkey.pem'
+
+zenoh-bridge-tcp --backend 'edge@api.example.com/127.0.0.1:8080'
+```
+
+### Example 5: WebSocket bridge
 
 ```bash
 # Terminal 1: Start WebSocket echo server (using websocat or similar)
 websocat -s 127.0.0.1:9000
 
-# Terminal 2: Export WebSocket backend
-zenoh-bridge-tcp --ws-export 'wsecho/ws://127.0.0.1:9000'
+# Terminal 2: Expose the WebSocket backend (URL scheme selects the transport)
+zenoh-bridge-tcp --backend 'wsecho/ws://127.0.0.1:9000'
 
-# Terminal 3: Import as WebSocket listener
-zenoh-bridge-tcp --ws-import 'wsecho/0.0.0.0:8080'
+# Terminal 3: Listener — the upgrade is auto-detected
+zenoh-bridge-tcp --listen 'wsecho/0.0.0.0:8080'
 
 # Terminal 4: Connect WebSocket client
 websocat ws://127.0.0.1:8080
-# Type messages - they go through Zenoh to the WebSocket backend
 ```
 
-### Example 5: Netcat Echo Test
+### Example 6: Raw tunnel for server-speaks-first protocols
 
 ```bash
-# Terminal 1: Start netcat server
+# Terminal 1: An SMTP-ish server that greets first
 nc -l 8003
 
-# Terminal 2: Export
-zenoh-bridge-tcp --export 'echo/127.0.0.1:8003'
-
-# Terminal 3: Import
-zenoh-bridge-tcp --import 'echo/127.0.0.1:8002'
+# proto=raw skips the protocol peek: the bridge would otherwise wait for
+# client bytes that never come before the server's greeting
+zenoh-bridge-tcp --backend 'echo/127.0.0.1:8003'
+zenoh-bridge-tcp --listen 'echo/127.0.0.1:8002,proto=raw'
 
 # Terminal 4: Client
 nc 127.0.0.1 8002
-# Type messages - they go through Zenoh to the server
 ```
 
-### Example 6: Multiple Services
-
-```bash
-zenoh-bridge-tcp \
-  --export 'web/127.0.0.1:8080' \
-  --export 'api/127.0.0.1:3000' \
-  --import 'frontend/0.0.0.0:9001' \
-  --import 'admin/0.0.0.0:9002' \
-  --mode peer
-```
-
-### Example 7: With Zenoh Router
+### Example 7: With a Zenoh router
 
 ```bash
 # Terminal 1: Start Zenoh router
 zenohd
 
-# Terminal 2: Export side (client mode)
+# Terminal 2: Backend side (client mode)
 zenoh-bridge-tcp \
-  --export 'service/127.0.0.1:8003' \
-  --mode client \
-  --connect tcp/localhost:7447
+  --backend 'service/127.0.0.1:8003' \
+  --zenoh-mode client \
+  --zenoh-connect tcp/localhost:7447
 
-# Terminal 3: Import side (client mode)
+# Terminal 3: Listener side (client mode)
 zenoh-bridge-tcp \
-  --import 'service/0.0.0.0:8002' \
-  --mode client \
-  --connect tcp/localhost:7447
+  --listen 'service/0.0.0.0:8002' \
+  --zenoh-mode client \
+  --zenoh-connect tcp/localhost:7447
 ```
 
 ## Docker Deployment
@@ -379,11 +351,11 @@ Build and run with Docker:
 # Build image
 docker build -t zenoh-bridge-tcp .
 
-# Run with docker-compose
+# Run the demo topology (backend bridge + listener bridge + echo backend)
 docker-compose up -d
 
-# Test multi-bridge setup
-docker-compose --profile multi-bridge up -d
+# Add a Zenoh router + client-mode bridge
+docker-compose --profile with-router up -d
 ```
 
 ## Testing
@@ -441,20 +413,20 @@ End-to-end tests using [nlink-lab](https://github.com/p13marc/nlink-lab) to crea
 
 See [tests/nlink/README.md](tests/nlink/README.md) for debugging tips and topology details.
 
-See [tests/README.md](tests/README.md) for detailed testing documentation and [docs/HTTP_ROUTING_GUIDE.md](docs/HTTP_ROUTING_GUIDE.md) for the HTTP/HTTPS routing guide.
+See [tests/README.md](tests/README.md) for detailed testing documentation.
 
 ## Zenoh Key Expression Design
 
 The bridge uses a structured key expression pattern:
 
-### Traditional TCP Mode
+### Opaque connections
 ```
 {service_name}/tx/{client_id}      # Client -> Backend data
 {service_name}/rx/{client_id}      # Backend -> Client data
 {service_name}/clients/{client_id} # Liveliness token
 ```
 
-### HTTP/HTTPS Mode (DNS-based routing)
+### Hostname-routed connections (Host / SNI / :authority)
 ```
 {service_name}/{dns}/tx/{client_id}      # Client -> Backend data (for specific DNS)
 {service_name}/{dns}/rx/{client_id}      # Backend -> Client data (for specific DNS)
@@ -462,7 +434,7 @@ The bridge uses a structured key expression pattern:
 {service_name}/{dns}/available           # Backend availability signal
 ```
 
-Each TCP connection gets a unique `client_id`, ensuring isolation between clients. In HTTP/HTTPS mode, the `{dns}` component (extracted from Host header or SNI) enables routing to multiple backends through a single listener.
+Each connection gets a unique `client_id`, ensuring isolation between clients. The `{dns}` component — minted from the Host header, TLS SNI, or h2 `:authority` — routes one listener to many backends; backends announce themselves at `{service}/{dns}/available`, so the bus itself is the route table.
 
 ## Logging
 
@@ -470,19 +442,19 @@ Control log verbosity with CLI flags or `RUST_LOG` environment variable:
 
 ```bash
 # Using CLI flags (recommended)
-zenoh-bridge-tcp --log-level debug --export 'service/127.0.0.1:8003'
+zenoh-bridge-tcp --log-level debug --backend 'service/127.0.0.1:8003'
 
 # JSON format for production/log aggregation
-zenoh-bridge-tcp --log-level info --log-format json --export 'service/127.0.0.1:8003'
+zenoh-bridge-tcp --log-level info --log-format json --backend 'service/127.0.0.1:8003'
 
 # Compact format (less verbose)
-zenoh-bridge-tcp --log-format compact --export 'service/127.0.0.1:8003'
+zenoh-bridge-tcp --log-format compact --backend 'service/127.0.0.1:8003'
 
 # Using RUST_LOG (takes precedence over --log-level)
-RUST_LOG=debug zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
+RUST_LOG=debug zenoh-bridge-tcp --backend 'service/127.0.0.1:8003'
 
 # Module-specific with RUST_LOG
-RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --export 'service/127.0.0.1:8003'
+RUST_LOG=zenoh_bridge_tcp=debug,zenoh=warn zenoh-bridge-tcp --backend 'service/127.0.0.1:8003'
 ```
 
 ### Log Formats
@@ -497,7 +469,7 @@ Pass `--metrics-addr <addr>` to expose a small HTTP surface (disabled by default
 suitable for Kubernetes probes and Prometheus scraping:
 
 ```bash
-zenoh-bridge-tcp --export 'api/127.0.0.1:3000' --metrics-addr 0.0.0.0:9100
+zenoh-bridge-tcp --backend 'api/127.0.0.1:3000' --metrics-addr 0.0.0.0:9100
 ```
 
 | Endpoint | Purpose | Response |
@@ -515,9 +487,9 @@ Counters are labelled per **service** (`service="…"`):
   client→backend, `down` = backend→client)
 - `zbridge_connections_outcome_total{service,outcome="completed|reset|failed"}`
   — how connections ended
-- `zbridge_grpc_status_total{service,code}` — terminated gRPC calls by
-  `grpc-status` code (a failed gRPC call still carries HTTP 200, so this is the
-  meaningful signal)
+- `zbridge_grpc_status_total{service,code}` — gRPC calls (terminated h2 or
+  plaintext h2c) by `grpc-status` code (a failed gRPC call still carries HTTP
+  200, so this is the meaningful signal)
 
 Wire up a Kubernetes probe:
 
@@ -526,9 +498,8 @@ livenessProbe:  { httpGet: { path: /healthz, port: 9100 } }
 readinessProbe: { httpGet: { path: /readyz,  port: 9100 } }
 ```
 
-> Byte and outcome counters are recorded on the raw/HTTP/HTTPS/WebSocket data
-> planes; the `--http-multiroute-import` path currently reports connection-level
-> counters only (active/total).
+> Byte counters are recorded on every data plane, including the
+> `route=request` (per-request HTTP) plane.
 
 ## Performance Considerations
 

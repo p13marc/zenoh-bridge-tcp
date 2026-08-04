@@ -113,9 +113,9 @@ Required set: **HTTP/1.1, gRPC, HTTP/2 (ideally), raw TCP, ws and wss.**
 |---|---|---|---|
 | HTTP/1.1 | ✅ | ✅ (Host) | ✅ (Host; multiroute optional) |
 | HTTP/2 / gRPC over TLS | ✅ (SNI, zero-decrypt) | ✅ (`:authority`, single-authority relay) | — |
-| **h2c / prior-knowledge gRPC (plaintext)** | n/a | n/a | ❌ **rejected** (`auto.rs` errors on `Http2Preface`) |
+| **h2c / prior-knowledge gRPC (plaintext)** | n/a | n/a | ✅ routed by `:authority` (#74, 0.7.0) |
 | WebSocket (`ws://`) | n/a | — | ✅ (auto-detected upgrade; multiroute splices upgrades too) |
-| WebSocket over TLS (`wss://`) | ✅ (it's TLS on the wire → SNI-routed opaquely) | ⚠️ should work (route on Host, opaque relay carries the upgrade) but **untested** | n/a |
+| WebSocket over TLS (`wss://`) | ✅ (it's TLS on the wire → SNI-routed opaquely) | ✅ (e2e-tested, #71) | n/a |
 | Raw TCP (rsync, Postgres, …) | ✅ | n/a | ✅ |
 
 Export side: `--ws-export` already accepts both `ws://` and `wss://` backend URLs
@@ -470,3 +470,7 @@ non-gaps: ClientHello ALPN exposure, prior-knowledge h2c parsing, gRPC status bo
 #74 h2c/gRPC `:authority` routing (with RFC 9113 §3.4 timeout fallback to opaque relay) →
 #77 RFC-correct WS detection (flowscope 0.24) → #80 ALPN surfacing → #78 docs + 0.7.0
 release. Backlog: #79 attachment-points config file (no routes section, ever — §3.4).
+
+**Implementation status (2026-08-04):** the epic shipped. #71–#76, #80, and #74 are merged
+(PRs #83–#91); #77's flowscope-API half waits on the flowscope 0.24.0 crates.io release;
+#79 (site file) remains backlog. The 0.7.0 release is prepared but not tagged.
