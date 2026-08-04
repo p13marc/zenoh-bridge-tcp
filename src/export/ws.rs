@@ -1,14 +1,13 @@
 use super::CancellationSender;
-use super::bridge::handle_client_bridge;
 use crate::config::BridgeConfig;
 use backon::{ExponentialBuilder, Retryable};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
-use tracing::{Instrument, error, info, info_span, warn};
+use tracing::{error, info, info_span, warn};
 use zenoh::Session;
 
 /// Handle a WebSocket client connection event
@@ -51,27 +50,9 @@ pub(super) async fn handle_ws_client_connect(
         Ok((ws_stream, _response)) => {
             info!(client_id = %client_id, ws_url = %ws_url, "WebSocket backend connection established");
 
-            // Cancel any existing connection for this client ID BEFORE spawning new task
-            {
-                let mut senders = cancellation_senders.lock().await;
-                if let Some((old_cancel_tx, old_handle)) = senders.remove(client_id) {
-                    warn!(client_id = %client_id, "WS client already has active connection, cancelling old one");
-                    let _ = old_cancel_tx.send(()).await;
-                    let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
-                }
-            }
-
             let (ws_sender, ws_receiver) = ws_stream.split();
             let reader = crate::transport::WsReader::new(ws_receiver);
             let writer = crate::transport::WsWriter::new(ws_sender);
-
-            let session_clone = session.clone();
-            let service_name_clone = service_name.to_string();
-            let client_id_str = client_id.to_string();
-            let client_id_for_map = client_id.to_string();
-
-            // Create cancellation channel for graceful shutdown
-            let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
 
             let span = info_span!(
                 "ws_client_bridge",
@@ -80,33 +61,20 @@ pub(super) async fn handle_ws_client_connect(
                 ws_url = %ws_url
             );
 
-            // Spawn dedicated task for this client connection
-            let config_clone = config.clone();
-            let main_handle = tokio::spawn(
-                async move {
-                    if let Err(e) = handle_client_bridge(
-                        session_clone,
-                        service_name_clone,
-                        client_id_str,
-                        reader,
-                        writer,
-                        cancel_rx,
-                        None,
-                        config_clone,
-                    )
-                    .await
-                    {
-                        error!(error = %e, "WebSocket client bridge error");
-                    }
-                }
-                .instrument(span),
-            );
-
-            // Store the new task handle
-            cancellation_senders
-                .lock()
-                .await
-                .insert(client_id_for_map, (cancel_tx, main_handle));
+            // Cancel any prior connection, spawn the bridge, and track it so it
+            // frees its own map entry on completion (D1).
+            super::bridge::spawn_and_track(
+                session.clone(),
+                service_name.to_string(),
+                client_id.to_string(),
+                reader,
+                writer,
+                None,
+                config.clone(),
+                cancellation_senders,
+                span,
+            )
+            .await;
         }
         Err(e) => {
             error!(

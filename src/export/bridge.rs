@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
 use zenoh::qos::CongestionControl;
@@ -419,6 +419,100 @@ where
     Ok(())
 }
 
+/// Remove `client_id` from the map only if its entry is still the one owned by
+/// `own_tx`. Identity is checked with `mpsc::Sender::same_channel`, so a
+/// duplicate-connect that replaced the entry with a fresh channel is never
+/// clobbered by the previous connection's self-cleanup (D1 #21).
+///
+/// Returns `true` if an entry was removed.
+fn remove_if_current(
+    map: &mut HashMap<String, CancellationSender>,
+    client_id: &str,
+    own_tx: &mpsc::Sender<()>,
+) -> bool {
+    if map
+        .get(client_id)
+        .is_some_and(|(tx, _)| tx.same_channel(own_tx))
+    {
+        map.remove(client_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Spawn the per-client bridge task and record it in the cancellation map.
+///
+/// Shared by the TCP and WebSocket export paths. Cancels any existing connection
+/// for `client_id` first, then spawns the new bridge over the given transport
+/// halves.
+///
+/// D1 (#21): the spawned task removes its **own** map entry when it completes
+/// naturally, so entries no longer live forever after a backend-first close. The
+/// removal is guarded by `mpsc::Sender::same_channel`, so a later duplicate
+/// connect that replaced the entry is never clobbered. The insert is performed
+/// under the same lock the self-removal must acquire, so a fast-completing task
+/// cannot race ahead of its own insert and leave a stale entry behind.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn spawn_and_track<R, W>(
+    session: Arc<Session>,
+    service_name: String,
+    client_id: String,
+    reader: R,
+    writer: W,
+    dns_suffix: Option<String>,
+    config: Arc<BridgeConfig>,
+    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    span: tracing::Span,
+) where
+    R: crate::transport::TransportReader,
+    W: crate::transport::TransportWriter,
+{
+    // Cancel any existing connection for this client ID before spawning the new
+    // one. Take the old entry out under the lock, then drain it without holding
+    // the lock (a drain can take up to drain_timeout).
+    let existing = cancellation_senders.lock().await.remove(&client_id);
+    if let Some((old_cancel_tx, old_handle)) = existing {
+        warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
+        let _ = old_cancel_tx.send(()).await;
+        let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
+    }
+
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let self_remove_tx = cancel_tx.clone();
+    let map = cancellation_senders.clone();
+    let client_id_task = client_id.clone();
+
+    // Hold the map lock across spawn + insert. The task's self-removal acquires
+    // this same lock, so it cannot run before its entry is recorded.
+    let mut guard = cancellation_senders.lock().await;
+    let main_handle = tokio::spawn(
+        async move {
+            if let Err(e) = handle_client_bridge(
+                session,
+                service_name,
+                client_id_task.clone(),
+                reader,
+                writer,
+                cancel_rx,
+                dns_suffix.as_deref(),
+                config,
+            )
+            .await
+            {
+                error!(error = %e, "Client bridge error");
+            }
+            // D1: free our own entry on natural completion, but only if it is
+            // still ours (guards against a duplicate-connect replacement).
+            if remove_if_current(&mut *map.lock().await, &client_id_task, &self_remove_tx) {
+                debug!(client_id = %client_id_task, "Freed client map entry on completion");
+            }
+        }
+        .instrument(span),
+    );
+    guard.insert(client_id, (cancel_tx, main_handle));
+}
+
 /// Handle a client disconnection event
 pub(super) async fn handle_client_disconnect(
     client_id: &str,
@@ -451,5 +545,54 @@ pub(super) async fn handle_client_disconnect(
                 warn!("  Drain timeout for backend connection: {}", client_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dummy completed task handle to pair with a channel in the map.
+    fn dummy_handle() -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async {})
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_frees_own_entry() {
+        // D1: a connection that completes naturally frees its own map entry.
+        let mut map: HashMap<String, CancellationSender> = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<()>(1);
+        map.insert("c1".into(), (tx.clone(), dummy_handle()));
+
+        assert!(remove_if_current(&mut map, "c1", &tx));
+        assert!(map.is_empty(), "entry should be freed on completion");
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_leaves_replacement_untouched() {
+        // D1: a duplicate connect replaces the entry with a fresh channel. When
+        // the OLD connection later completes, its cleanup must not clobber the
+        // live replacement.
+        let mut map: HashMap<String, CancellationSender> = HashMap::new();
+        let (old_tx, _old_rx) = mpsc::channel::<()>(1);
+        let (new_tx, _new_rx) = mpsc::channel::<()>(1);
+
+        // Replacement is now installed under the same client id.
+        map.insert("c1".into(), (new_tx.clone(), dummy_handle()));
+
+        // Old connection's self-cleanup runs with its stale channel handle.
+        assert!(!remove_if_current(&mut map, "c1", &old_tx));
+        assert!(
+            map.get("c1")
+                .is_some_and(|(tx, _)| tx.same_channel(&new_tx)),
+            "the live replacement must survive the old connection's cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_if_current_no_entry_is_noop() {
+        let mut map: HashMap<String, CancellationSender> = HashMap::new();
+        let (tx, _rx) = mpsc::channel::<()>(1);
+        assert!(!remove_if_current(&mut map, "absent", &tx));
     }
 }
