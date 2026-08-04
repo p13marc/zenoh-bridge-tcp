@@ -211,6 +211,13 @@ async fn handle_tls_terminated_connection(
     let reader = crate::transport::TcpReader::new(tls_reader, config.buffer_size);
     let writer = crate::transport::TcpWriter::new(tls_writer);
 
+    // For h2, observe the response stream to surface gRPC status trailers (#62).
+    let response_tap = if is_h2 {
+        Some(super::connection::h2_response_tap(service_name.to_string()))
+    } else {
+        None
+    };
+
     super::bridge::bridge_import_connection(
         session,
         reader,
@@ -220,6 +227,7 @@ async fn handle_tls_terminated_connection(
         &dns_suffix,
         Some(buffer),
         config,
+        response_tap,
     )
     .await
 }

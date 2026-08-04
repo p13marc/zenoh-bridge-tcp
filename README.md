@@ -533,6 +533,9 @@ Counters are labelled per **service** (`service="…"`):
   client→backend, `down` = backend→client)
 - `zbridge_connections_outcome_total{service,outcome="completed|reset|failed"}`
   — how connections ended
+- `zbridge_grpc_status_total{service,code}` — terminated gRPC calls by
+  `grpc-status` code (a failed gRPC call still carries HTTP 200, so this is the
+  meaningful signal)
 
 Wire up a Kubernetes probe:
 

@@ -75,6 +75,10 @@ pub enum ConnOutcome {
 #[derive(Debug)]
 pub struct Metrics {
     services: Mutex<HashMap<String, Arc<Counters>>>,
+    /// gRPC completion counts keyed by (service, grpc-status code). Bounded
+    /// cardinality (service × the 17 defined codes); a gRPC call completes far
+    /// less often than a byte is relayed, so a lock per completion is fine.
+    grpc_statuses: Mutex<HashMap<(String, u32), u64>>,
     ready: AtomicBool,
 }
 
@@ -88,6 +92,7 @@ impl Metrics {
     fn new() -> Self {
         Self {
             services: Mutex::new(HashMap::new()),
+            grpc_statuses: Mutex::new(HashMap::new()),
             ready: AtomicBool::new(false),
         }
     }
@@ -96,6 +101,12 @@ impl Metrics {
     pub fn service(&self, name: &str) -> Arc<Counters> {
         let mut map = self.services.lock().expect("metrics mutex poisoned");
         map.entry(name.to_string()).or_default().clone()
+    }
+
+    /// Record a completed terminated-gRPC call's `grpc-status` code (#62).
+    pub fn record_grpc_status(&self, service: &str, code: u32) {
+        let mut map = self.grpc_statuses.lock().expect("metrics mutex poisoned");
+        *map.entry((service.to_string(), code)).or_insert(0) += 1;
     }
 
     /// Record the start of a connection for `service`, returning a guard that
@@ -192,6 +203,27 @@ impl Metrics {
                 Some(("outcome", "failed")),
                 c.failed.load(Ordering::Relaxed),
             ));
+        }
+
+        // Terminated-gRPC completions by status code (#62).
+        let mut grpc: Vec<((String, u32), u64)> = {
+            let map = self.grpc_statuses.lock().expect("metrics mutex poisoned");
+            map.iter().map(|(k, v)| (k.clone(), *v)).collect()
+        };
+        if !grpc.is_empty() {
+            grpc.sort_by(|a, b| a.0.cmp(&b.0));
+            out.push_str(
+                "# HELP zbridge_grpc_status_total Terminated gRPC calls by grpc-status code.\n",
+            );
+            out.push_str("# TYPE zbridge_grpc_status_total counter\n");
+            for ((svc, code), count) in &grpc {
+                out.push_str(&metric_line(
+                    "zbridge_grpc_status_total",
+                    svc,
+                    Some(("code", &code.to_string())),
+                    *count,
+                ));
+            }
         }
 
         out
@@ -411,5 +443,23 @@ mod tests {
     #[test]
     fn label_escaping() {
         assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    #[test]
+    fn grpc_status_counter_renders() {
+        let m = Metrics::new();
+        m.record_grpc_status("grpc", 5); // NOT_FOUND
+        m.record_grpc_status("grpc", 5);
+        m.record_grpc_status("grpc", 0); // OK
+        let text = m.render_prometheus();
+        assert!(text.contains("# TYPE zbridge_grpc_status_total counter"));
+        assert!(text.contains("zbridge_grpc_status_total{service=\"grpc\",code=\"5\"} 2"));
+        assert!(text.contains("zbridge_grpc_status_total{service=\"grpc\",code=\"0\"} 1"));
+    }
+
+    #[test]
+    fn grpc_status_absent_when_empty() {
+        let m = Metrics::new();
+        assert!(!m.render_prometheus().contains("zbridge_grpc_status_total"));
     }
 }
