@@ -28,7 +28,7 @@ async fn metrics_endpoints_respond() {
     // backend need not exist (it is only dialed when a client appears).
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args([
-            "--export",
+            "--backend",
             "metricsvc/127.0.0.1:1",
             "--metrics-addr",
             &metrics_addr_str,

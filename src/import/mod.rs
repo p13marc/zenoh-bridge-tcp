@@ -40,6 +40,57 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zenoh::Session;
 
+/// Run one `--listen` attachment point, dispatching on its parsed options.
+///
+/// The contradictory option combinations were rejected by [`ListenSpec`]
+/// parsing, leaving four: raw tunnel, auto-detect (the default door),
+/// per-request HTTP/1.1 routing, and TLS termination. TLS material is loaded
+/// here, lazily and per listener — a bad cert path fails this listener with a
+/// clear error instead of taking the whole process down before other
+/// listeners start.
+pub async fn run_listener(
+    session: Arc<Session>,
+    spec: crate::spec::ListenSpec,
+    config: Arc<BridgeConfig>,
+    shutdown_token: CancellationToken,
+) -> Result<()> {
+    use crate::spec::{ProtoMode, RouteMode, TlsMode};
+
+    // The internal mode runners consume the canonical 'service/addr' spec.
+    let mode_spec = format!("{}/{}", spec.service, spec.addr);
+
+    match (&spec.proto, &spec.tls, &spec.route) {
+        (ProtoMode::Raw, TlsMode::Passthrough, RouteMode::Connection) => {
+            listener::run_import_mode_internal(session, &mode_spec, false, config, shutdown_token)
+                .await
+        }
+        (ProtoMode::Auto, TlsMode::Passthrough, RouteMode::Connection) => {
+            auto::run_auto_import_mode(session, &mode_spec, config, shutdown_token).await
+        }
+        (ProtoMode::Auto, TlsMode::Passthrough, RouteMode::Request) => {
+            multiroute::run_http_multiroute_import_mode(session, &mode_spec, config, shutdown_token)
+                .await
+        }
+        #[cfg(feature = "tls-termination")]
+        (ProtoMode::Auto, TlsMode::Terminate { cert, key }, RouteMode::Connection) => {
+            let tls_config = crate::tls_config::load_tls_config(cert, key)?;
+            tls::run_https_terminate_import_mode(
+                session,
+                &mode_spec,
+                tls_config,
+                config,
+                shutdown_token,
+            )
+            .await
+        }
+        // Terminate without the feature is rejected by Args::validate();
+        // everything else is unreachable by the ListenSpec validation matrix.
+        _ => Err(anyhow::anyhow!(
+            "unsupported --listen option combination: {spec}"
+        )),
+    }
+}
+
 /// Parse import specification in format 'service_name/listen_addr'
 pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
     let parts: Vec<&str> = import_spec.split('/').collect();

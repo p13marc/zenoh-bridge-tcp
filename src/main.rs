@@ -62,27 +62,28 @@ async fn shutdown_signal() {
     }
 }
 
-/// Spawn bridge tasks from a list of specs using a factory closure
-fn spawn_bridge_tasks<F, Fut>(
+/// Spawn bridge tasks from a list of parsed specs using a factory closure
+fn spawn_bridge_tasks<S, F, Fut>(
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
-    specs: &[String],
+    specs: Vec<S>,
     mode: &'static str,
     shutdown_token: &CancellationToken,
     factory: F,
 ) where
-    F: Fn(String, CancellationToken) -> Fut + Send + 'static + Clone,
+    S: std::fmt::Display + Clone + Send + 'static,
+    F: Fn(S, CancellationToken) -> Fut + Send + 'static + Clone,
     Fut: std::future::Future<Output = Result<()>> + Send + 'static,
 {
     for spec in specs {
         let token = shutdown_token.child_token();
-        let spec_clone = spec.clone();
         let factory = factory.clone();
+        debug!(mode = mode, spec = %spec, "Spawning task");
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = factory(spec_clone.clone(), token).await {
-                tracing::error!(mode = %mode, spec = %spec_clone, error = %e, "Task failed");
+            let label = spec.to_string();
+            if let Err(e) = factory(spec, token).await {
+                tracing::error!(mode = %mode, spec = %label, error = %e, "Task failed");
             }
         }));
-        debug!(mode = mode, spec = %spec, "Spawned task");
     }
 }
 
@@ -98,20 +99,25 @@ async fn main() -> Result<()> {
     args.validate()?;
 
     // Configure Zenoh session
-    let config = if let Some(config_file) = &args.config {
-        if args.mode != "peer" || args.connect.is_some() || args.listen.is_some() {
+    let config = if let Some(config_file) = &args.zenoh_config {
+        if args.zenoh_mode != "peer" || args.zenoh_connect.is_some() || args.zenoh_listen.is_some()
+        {
             warn!(
-                "Config file provided; --mode, --connect, and --listen CLI arguments will be ignored"
+                "Zenoh config file provided; --zenoh-mode, --zenoh-connect, and --zenoh-listen will be ignored"
             );
         }
         info!(config_file = %config_file, "Loading Zenoh configuration from file");
         config::create_zenoh_config_from_file(config_file)?
     } else {
-        config::create_zenoh_config(&args.mode, args.connect.as_ref(), args.listen.as_ref())?
+        config::create_zenoh_config(
+            &args.zenoh_mode,
+            args.zenoh_connect.as_ref(),
+            args.zenoh_listen.as_ref(),
+        )?
     };
 
     // Open Zenoh session
-    info!(mode = %args.mode, "Opening Zenoh session");
+    info!(mode = %args.zenoh_mode, "Opening Zenoh session");
     let session = Arc::new(
         zenoh::open(config)
             .await
@@ -141,195 +147,47 @@ async fn main() -> Result<()> {
         signal_token.cancel();
     });
 
-    // Spawn tasks for each specification
-    let mut tasks = Vec::new();
-    let export_count = args.export.len();
-    let import_count = args.import.len();
-    let http_export_count = args.http_export.len();
-    let http_import_count = args.http_import.len();
-    let ws_export_count = args.ws_export.len();
-    let ws_import_count = args.ws_import.len();
-    let auto_import_count = args.auto_import.len();
-    let http_multiroute_import_count = args.http_multiroute_import.len();
+    // Spawn tasks for each attachment point. Specs were validated already;
+    // parse them into their structured form.
+    let listens = args.listen_specs()?;
+    let backends = args.backend_specs()?;
+    let listener_count = listens.len();
+    let backend_count = backends.len();
 
+    let mut tasks = Vec::new();
     let bridge_config = Arc::new(args.bridge_config());
 
-    // TCP export tasks
+    // Listener tasks: each --listen dispatches on its parsed options
+    // (auto/raw, passthrough/terminate, per-connection/per-request). TLS
+    // material, if any, is loaded lazily inside run_listener, per listener.
     {
         let session = session.clone();
         let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(&mut tasks, &args.export, "export", &shutdown_token, {
+        spawn_bridge_tasks(&mut tasks, listens, "listen", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
                 let config = bridge_config.clone();
-                async move { export::run_export_mode(session, &spec, config, token).await }
+                async move { import::run_listener(session, spec, config, token).await }
             }
         });
     }
 
-    // TCP import tasks
+    // Backend tasks: each --backend exposes a local target onto the bus.
     {
         let session = session.clone();
         let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(&mut tasks, &args.import, "import", &shutdown_token, {
+        spawn_bridge_tasks(&mut tasks, backends, "backend", &shutdown_token, {
             move |spec, token| {
                 let session = session.clone();
                 let config = bridge_config.clone();
-                async move { import::run_import_mode(session, &spec, config, token).await }
+                async move { export::run_backend(session, spec, config, token).await }
             }
         });
-    }
-
-    // HTTP export tasks
-    {
-        let session = session.clone();
-        let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(
-            &mut tasks,
-            &args.http_export,
-            "http_export",
-            &shutdown_token,
-            {
-                move |spec, token| {
-                    let session = session.clone();
-                    let config = bridge_config.clone();
-                    async move { export::run_http_export_mode(session, &spec, config, token).await }
-                }
-            },
-        );
-    }
-
-    // HTTP import tasks
-    {
-        let session = session.clone();
-        let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(
-            &mut tasks,
-            &args.http_import,
-            "http_import",
-            &shutdown_token,
-            {
-                move |spec, token| {
-                    let session = session.clone();
-                    let config = bridge_config.clone();
-                    async move { import::run_http_import_mode(session, &spec, config, token).await }
-                }
-            },
-        );
-    }
-
-    // WebSocket export tasks
-    {
-        let session = session.clone();
-        let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(&mut tasks, &args.ws_export, "ws_export", &shutdown_token, {
-            move |spec, token| {
-                let session = session.clone();
-                let config = bridge_config.clone();
-                async move { export::run_ws_export_mode(session, &spec, config, token).await }
-            }
-        });
-    }
-
-    // WebSocket import tasks
-    {
-        let session = session.clone();
-        let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(&mut tasks, &args.ws_import, "ws_import", &shutdown_token, {
-            move |spec, token| {
-                let session = session.clone();
-                let config = bridge_config.clone();
-                async move { import::run_ws_import_mode(session, &spec, config, token).await }
-            }
-        });
-    }
-
-    // Auto-detecting import tasks
-    {
-        let session = session.clone();
-        let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(
-            &mut tasks,
-            &args.auto_import,
-            "auto_import",
-            &shutdown_token,
-            {
-                move |spec, token| {
-                    let session = session.clone();
-                    let config = bridge_config.clone();
-                    async move { import::run_auto_import_mode(session, &spec, config, token).await }
-                }
-            },
-        );
-    }
-
-    // HTTP multiroute import tasks
-    {
-        let session = session.clone();
-        let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(
-            &mut tasks,
-            &args.http_multiroute_import,
-            "http_multiroute_import",
-            &shutdown_token,
-            {
-                move |spec, token| {
-                    let session = session.clone();
-                    let config = bridge_config.clone();
-                    async move {
-                        import::run_http_multiroute_import_mode(session, &spec, config, token).await
-                    }
-                }
-            },
-        );
-    }
-
-    // HTTPS termination import tasks (feature-gated)
-    #[cfg(feature = "tls-termination")]
-    let https_terminate_count = args.https_terminate.len();
-    #[cfg(not(feature = "tls-termination"))]
-    let https_terminate_count = 0;
-
-    #[cfg(feature = "tls-termination")]
-    if !args.https_terminate.is_empty() {
-        let tls_config = zenoh_bridge_tcp::tls_config::load_tls_config(
-            args.tls_cert.as_ref().unwrap(),
-            args.tls_key.as_ref().unwrap(),
-        )?;
-
-        for spec in &args.https_terminate {
-            let session = session.clone();
-            let spec_clone = spec.clone();
-            let tls_config = tls_config.clone();
-            let config = bridge_config.clone();
-            let token = shutdown_token.child_token();
-            tasks.push(tokio::spawn(async move {
-                if let Err(e) = import::run_https_terminate_import_mode(
-                    session,
-                    &spec_clone,
-                    tls_config,
-                    config,
-                    token,
-                )
-                .await
-                {
-                    tracing::error!(mode = "https_terminate", spec = %spec_clone, error = %e, "Task failed");
-                }
-            }));
-            debug!(mode = "https_terminate", spec = %spec, "Spawned task");
-        }
     }
 
     info!(
-        exports = export_count,
-        imports = import_count,
-        http_exports = http_export_count,
-        http_imports = http_import_count,
-        ws_exports = ws_export_count,
-        ws_imports = ws_import_count,
-        auto_imports = auto_import_count,
-        http_multiroute_imports = http_multiroute_import_count,
-        https_terminates = https_terminate_count,
+        listeners = listener_count,
+        backends = backend_count,
         "All bridge tasks started"
     );
 

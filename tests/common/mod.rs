@@ -177,7 +177,7 @@ impl BridgePair {
     /// Waits for the import bridge to accept connections before returning.
     pub async fn tcp(service: &str, backend_addr: SocketAddr) -> Self {
         let export_spec = format!("{}/{}", service, backend_addr);
-        let export = BridgeProcess::new(&["--export", &export_spec]).await;
+        let export = BridgeProcess::new(&["--backend", &export_spec]).await;
 
         // Export bridge doesn't listen on TCP, so we must give it time
         // to connect to the Zenoh network before starting the import side.
@@ -185,9 +185,9 @@ impl BridgePair {
 
         let import_port = PortGuard::new();
         let import_addr = import_port.addr();
-        let import_spec = format!("{}/{}", service, import_addr);
+        let import_spec = format!("{}/{},proto=raw", service, import_addr);
         let import_addr = import_port.release();
-        let import = BridgeProcess::new(&["--import", &import_spec]).await;
+        let import = BridgeProcess::new(&["--listen", &import_spec]).await;
 
         wait_for_port(import_addr, Duration::from_secs(10))
             .await
@@ -208,7 +208,7 @@ impl BridgePair {
         extra_import_args: &[&str],
     ) -> Self {
         let export_spec = format!("{}/{}", service, backend_addr);
-        let mut export_args: Vec<&str> = vec!["--export", &export_spec];
+        let mut export_args: Vec<&str> = vec!["--backend", &export_spec];
         export_args.extend_from_slice(extra_export_args);
         let export = BridgeProcess::new(&export_args).await;
 
@@ -216,9 +216,9 @@ impl BridgePair {
 
         let import_port = PortGuard::new();
         let import_addr = import_port.addr();
-        let import_spec = format!("{}/{}", service, import_addr);
+        let import_spec = format!("{}/{},proto=raw", service, import_addr);
         let import_addr = import_port.release();
-        let mut import_args: Vec<&str> = vec!["--import", &import_spec];
+        let mut import_args: Vec<&str> = vec!["--listen", &import_spec];
         import_args.extend_from_slice(extra_import_args);
         let import = BridgeProcess::new(&import_args).await;
 
@@ -236,8 +236,8 @@ impl BridgePair {
     /// Start an HTTP export+import bridge pair with DNS-based routing.
     /// Waits for the import bridge to accept connections before returning.
     pub async fn http(service: &str, dns: &str, backend_addr: SocketAddr) -> Self {
-        let export_spec = format!("{}/{}/{}", service, dns, backend_addr);
-        let export = BridgeProcess::new(&["--http-export", &export_spec]).await;
+        let export_spec = format!("{}@{}/{}", service, dns, backend_addr);
+        let export = BridgeProcess::new(&["--backend", &export_spec]).await;
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -245,7 +245,7 @@ impl BridgePair {
         let import_addr = import_port.addr();
         let import_spec = format!("{}/{}", service, import_addr);
         let import_addr = import_port.release();
-        let import = BridgeProcess::new(&["--http-import", &import_spec]).await;
+        let import = BridgeProcess::new(&["--listen", &import_spec]).await;
 
         wait_for_port(import_addr, Duration::from_secs(10))
             .await
@@ -262,7 +262,7 @@ impl BridgePair {
     /// Waits for the import bridge to accept connections before returning.
     pub async fn ws(service: &str, backend_url: &str) -> Self {
         let export_spec = format!("{}/{}", service, backend_url);
-        let export = BridgeProcess::new(&["--ws-export", &export_spec]).await;
+        let export = BridgeProcess::new(&["--backend", &export_spec]).await;
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -270,7 +270,7 @@ impl BridgePair {
         let import_addr = import_port.addr();
         let import_spec = format!("{}/{}", service, import_addr);
         let import_addr = import_port.release();
-        let import = BridgeProcess::new(&["--ws-import", &import_spec]).await;
+        let import = BridgeProcess::new(&["--listen", &import_spec]).await;
 
         wait_for_port(import_addr, Duration::from_secs(10))
             .await

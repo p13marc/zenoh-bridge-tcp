@@ -13,9 +13,12 @@ use tokio::process::Command;
 /// accept them — clap rejects the unknown argument rather than silently ignoring
 /// it (which would be a confusing no-op).
 #[tokio::test]
-async fn default_build_rejects_https_terminate() {
+async fn default_build_rejects_terminating_listen_by_feature_name() {
+    // cert=/key= parse in every build (the grammar is feature-independent);
+    // a default build must reject them at validation, naming the feature the
+    // user has to enable rather than a cryptic unknown-argument error.
     let out = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--https-terminate", "svc/0.0.0.0:8443"])
+        .args(["--listen", "svc/0.0.0.0:8443,cert=/c.pem,key=/k.pem"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -24,11 +27,11 @@ async fn default_build_rejects_https_terminate() {
 
     assert!(
         !out.status.success(),
-        "a default build must reject the gated --https-terminate flag"
+        "a default build must reject a terminating --listen spec"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("unexpected argument") || stderr.contains("https-terminate"),
-        "expected an unknown-argument error, got: {stderr}"
+        stderr.contains("tls-termination"),
+        "expected the error to name the tls-termination feature, got: {stderr}"
     );
 }

@@ -39,7 +39,39 @@ pub(super) enum ExportBackend {
         addr: SocketAddr,
         dns_suffix: Option<String>,
     },
-    WebSocket(String),
+    WebSocket {
+        url: String,
+        dns_suffix: Option<String>,
+    },
+}
+
+/// Run one `--backend` attachment point: expose a local target onto the bus.
+///
+/// The target's scheme selects the transport (`host:port` TCP, `ws://`/`wss://`
+/// WebSocket); an `@host` in the spec registers `{service}/{host}/available`
+/// for hostname routing, for either transport.
+pub async fn run_backend(
+    session: Arc<Session>,
+    spec: crate::spec::BackendSpec,
+    config: Arc<BridgeConfig>,
+    shutdown_token: CancellationToken,
+) -> Result<()> {
+    let crate::spec::BackendSpec {
+        service,
+        host,
+        target,
+    } = spec;
+    let backend = match target {
+        crate::spec::BackendTarget::Tcp(addr) => ExportBackend::Tcp {
+            addr,
+            dns_suffix: host,
+        },
+        crate::spec::BackendTarget::Ws(url) => ExportBackend::WebSocket {
+            url,
+            dns_suffix: host,
+        },
+    };
+    bridge::run_export_loop(session, &service, backend, config, shutdown_token).await
 }
 
 /// Parse export specification in format 'service_name/backend_addr'
@@ -180,7 +212,10 @@ pub async fn run_ws_export_mode(
     bridge::run_export_loop(
         session,
         &service_name,
-        ExportBackend::WebSocket(ws_url),
+        ExportBackend::WebSocket {
+            url: ws_url,
+            dns_suffix: None,
+        },
         config,
         shutdown_token,
     )

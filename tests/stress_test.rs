@@ -21,7 +21,7 @@ async fn start_export_bridge(
 ) -> Result<tokio::process::Child> {
     let export_spec = format!("{}/{}", service_name, backend_addr);
     let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--export", &export_spec])
+        .args(["--backend", &export_spec])
         .kill_on_drop(true)
         .spawn()?;
 
@@ -34,9 +34,9 @@ async fn start_import_bridge(
     listen_addr: &str,
     service_name: &str,
 ) -> Result<tokio::process::Child> {
-    let import_spec = format!("{}/{}", service_name, listen_addr);
+    let import_spec = format!("{}/{},proto=raw", service_name, listen_addr);
     let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--import", &import_spec])
+        .args(["--listen", &import_spec])
         .kill_on_drop(true)
         .spawn()?;
 

@@ -1,5 +1,42 @@
 # Changelog
 
+## [Unreleased] — 0.7.0
+
+### Breaking
+
+- **The 9 routing flags are replaced by 2** (epic #81, design in
+  `docs/ROUTING-SIMPLIFICATION.md`):
+  `--listen '<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]'`
+  and `--backend '<service>[@<host>]/<target>'`. Auto-detection is the default
+  door; **cert presence implies TLS termination** (no cert = passthrough, zero
+  key material on the bridge); a `ws://`/`wss://` target selects WebSocket.
+  Migration:
+
+  | 0.6.x | 0.7.0 |
+  |---|---|
+  | `--import s/a` | `--listen s/a,proto=raw` |
+  | `--http-import s/a` · `--auto-import s/a` | `--listen s/a` |
+  | `--ws-import s/a` | `--listen s/a` (upgrade auto-detected; the forced-upgrade semantics of `--ws-import` are gone) |
+  | `--http-multiroute-import s/a` | `--listen s/a,route=request` |
+  | `--https-terminate s/a --tls-cert C --tls-key K` | `--listen s/a,cert=C,key=K` (per-listener certs) |
+  | `--export s/b` | `--backend s/b` |
+  | `--http-export s/d/b` | `--backend s@d/b` |
+  | `--ws-export s/ws://u` | `--backend s/ws://u` |
+
+- **Zenoh session flags renamed**: `-m/--mode` → `--zenoh-mode`,
+  `-e/--connect` → `--zenoh-connect`, `-l/--listen` → `--zenoh-listen`,
+  `-c/--config` → `--zenoh-config`. Short flags are dropped (`-l` must not
+  silently change meaning between 0.6 and 0.7).
+- A default (non-`tls-termination`) build now rejects `cert=`/`key=` at spec
+  validation with an error naming the missing feature, instead of a clap
+  unknown-argument error for `--https-terminate`.
+
+### Added
+
+- `--backend 'svc@host/ws://…'`: WebSocket backends can register for hostname
+  routing (`{service}/{host}/available`), which the removed `--ws-export`
+  could not express.
+
 ## [0.5.0] - 2026-04-08
 
 ### Added

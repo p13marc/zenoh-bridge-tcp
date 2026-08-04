@@ -5,8 +5,8 @@
 #   [backend] --- [site-a] ===WAN=== [site-b] --- [client]
 #
 #   backend:  runs a TCP echo server (nc -lk)
-#   site-a:   runs zenoh-bridge-tcp --export (connects to backend)
-#   site-b:   runs zenoh-bridge-tcp --import (listens for clients)
+#   site-a:   runs zenoh-bridge-tcp --backend (connects to backend)
+#   site-b:   runs zenoh-bridge-tcp --listen (listens for clients)
 #   client:   connects to site-b import listener and sends data through
 #             the full chain: client -> import bridge -> zenoh -> export bridge -> backend
 #
@@ -62,7 +62,7 @@ node backend {
 node exporter {
     depends-on [backend]
     startup-delay 1s
-    run ["${bridge_bin}", "--export", "echo/10.0.1.10:8003", "--mode", "peer", "--log-level", "debug"] background
+    run ["${bridge_bin}", "--backend", "echo/10.0.1.10:8003", "--zenoh-mode", "peer", "--log-level", "debug"] background
     healthcheck "bash -c 'true'"
     healthcheck-timeout 15s
     route default via 10.0.3.1
@@ -72,7 +72,7 @@ node exporter {
 node importer {
     depends-on [exporter]
     startup-delay 2s
-    run ["${bridge_bin}", "--import", "echo/0.0.0.0:8002", "--mode", "peer", "--log-level", "debug"] background
+    run ["${bridge_bin}", "--listen", "echo/0.0.0.0:8002,proto=raw", "--zenoh-mode", "peer", "--log-level", "debug"] background
     healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8002'"
     healthcheck-interval 500ms
     healthcheck-timeout 15s

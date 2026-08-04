@@ -27,8 +27,9 @@ pub(super) async fn run_export_loop(
     shutdown_token: CancellationToken,
 ) -> Result<()> {
     let dns_suffix = match &backend {
-        ExportBackend::Tcp { dns_suffix, .. } => dns_suffix.clone(),
-        ExportBackend::WebSocket(_) => None,
+        ExportBackend::Tcp { dns_suffix, .. } | ExportBackend::WebSocket { dns_suffix, .. } => {
+            dns_suffix.clone()
+        }
     };
 
     let mode = match &backend {
@@ -37,7 +38,7 @@ pub(super) async fn run_export_loop(
             ..
         } => "http_export",
         ExportBackend::Tcp { .. } => "export",
-        ExportBackend::WebSocket(_) => "ws_export",
+        ExportBackend::WebSocket { .. } => "ws_export",
     };
 
     info!(
@@ -199,13 +200,14 @@ async fn dispatch_client_connect(
             )
             .await;
         }
-        ExportBackend::WebSocket(ws_url) => {
+        ExportBackend::WebSocket { url, dns_suffix } => {
             super::ws::handle_ws_client_connect(
                 session,
                 service_name,
-                ws_url,
+                url,
                 client_id,
                 cancellation_senders,
+                dns_suffix.as_deref(),
                 config,
             )
             .await;

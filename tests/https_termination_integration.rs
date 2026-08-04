@@ -16,11 +16,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 
-/// Test that --https-terminate without --tls-cert/--tls-key fails validation
+/// Cert implies termination — but a lone cert= without key= is a config
+/// mistake, rejected at spec validation with the missing half named.
 #[tokio::test]
-async fn test_https_terminate_requires_cert_and_key() {
+async fn test_terminate_cert_without_key_fails() {
     let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--https-terminate", "svc/0.0.0.0:8443"])
+        .args(["--listen", "svc/0.0.0.0:8443,cert=/tmp/only-cert.pem"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -33,32 +34,22 @@ async fn test_https_terminate_requires_cert_and_key() {
 
     assert!(
         !output.status.success(),
-        "Bridge should fail without --tls-cert and --tls-key"
+        "Bridge should fail with cert= but no key="
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--tls-cert") || stderr.contains("--tls-key"),
-        "Error should mention missing TLS cert/key, got: {}",
+        stderr.contains("key="),
+        "Error should name the missing key= option, got: {}",
         stderr
     );
 }
 
-/// Test that --https-terminate with cert but missing key fails
+/// key= without cert= is rejected symmetrically.
 #[tokio::test]
-async fn test_https_terminate_requires_key() {
-    let dir = std::env::temp_dir();
-    let cert_path = dir.join("test_cert_only_integ.pem");
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-
+async fn test_terminate_key_without_cert_fails() {
     let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args([
-            "--https-terminate",
-            "svc/0.0.0.0:8443",
-            "--tls-cert",
-            cert_path.to_str().unwrap(),
-        ])
+        .args(["--listen", "svc/0.0.0.0:8443,key=/tmp/only-key.pem"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -71,13 +62,18 @@ async fn test_https_terminate_requires_key() {
 
     assert!(
         !output.status.success(),
-        "Bridge should fail without --tls-key"
+        "Bridge should fail with key= but no cert="
     );
 
-    std::fs::remove_file(&cert_path).unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cert="),
+        "Error should name the missing cert= option, got: {}",
+        stderr
+    );
 }
 
-/// Test that --https-terminate with valid cert and key starts successfully
+/// A terminating --listen with valid cert= and key= starts successfully
 /// (We can't do a full end-to-end test without a running Zenoh network,
 /// but we verify the binary accepts the arguments and starts)
 #[tokio::test]
@@ -97,12 +93,12 @@ async fn test_https_terminate_starts_with_valid_tls() {
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args([
-            "--https-terminate",
-            &spec,
-            "--tls-cert",
-            cert_path.to_str().unwrap(),
-            "--tls-key",
-            key_path.to_str().unwrap(),
+            "--listen",
+            &format!(
+                "{spec},cert={},key={}",
+                cert_path.display(),
+                key_path.display()
+            ),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -199,12 +195,12 @@ async fn test_https_terminate_alpn_negotiation() {
 
     let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args([
-            "--https-terminate",
-            &spec,
-            "--tls-cert",
-            cert_path.to_str().unwrap(),
-            "--tls-key",
-            key_path.to_str().unwrap(),
+            "--listen",
+            &format!(
+                "{spec},cert={},key={}",
+                cert_path.display(),
+                key_path.display()
+            ),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -282,8 +278,8 @@ async fn start_h2_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-/// End-to-end (#50): a real h2 client over TLS -> `--https-terminate` (routes by
-/// `:authority`) -> Zenoh -> `--http-export` -> plaintext h2 backend -> response.
+/// End-to-end (#50): a real h2 client over TLS -> a terminating `--listen` (routes by
+/// `:authority`) -> Zenoh -> `--backend` -> plaintext h2 backend -> response.
 #[tokio::test]
 async fn test_https_terminate_h2_end_to_end() {
     use http_body_util::{BodyExt, Empty};
@@ -296,8 +292,8 @@ async fn test_https_terminate_h2_end_to_end() {
     let service = common::unique_service_name("h2term");
 
     // Export the h2 backend for this authority.
-    let export_spec = format!("{service}/{authority}/{backend_addr}");
-    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    let export_spec = format!("{service}@{authority}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Cert + terminating import (advertises h2 via ALPN).
@@ -311,15 +307,12 @@ async fn test_https_terminate_h2_end_to_end() {
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
     let import_spec = format!("{service}/{import_addr}");
-    let _import = common::BridgeProcess::new(&[
-        "--https-terminate",
-        &import_spec,
-        "--tls-cert",
-        cert_path.to_str().unwrap(),
-        "--tls-key",
-        key_path.to_str().unwrap(),
-    ])
-    .await;
+    let listen_spec = format!(
+        "{import_spec},cert={},key={}",
+        cert_path.display(),
+        key_path.display()
+    );
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
@@ -391,8 +384,8 @@ async fn start_ws_echo_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-/// End-to-end (#71): a wss client -> `--https-terminate` (TLS ends at the bridge,
-/// routes the upgrade request by Host) -> Zenoh -> `--http-export` -> plaintext
+/// End-to-end (#71): a wss client -> a terminating `--listen` (TLS ends at the bridge,
+/// routes the upgrade request by Host) -> Zenoh -> `--backend` -> plaintext
 /// WebSocket backend. The upgrade and both frame types must round-trip — the
 /// terminated relay carries the 101 and subsequent frames opaquely.
 #[tokio::test]
@@ -407,8 +400,8 @@ async fn test_https_terminate_wss_end_to_end() {
     let service = common::unique_service_name("wssterm");
 
     // Export the plaintext WS backend for this host.
-    let export_spec = format!("{service}/{host}/{backend_addr}");
-    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    let export_spec = format!("{service}@{host}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Cert + terminating import.
@@ -422,15 +415,12 @@ async fn test_https_terminate_wss_end_to_end() {
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
     let import_spec = format!("{service}/{import_addr}");
-    let _import = common::BridgeProcess::new(&[
-        "--https-terminate",
-        &import_spec,
-        "--tls-cert",
-        cert_path.to_str().unwrap(),
-        "--tls-key",
-        key_path.to_str().unwrap(),
-    ])
-    .await;
+    let listen_spec = format!(
+        "{import_spec},cert={},key={}",
+        cert_path.display(),
+        key_path.display()
+    );
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
@@ -543,8 +533,8 @@ async fn test_https_terminate_grpc_status_surfaced() {
     let authority = "grpc.test";
     let service = common::unique_service_name("grpcstatus");
 
-    let export_spec = format!("{service}/{authority}/{backend_addr}");
-    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    let export_spec = format!("{service}@{authority}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
@@ -559,13 +549,14 @@ async fn test_https_terminate_grpc_status_surfaced() {
     let metrics_port = common::PortGuard::new();
     let metrics_addr = metrics_port.release();
     let import_spec = format!("{service}/{import_addr}");
+    let listen_spec = format!(
+        "{import_spec},cert={},key={}",
+        cert_path.display(),
+        key_path.display()
+    );
     let _import = common::BridgeProcess::new(&[
-        "--https-terminate",
-        &import_spec,
-        "--tls-cert",
-        cert_path.to_str().unwrap(),
-        "--tls-key",
-        key_path.to_str().unwrap(),
+        "--listen",
+        &listen_spec,
         "--metrics-addr",
         &metrics_addr.to_string(),
     ])

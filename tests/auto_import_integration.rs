@@ -43,7 +43,7 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
     println!("4. Starting export bridge: --export '{}'", export_spec);
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--export", &export_spec])
+        .args(["--backend", &export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -62,7 +62,7 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
     );
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--auto-import", &import_spec])
+        .args(["--listen", &import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -153,14 +153,14 @@ async fn test_auto_import_http_detection() -> Result<()> {
     // Start HTTP export bridge (backend registers for the DNS name)
     let service = common::unique_service_name("autohttp");
     let dns = "api.example.com";
-    let http_export_spec = format!("{}/{}/{}", service, dns, backend_addr);
+    let http_export_spec = format!("{}@{}/{}", service, dns, backend_addr);
     println!(
         "5. Starting HTTP export bridge: --http-export '{}'",
         http_export_spec
     );
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--http-export", &http_export_spec])
+        .args(["--backend", &http_export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -179,7 +179,7 @@ async fn test_auto_import_http_detection() -> Result<()> {
     );
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--auto-import", &import_spec])
+        .args(["--listen", &import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -255,7 +255,7 @@ async fn test_auto_import_cli_starts() -> Result<()> {
     );
 
     let mut bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
-        .args(["--auto-import", &import_spec])
+        .args(["--listen", &import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

@@ -56,9 +56,9 @@ async fn test_backend_not_available() {
     // Start import bridge only (no export)
     let import_port = PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("{}/{}", service, import_addr);
+    let import_spec = format!("{}/{},proto=raw", service, import_addr);
     let import_addr = import_port.release();
-    let _import = BridgeProcess::new(&["--import", &import_spec]).await;
+    let _import = BridgeProcess::new(&["--listen", &import_spec]).await;
     wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .expect("Import bridge did not start in time");
@@ -137,9 +137,9 @@ async fn test_backend_comes_back() {
     // Start import bridge first (no export yet)
     let import_port = PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("{}/{}", service, import_addr);
+    let import_spec = format!("{}/{},proto=raw", service, import_addr);
     let import_addr = import_port.release();
-    let _import = BridgeProcess::new(&["--import", &import_spec]).await;
+    let _import = BridgeProcess::new(&["--listen", &import_spec]).await;
     wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .expect("Import bridge did not start in time");
@@ -160,7 +160,7 @@ async fn test_backend_comes_back() {
 
     // Now start the export bridge — "backend comes back"
     let export_spec = format!("{}/{}", service, backend_addr);
-    let _export = BridgeProcess::new(&["--export", &export_spec]).await;
+    let _export = BridgeProcess::new(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_secs(1)).await;
 
     // New connection should now work (wait for liveliness propagation)
