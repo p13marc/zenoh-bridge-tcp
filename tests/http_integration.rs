@@ -77,7 +77,7 @@ async fn start_http_backend() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        let _ = axum::serve(listener, app).await; // ignore shutdown result to avoid a teardown panic/abort
     });
     sleep(Duration::from_millis(200)).await;
     addr
@@ -193,10 +193,13 @@ async fn test_tls_passthrough() {
     drop(https_listener);
 
     tokio::spawn(async move {
-        axum_server::bind_rustls(https_addr, tls_rustls_config)
+        // Ignore the shutdown result: when the test ends and the runtime drops,
+        // `serve` resolving to Err and being `.unwrap()`ed panics inside teardown,
+        // which can become a non-unwinding abort (SIGABRT) that fails the whole
+        // test binary. Dropping the result avoids that flake.
+        let _ = axum_server::bind_rustls(https_addr, tls_rustls_config)
             .serve(app.into_make_service())
-            .await
-            .unwrap();
+            .await;
     });
     sleep(Duration::from_millis(500)).await;
 

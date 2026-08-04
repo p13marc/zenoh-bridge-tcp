@@ -94,10 +94,11 @@ async fn start_https_backend(addr: SocketAddr, domain: &str, backend_id: &str) {
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(tls_config));
 
     tokio::spawn(async move {
-        axum_server::bind_rustls(addr, tls_config)
+        // Ignore the shutdown result to avoid a teardown panic/abort (see the
+        // note in http_integration.rs).
+        let _ = axum_server::bind_rustls(addr, tls_config)
             .serve(app.into_make_service())
-            .await
-            .unwrap();
+            .await;
     });
 
     sleep(Duration::from_millis(300)).await;
