@@ -338,3 +338,32 @@ where
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    // The exact on-wire key shapes are an interop contract: a 0.7 importer
+    // must rendezvous with any exporter speaking the 0.6 key layout. Both
+    // sides were rewritten in 0.7, so integration tests alone would pass a
+    // symmetric wire break — pin the strings here.
+    #[test]
+    fn scoped_key_matches_the_0_6_wire_layout() {
+        assert_eq!(super::scoped_key("svc", None, "tx/c1"), "svc/tx/c1");
+        assert_eq!(super::scoped_key("svc", None, "rx/c1"), "svc/rx/c1");
+        assert_eq!(
+            super::scoped_key("svc", None, "clients/c1"),
+            "svc/clients/c1"
+        );
+        assert_eq!(
+            super::scoped_key("svc", Some("api.example.com"), "tx/c1"),
+            "svc/api.example.com/tx/c1"
+        );
+        assert_eq!(
+            super::scoped_key("svc", Some("api.example.com"), "error/c1"),
+            "svc/api.example.com/error/c1"
+        );
+        assert_eq!(
+            super::scoped_key("svc", Some("api.example.com"), "clients/c1"),
+            "svc/api.example.com/clients/c1"
+        );
+    }
+}

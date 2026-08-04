@@ -113,7 +113,7 @@ async fn handle_multiroute_connection(
     let conn_metrics = crate::metrics::conn_start(service_name);
     let svc = conn_metrics.counters();
 
-    let mut parser = HttpProxyParser::new();
+    let mut parser = super::connection::http_head_parser(&config);
     let mut events: VecDeque<HttpEvent> = VecDeque::new();
     let mut client_eof = false;
     let mut request_num = 0u64;
@@ -234,6 +234,18 @@ async fn next_request_head(
             return NextRequest::CleanEnd;
         }
 
+        // A protocol switch where a fresh request was expected (an h2
+        // preface, most likely a plaintext gRPC client on a route=request
+        // listener): this plane is HTTP/1.1-only, and a tunnelled parser
+        // accepts nothing more — without this check the re-offer loop below
+        // would spin forever on an unshrinkable leftover (flowscope 0.24
+        // returns 0 for tunnelled pushes instead of silently dropping).
+        if parser.is_tunnelled() {
+            return NextRequest::Malformed {
+                client_fault: false,
+            };
+        }
+
         // Re-offer any backpressured tail before reading more.
         if !leftover.is_empty() {
             leftover = push_bytes(parser, FlowSide::Initiator, &leftover);
@@ -321,7 +333,7 @@ async fn consume_request_body(
         }
         let _ = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
         drain_events(parser, events);
-        if parser.poison().is_some() {
+        if parser.poison().is_some() || parser.is_tunnelled() {
             return;
         }
     }
@@ -576,6 +588,31 @@ async fn run_exchange(
     // opaquely: client bytes -> backend tx, backend rx -> client, until either
     // side closes. Done inline so the concrete Zenoh entity types stay local.
     if switched {
+        // First bytes of the switched-to protocol arrive in two places, both
+        // of which must be forwarded BEFORE anything read after the switch:
+        // the parser's tunnel residue (bytes coalesced into the same segment
+        // as the 101/CONNECT-200 — flowscope 0.24.1's take_tunnel_residue),
+        // and any tail the tunnelled parser refused back into our pendings.
+        let up_first = [
+            parser.take_tunnel_residue(FlowSide::Initiator),
+            std::mem::take(&mut client_pending),
+        ];
+        for chunk in up_first.iter().filter(|c| !c.is_empty()) {
+            tx_publisher
+                .put(&chunk[..])
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to splice client bytes: {}", e))?;
+            svc.add_up(chunk.len());
+        }
+        let down_first = [
+            parser.take_tunnel_residue(FlowSide::Responder),
+            std::mem::take(&mut resp_pending),
+        ];
+        for chunk in down_first.iter().filter(|c| !c.is_empty()) {
+            stream.write_all(chunk).await?;
+            svc.add_down(chunk.len());
+        }
+
         let mut tmp = vec![0u8; config.buffer_size];
         loop {
             tokio::select! {

@@ -613,3 +613,89 @@ async fn test_https_terminate_grpc_status_surfaced() {
     std::fs::remove_file(&cert_path).unwrap();
     std::fs::remove_file(&key_path).unwrap();
 }
+
+/// Plain HTTP/1.1 over a terminating listener: TLS ends at the bridge, the
+/// decrypted GET routes by Host, and the backend's h1 response returns over
+/// TLS. (The h2 and wss e2e tests cover the other ALPN arms; this pins the
+/// bread-and-butter h1 arm.)
+#[tokio::test]
+async fn test_https_terminate_h1_end_to_end() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Minimal plaintext h1 backend.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = s.read(&mut buf).await
+                    && n > 0
+                {
+                    let _ = s
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nh1-ok",
+                        )
+                        .await;
+                }
+            });
+        }
+    });
+
+    let host = "h1.test";
+    let service = common::unique_service_name("h1term");
+    let export_spec = format!("{service}@{host}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let dir = std::env::temp_dir();
+    let cert_path = dir.join("test_h1e2e_cert.pem");
+    let key_path = dir.join("test_h1e2e_key.pem");
+    std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!(
+        "{service}/{import_addr},cert={},key={}",
+        cert_path.display(),
+        key_path.display()
+    );
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let connector =
+        tokio_rustls::TlsConnector::from(Arc::new(client_config_with_alpn(&[b"http/1.1"])));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tcp = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+    tls.write_all(concat!("GET /hello HTTP/1.1\r\n", "Host: h1.test\r\n", "\r\n").as_bytes())
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    let mut buf = vec![0u8; 1024];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !response.windows(5).any(|w| w == b"h1-ok") {
+        match tokio::time::timeout_at(deadline, tls.read(&mut buf)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => response.extend_from_slice(&buf[..n]),
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.starts_with("HTTP/1.1 200") && text.contains("h1-ok"),
+        "terminated h1 GET must round-trip, got: {text:.80}"
+    );
+
+    std::fs::remove_file(&cert_path).unwrap();
+    std::fs::remove_file(&key_path).unwrap();
+}

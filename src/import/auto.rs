@@ -143,7 +143,7 @@ async fn peek_full_http_head(
             Ok(Ok(0)) => return None,
             Ok(Ok(n)) => n,
         };
-        if let Some(head) = super::connection::peek_http_head(&buf[..n]) {
+        if let Some(head) = super::connection::peek_http_head(&buf[..n], config) {
             return Some(head);
         }
         if n == size {
@@ -251,17 +251,28 @@ async fn handle_auto_http_connection(
         && super::connection::head_is_websocket_upgrade(&head)
     {
         // Host-routed WS (#75): if a backend announced itself for this
-        // upgrade's Host, scope the connection to it; otherwise fall back
-        // to the bare service key (a plain `--backend svc/ws://…`).
+        // upgrade's Host, scope the connection to it; otherwise fall back to
+        // the bare service key (a plain `--backend svc/ws://…` — WS requests
+        // always carry a Host, so bare deployments depend on this fallback).
+        // A Zenoh liveliness failure is an error, not a routing decision:
+        // falling back on it could silently deliver a host-routed client to
+        // the wrong backend during a transient bus hiccup.
         let dns = match super::connection::routing_key_from_head(&head) {
-            Ok(dns)
+            Ok(dns) => {
                 if super::connection::backend_available(&session, service_name, &dns, &config)
-                    .await
-                    .unwrap_or(false) =>
-            {
-                Some(dns)
+                    .await?
+                {
+                    Some(dns)
+                } else {
+                    info!(
+                        client_id = %client_id,
+                        host = %dns,
+                        "No host-routed WS backend announced; using the bare service key"
+                    );
+                    None
+                }
             }
-            _ => None,
+            Err(_) => None,
         };
         info!(
             client_id = %client_id,
