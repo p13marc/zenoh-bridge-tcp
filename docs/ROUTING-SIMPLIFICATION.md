@@ -440,7 +440,7 @@ corresponding parts of §5 and are tracked in epic
 
 1. **Clean break in 0.7.0** — the 9 flags are removed outright; no deprecation aliases
    (supersedes §5.6 Phases 1 & 5's alias step).
-2. **Comma key=value option syntax**: `--listen '<svc>/<addr>[,proto=raw][,tls=terminate,cert=P,key=P][,route=request]'`;
+2. **Comma key=value option syntax**: `--listen '<svc>/<addr>[,proto=raw][,cert=P,key=P][,route=request]'`;
    `--backend '<svc>[@<host>]/<target>'`.
 3. **Zenoh session flags renamed** (`--zenoh-mode/--zenoh-connect/--zenoh-listen/--zenoh-config`,
    shorts dropped) — resolves the previously unnoticed collision: `-l/--listen` was the Zenoh
@@ -450,6 +450,13 @@ corresponding parts of §5 and are tracked in epic
    SNI-selected multi-cert stays out of scope).
 5. **Host-routed WebSocket export** becomes supported (`--backend svc@host/ws://…`), removing
    the current `ExportBackend::WebSocket` asymmetry.
+6. **Cert implies termination** (amended after review): there is no `tls=terminate` keyword —
+   wherever §5 of this report writes one, read "cert=/key= present". A listener with
+   `cert=`/`key=` terminates TLS; without them it is a passthrough tunnel (SNI-routed, zero
+   key material on the bridge). Same convention as Envoy (a filter chain with a TLS
+   `transport_socket` terminates) and Caddy (providing a cert *is* the config). Also
+   simplifies validation: `cert=`/`key=` require each other and conflict with `proto=raw`
+   and `route=request`.
 
 **flowscope gaps found** (0.23.0): no request-side WS-upgrade detection
 ([flowscope#204](https://github.com/p13marc/flowscope/issues/204)); `HttpProxyParser::push`
