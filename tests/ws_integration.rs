@@ -107,7 +107,7 @@ async fn test_ws_export_import_basic() -> Result<()> {
         ws_export_spec
     );
 
-    let mut export_bridge = common::BridgeProcess::new(&["--ws-export", &ws_export_spec]).await;
+    let mut export_bridge = common::BridgeProcess::new(&["--backend", &ws_export_spec]).await;
     println!("3. WebSocket export bridge started");
 
     // Step 3: Find a free port for import bridge and start it
@@ -121,7 +121,7 @@ async fn test_ws_export_import_basic() -> Result<()> {
 
     // Release port just before starting bridge so it can bind
     let import_addr = import_port.release();
-    let mut import_bridge = common::BridgeProcess::new(&["--ws-import", &ws_import_spec]).await;
+    let mut import_bridge = common::BridgeProcess::new(&["--listen", &ws_import_spec]).await;
 
     // Wait for the import bridge to start listening (raw TCP probe - will cause
     // a harmless "WebSocket handshake failed" log in the bridge, but does NOT
@@ -203,13 +203,13 @@ async fn test_ws_multiple_messages() -> Result<()> {
 
     // Start bridges
     let ws_export_spec = format!("{}/{}", service, ws_server_url);
-    let mut export_bridge = common::BridgeProcess::new(&["--ws-export", &ws_export_spec]).await;
+    let mut export_bridge = common::BridgeProcess::new(&["--backend", &ws_export_spec]).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
     let ws_import_spec = format!("{}/{}", service, import_addr);
     let import_addr = import_port.release();
-    let mut import_bridge = common::BridgeProcess::new(&["--ws-import", &ws_import_spec]).await;
+    let mut import_bridge = common::BridgeProcess::new(&["--listen", &ws_import_spec]).await;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
@@ -316,13 +316,13 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
 
     // Start bridges
     let ws_export_spec = format!("{}/{}", service, ws_server_url);
-    let mut export_bridge = common::BridgeProcess::new(&["--ws-export", &ws_export_spec]).await;
+    let mut export_bridge = common::BridgeProcess::new(&["--backend", &ws_export_spec]).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
     let ws_import_spec = format!("{}/{}", service, import_addr);
     let import_addr = import_port.release();
-    let mut import_bridge = common::BridgeProcess::new(&["--ws-import", &ws_import_spec]).await;
+    let mut import_bridge = common::BridgeProcess::new(&["--listen", &ws_import_spec]).await;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await

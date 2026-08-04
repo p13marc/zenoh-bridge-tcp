@@ -16,8 +16,9 @@ COPY Cargo.toml Cargo.lock ./
 # Copy source code
 COPY src ./src
 
-# Build with tls-termination so the image can serve --https-terminate (HTTPS /
-# terminated h2/gRPC). rustls uses the ring backend — no extra system deps.
+# Build with tls-termination so the image can terminate TLS (a --listen with
+# cert=/key=; HTTPS / terminated h2/gRPC). rustls uses the ring backend — no
+# extra system deps.
 RUN cargo build --release --features tls-termination
 
 # Runtime stage
@@ -37,8 +38,8 @@ COPY --from=builder /usr/src/zenoh-bridge-tcp/target/release/zenoh-bridge-tcp /u
 # Switch to non-root user
 USER zenoh
 
-# The bridge listens on whatever ports the --import/--ws-import/--https-terminate
-# specs request, and optionally serves /healthz + /readyz + /metrics on
+# The bridge listens on whatever ports the --listen specs request, and
+# optionally serves /healthz + /readyz + /metrics on
 # --metrics-addr; publish those at run time (e.g. -p) rather than pinning one here.
 
 # Set environment variables
@@ -46,7 +47,7 @@ ENV RUST_LOG=info
 ENV RUST_BACKTRACE=1
 
 # No usable default run configuration exists (specs are deployment-specific), so
-# the default command prints help; supply real --export/--import/... specs at run
-# time, e.g. `docker run <image> --import svc/0.0.0.0:8080`.
+# the default command prints help; supply real --listen/--backend specs at run
+# time, e.g. `docker run <image> --listen svc/0.0.0.0:8080`.
 ENTRYPOINT ["zenoh-bridge-tcp"]
 CMD ["--help"]

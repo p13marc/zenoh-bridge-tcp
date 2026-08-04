@@ -178,15 +178,15 @@ async fn slow_multiroute_client_does_not_stall_fast_client() {
     let (backend_addr, _backend) = start_flooding_http_backend().await;
     let service = unique_service_name("d2_multiroute");
 
-    let export_spec = format!("{service}/host.test/{backend_addr}");
-    let _export = common::BridgeProcess::new(&["--http-export", &export_spec]).await;
+    let export_spec = format!("{service}@host.test/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
-    let import_spec = format!("{service}/{import_addr}");
+    let import_spec = format!("{service}/{import_addr},route=request");
     let _import = common::BridgeProcess::new(&[
-        "--http-multiroute-import",
+        "--listen",
         &import_spec,
         "--reliability",
         "stream",

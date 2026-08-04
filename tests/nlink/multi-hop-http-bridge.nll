@@ -57,7 +57,7 @@ node backend-web {
 node exporter {
     depends-on [backend-api, backend-web]
     startup-delay 1s
-    run ["${bridge_bin}", "--http-export", "http-svc/api.example.com/10.0.1.10:8001", "--http-export", "http-svc/web.example.com/10.0.3.20:8002", "--mode", "peer", "--log-level", "debug"] background
+    run ["${bridge_bin}", "--backend", "http-svc@api.example.com/10.0.1.10:8001", "--backend", "http-svc@web.example.com/10.0.3.20:8002", "--zenoh-mode", "peer", "--log-level", "debug"] background
     healthcheck "bash -c 'true'"
     healthcheck-timeout 15s
     route default via 10.0.5.1
@@ -67,7 +67,7 @@ node exporter {
 node importer {
     depends-on [exporter]
     startup-delay 2s
-    run ["${bridge_bin}", "--http-import", "http-svc/0.0.0.0:8080", "--mode", "peer", "--log-level", "debug"] background
+    run ["${bridge_bin}", "--listen", "http-svc/0.0.0.0:8080", "--zenoh-mode", "peer", "--log-level", "debug"] background
     healthcheck "bash -c 'echo > /dev/tcp/127.0.0.1/8080'"
     healthcheck-interval 500ms
     healthcheck-timeout 15s

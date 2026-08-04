@@ -17,6 +17,7 @@ pub(super) async fn handle_ws_client_connect(
     ws_url: &str,
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    dns_suffix: Option<&str>,
     config: &Arc<BridgeConfig>,
 ) {
     info!(client_id = %client_id, "WebSocket client connected, connecting to backend");
@@ -58,6 +59,7 @@ pub(super) async fn handle_ws_client_connect(
                 "ws_client_bridge",
                 client_id = %client_id,
                 service = %service_name,
+                dns = %dns_suffix.unwrap_or("-"),
                 ws_url = %ws_url
             );
 
@@ -69,7 +71,7 @@ pub(super) async fn handle_ws_client_connect(
                 client_id.to_string(),
                 reader,
                 writer,
-                None,
+                dns_suffix.map(str::to_string),
                 config.clone(),
                 cancellation_senders,
                 span,
@@ -82,8 +84,12 @@ pub(super) async fn handle_ws_client_connect(
                 client_id, e
             );
 
-            // Publish error signal to notify import bridge
-            let error_key = format!("{}/error/{}", service_name, client_id);
+            // Publish error signal to notify import bridge (host-routed
+            // backends signal on their {service}/{dns} key, like the TCP path).
+            let error_key = match dns_suffix {
+                Some(dns) => format!("{}/{}/error/{}", service_name, dns, client_id),
+                None => format!("{}/error/{}", service_name, client_id),
+            };
             if let Err(pub_err) = session.put(&error_key, "backend_unavailable").await {
                 error!("Failed to publish error signal: {:?}", pub_err);
             }

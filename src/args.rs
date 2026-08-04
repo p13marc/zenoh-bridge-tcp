@@ -1,104 +1,53 @@
 //! Command-line argument definitions for zenoh-bridge-tcp.
+//!
+//! The 0.7.0 surface: routing is two flags — `--listen` (attachment points
+//! that accept clients) and `--backend` (local services exposed onto the bus)
+//! — with the grammar in [`crate::spec`]. Zenoh session flags carry a
+//! `zenoh-` prefix. The route table itself is never configured: it lives on
+//! the Zenoh key space (`docs/ROUTING-SIMPLIFICATION.md`).
 
 use crate::config::BridgeConfig;
+use crate::spec::{BackendSpec, ListenSpec};
 use clap::Parser;
 use std::net::SocketAddr;
 
 /// Command-line arguments for the Zenoh TCP Bridge
 #[derive(Parser, Debug)]
-#[command(author, version, about = "Simple TCP to Zenoh Bridge", long_about = None)]
+#[command(author, version, about = "TCP <-> Zenoh bridge", long_about = None)]
 pub struct Args {
+    /// Listener spec: '<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]'
+    /// Default behavior auto-detects the protocol and routes TLS by SNI,
+    /// HTTP/1 by Host, WebSocket upgrades transparently, anything else opaquely.
+    /// 'proto=raw' skips detection (server-speaks-first protocols);
+    /// 'cert='+'key=' terminate TLS at the bridge (cert implies termination);
+    /// 'route=request' re-routes each HTTP/1.1 request independently.
+    /// Can be specified multiple times.
+    #[arg(long)]
+    pub listen: Vec<String>,
+
+    /// Backend spec: '<service>[@<host>]/<target>' where target is
+    /// 'host:port' (TCP) or a 'ws://'/'wss://' URL (WebSocket).
+    /// '@host' registers this backend for hostname routing at
+    /// '{service}/{host}/available'. Can be specified multiple times.
+    #[arg(long)]
+    pub backend: Vec<String>,
+
     /// Path to a Zenoh configuration file (JSON5 format)
-    /// If provided, this configuration will be used instead of mode/connect/listen options
-    #[arg(short = 'c', long)]
-    pub config: Option<String>,
-
-    /// Export a TCP backend as Zenoh service: 'service_name/backend_addr'
-    /// Example: --export 'myservice/127.0.0.1:8003'
-    /// Creates lazy connections: one per importing client
-    /// Can be specified multiple times for multiple exports
+    /// If provided, the other zenoh-* options are ignored
     #[arg(long)]
-    pub export: Vec<String>,
+    pub zenoh_config: Option<String>,
 
-    /// Import a Zenoh service as TCP listener: 'service_name/listen_addr'
-    /// Example: --import 'myservice/127.0.0.1:8002'
-    /// Listens for TCP connections and connects them to the exported service
-    /// Can be specified multiple times for multiple imports
-    #[arg(long)]
-    pub import: Vec<String>,
-
-    /// Export HTTP backend with DNS-based routing: 'service_name/dns/backend_addr'
-    /// Example: --http-export 'http-service/api.example.com/127.0.0.1:8003'
-    /// Registers backend for specific DNS name extracted from HTTP Host headers
-    /// Can be specified multiple times for multiple DNS-based exports
-    #[arg(long)]
-    pub http_export: Vec<String>,
-
-    /// Import HTTP service with DNS-based routing: 'service_name/listen_addr'
-    /// Example: --http-import 'http-service/0.0.0.0:8080'
-    /// Parses HTTP Host header to route requests to appropriate backends
-    /// Can be specified multiple times for multiple HTTP listeners
-    #[arg(long)]
-    pub http_import: Vec<String>,
-
-    /// Export WebSocket backend as Zenoh service: 'service_name/ws_url'
-    /// Example: --ws-export 'myws/ws://127.0.0.1:9000'
-    /// Connects to WebSocket backend when clients appear
-    /// Can be specified multiple times for multiple WebSocket exports
-    #[arg(long)]
-    pub ws_export: Vec<String>,
-
-    /// Import Zenoh service as WebSocket listener: 'service_name/listen_addr'
-    /// Example: --ws-import 'myws/0.0.0.0:8080'
-    /// Accepts WebSocket connections and bridges them to Zenoh
-    /// Can be specified multiple times for multiple WebSocket imports
-    #[arg(long)]
-    pub ws_import: Vec<String>,
-
-    /// Auto-detecting import: 'service_name/listen_addr'
-    /// Example: --auto-import 'myservice/0.0.0.0:8080'
-    /// Detects protocol (TLS/HTTPS, HTTP, WebSocket, raw TCP) from first bytes
-    /// and dispatches to the appropriate handler automatically
-    /// Can be specified multiple times for multiple auto-detect listeners
-    #[arg(long)]
-    pub auto_import: Vec<String>,
-
-    /// Import HTTP service with per-request routing: 'service_name/listen_addr'
-    /// Example: --http-multiroute-import 'http-service/0.0.0.0:8080'
-    /// Each request's Host header is evaluated independently for routing,
-    /// allowing persistent HTTP/1.1 connections to reach multiple backends
-    #[arg(long)]
-    pub http_multiroute_import: Vec<String>,
-
-    /// Import HTTPS service with TLS termination: 'service_name/listen_addr'
-    /// Example: --https-terminate 'https-service/0.0.0.0:8443'
-    /// Terminates TLS at the bridge; backends receive plaintext HTTP
-    /// Requires --tls-cert and --tls-key
-    #[arg(long)]
-    #[cfg(feature = "tls-termination")]
-    pub https_terminate: Vec<String>,
-
-    /// Path to PEM-encoded TLS certificate chain (required for --https-terminate)
-    #[arg(long)]
-    #[cfg(feature = "tls-termination")]
-    pub tls_cert: Option<String>,
-
-    /// Path to PEM-encoded TLS private key (required for --https-terminate)
-    #[arg(long)]
-    #[cfg(feature = "tls-termination")]
-    pub tls_key: Option<String>,
-
-    /// Zenoh configuration mode
-    #[arg(short = 'm', long, default_value = "peer")]
-    pub mode: String,
+    /// Zenoh session mode: peer, client, or router
+    #[arg(long, default_value = "peer")]
+    pub zenoh_mode: String,
 
     /// Zenoh connect endpoint (e.g., tcp/localhost:7447)
-    #[arg(short = 'e', long)]
-    pub connect: Option<String>,
+    #[arg(long)]
+    pub zenoh_connect: Option<String>,
 
     /// Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
-    #[arg(short = 'l', long)]
-    pub listen: Option<String>,
+    #[arg(long)]
+    pub zenoh_listen: Option<String>,
 
     /// Buffer size for TCP read/write operations in bytes
     #[arg(long, default_value = "65536")]
@@ -137,7 +86,7 @@ pub struct Args {
     #[arg(long, default_value = "1000")]
     pub availability_timeout_ms: u64,
 
-    /// Maximum response size for multiroute HTTP mode in bytes (exceeding -> HTTP 502)
+    /// Maximum response size for route=request mode in bytes (exceeding -> HTTP 502)
     #[arg(long, default_value = "10485760")]
     pub max_response_size: usize,
 
@@ -165,24 +114,12 @@ pub struct Args {
 impl Default for Args {
     fn default() -> Self {
         Self {
-            config: None,
-            export: Vec::new(),
-            import: Vec::new(),
-            http_export: Vec::new(),
-            http_import: Vec::new(),
-            ws_export: Vec::new(),
-            ws_import: Vec::new(),
-            auto_import: Vec::new(),
-            http_multiroute_import: Vec::new(),
-            #[cfg(feature = "tls-termination")]
-            https_terminate: Vec::new(),
-            #[cfg(feature = "tls-termination")]
-            tls_cert: None,
-            #[cfg(feature = "tls-termination")]
-            tls_key: None,
-            mode: "peer".to_string(),
-            connect: None,
-            listen: None,
+            listen: Vec::new(),
+            backend: Vec::new(),
+            zenoh_config: None,
+            zenoh_mode: "peer".to_string(),
+            zenoh_connect: None,
+            zenoh_listen: None,
             buffer_size: 65536,
             read_timeout: 10,
             drain_timeout: 5,
@@ -202,32 +139,42 @@ impl Default for Args {
 }
 
 impl Args {
+    /// Parse every `--listen` spec, in flag order.
+    pub fn listen_specs(&self) -> anyhow::Result<Vec<ListenSpec>> {
+        self.listen.iter().map(|s| s.parse()).collect()
+    }
+
+    /// Parse every `--backend` spec, in flag order.
+    pub fn backend_specs(&self) -> anyhow::Result<Vec<BackendSpec>> {
+        self.backend.iter().map(|s| s.parse()).collect()
+    }
+
     /// Validate command-line arguments
     pub fn validate(&self) -> anyhow::Result<()> {
-        let has_spec = !self.export.is_empty()
-            || !self.import.is_empty()
-            || !self.http_export.is_empty()
-            || !self.http_import.is_empty()
-            || !self.ws_export.is_empty()
-            || !self.ws_import.is_empty()
-            || !self.auto_import.is_empty()
-            || !self.http_multiroute_import.is_empty();
+        // Parse specs early for clear startup errors.
+        let listens = self.listen_specs()?;
+        let _backends = self.backend_specs()?;
 
-        #[cfg(feature = "tls-termination")]
-        let has_spec = has_spec || !self.https_terminate.is_empty();
-
-        if !has_spec {
+        if self.listen.is_empty() && self.backend.is_empty() {
             return Err(anyhow::anyhow!(
-                "Must specify at least one --export, --import, --http-export, --http-import, --ws-export, or --ws-import. Use --help for usage."
+                "Must specify at least one --listen or --backend. Use --help for usage."
             ));
         }
 
-        #[cfg(feature = "tls-termination")]
-        if !self.https_terminate.is_empty() && (self.tls_cert.is_none() || self.tls_key.is_none()) {
-            return Err(anyhow::anyhow!(
-                "--https-terminate requires both --tls-cert and --tls-key"
-            ));
+        // The grammar accepts cert=/key= unconditionally; whether this build
+        // can act on them is a feature question, answered here by name.
+        #[cfg(not(feature = "tls-termination"))]
+        for spec in &listens {
+            if matches!(spec.tls, crate::spec::TlsMode::Terminate { .. }) {
+                return Err(anyhow::anyhow!(
+                    "--listen '{spec}' requests TLS termination (cert=/key=), but this \
+                     binary was built without the 'tls-termination' feature; rebuild with \
+                     `cargo build --features tls-termination`"
+                ));
+            }
         }
+        #[cfg(feature = "tls-termination")]
+        let _ = listens;
 
         // Validate buffer_size
         if self.buffer_size < 1024 {
@@ -306,32 +253,6 @@ impl Args {
             }
         }
 
-        // Validate spec formats early to give clear error messages
-        for spec in &self.export {
-            crate::export::parse_export_spec(spec)?;
-        }
-        for spec in &self.import {
-            crate::import::parse_import_spec(spec)?;
-        }
-        for spec in &self.http_export {
-            crate::export::parse_http_export_spec(spec)?;
-        }
-        for spec in &self.http_import {
-            crate::import::parse_import_spec(spec)?;
-        }
-        for spec in &self.ws_export {
-            crate::export::parse_ws_export_spec(spec)?;
-        }
-        for spec in &self.ws_import {
-            crate::import::parse_import_spec(spec)?;
-        }
-        for spec in &self.auto_import {
-            crate::import::parse_import_spec(spec)?;
-        }
-        for spec in &self.http_multiroute_import {
-            crate::import::parse_import_spec(spec)?;
-        }
-
         Ok(())
     }
 
@@ -363,72 +284,94 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_with_export_passes() {
+    fn test_validate_with_listen_passes() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             ..Default::default()
         };
         assert!(args.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_with_import_passes() {
+    fn test_validate_with_backend_passes() {
         let args = Args {
-            import: vec!["svc/127.0.0.1:8000".into()],
+            backend: vec!["svc/127.0.0.1:8000".into()],
             ..Default::default()
         };
         assert!(args.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_with_http_export_passes() {
+    fn test_validate_listen_and_backend_passes() {
         let args = Args {
-            http_export: vec!["svc/dns.test/127.0.0.1:8000".into()],
+            listen: vec![
+                "svc1/127.0.0.1:8001".into(),
+                "svc2/[::1]:8002,proto=raw".into(),
+            ],
+            backend: vec![
+                "svc1@api.example.com/127.0.0.1:9001".into(),
+                "chat/ws://127.0.0.1:9000".into(),
+            ],
             ..Default::default()
         };
         assert!(args.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_with_http_import_passes() {
+    fn test_validate_rejects_bad_listen_spec() {
         let args = Args {
-            http_import: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["invalid-no-slash".into()],
             ..Default::default()
         };
-        assert!(args.validate().is_ok());
+        assert!(args.validate().is_err());
     }
 
     #[test]
-    fn test_validate_with_ws_export_passes() {
+    fn test_validate_rejects_bad_backend_spec() {
         let args = Args {
-            ws_export: vec!["svc/ws://127.0.0.1:9000".into()],
+            backend: vec!["svc/http://not-supported".into()],
             ..Default::default()
         };
-        assert!(args.validate().is_ok());
+        assert!(args.validate().is_err());
     }
 
     #[test]
-    fn test_validate_with_ws_import_passes() {
+    fn test_validate_rejects_unknown_listen_option() {
+        // The 0.7.0 grammar has no tls= keyword: cert=/key= imply termination.
         let args = Args {
-            ws_import: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000,tls=terminate".into()],
             ..Default::default()
         };
-        assert!(args.validate().is_ok());
+        assert!(args.validate().is_err());
     }
 
     #[test]
-    fn test_validate_with_auto_import_passes() {
+    fn test_validate_mixed_good_and_bad_specs() {
         let args = Args {
-            auto_import: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["good/127.0.0.1:8001".into(), "bad-no-slash".into()],
             ..Default::default()
         };
-        assert!(args.validate().is_ok());
+        assert!(args.validate().is_err());
     }
 
+    #[cfg(not(feature = "tls-termination"))]
     #[test]
-    fn test_validate_with_http_multiroute_import_passes() {
+    fn test_validate_default_build_rejects_termination_by_feature_name() {
         let args = Args {
-            http_multiroute_import: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8443,cert=/c.pem,key=/k.pem".into()],
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("tls-termination"), "{err}");
+    }
+
+    #[cfg(feature = "tls-termination")]
+    #[test]
+    fn test_validate_tls_build_accepts_termination_spec() {
+        // Cert/key files need not exist at validate() time — they are opened
+        // when the listener starts.
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8443,cert=/c.pem,key=/k.pem".into()],
             ..Default::default()
         };
         assert!(args.validate().is_ok());
@@ -437,7 +380,7 @@ mod tests {
     #[test]
     fn test_bridge_config_maps_fields_correctly() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             buffer_size: 1024,
             read_timeout: 30,
             drain_timeout: 15,
@@ -454,7 +397,7 @@ mod tests {
     #[test]
     fn test_validate_buffer_size_minimum_boundary() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             buffer_size: 1024,
             ..Default::default()
         };
@@ -464,7 +407,7 @@ mod tests {
     #[test]
     fn test_validate_buffer_size_below_minimum() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             buffer_size: 1023,
             ..Default::default()
         };
@@ -475,7 +418,7 @@ mod tests {
     #[test]
     fn test_validate_buffer_size_zero() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             buffer_size: 0,
             ..Default::default()
         };
@@ -485,7 +428,7 @@ mod tests {
     #[test]
     fn test_validate_buffer_size_large() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             buffer_size: 10 * 1024 * 1024, // 10 MiB
             ..Default::default()
         };
@@ -497,7 +440,7 @@ mod tests {
     #[test]
     fn test_validate_drain_timeout_minimum() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             drain_timeout: 1,
             ..Default::default()
         };
@@ -507,7 +450,7 @@ mod tests {
     #[test]
     fn test_validate_drain_timeout_zero() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             drain_timeout: 0,
             ..Default::default()
         };
@@ -521,7 +464,7 @@ mod tests {
     fn test_validate_all_log_formats() {
         for fmt in &["pretty", "compact", "json"] {
             let args = Args {
-                export: vec!["svc/127.0.0.1:8000".into()],
+                listen: vec!["svc/127.0.0.1:8000".into()],
                 log_format: fmt.to_string(),
                 ..Default::default()
             };
@@ -536,7 +479,7 @@ mod tests {
     #[test]
     fn test_validate_invalid_log_format() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             log_format: "xml".into(),
             ..Default::default()
         };
@@ -551,7 +494,7 @@ mod tests {
     fn test_validate_all_log_levels() {
         for level in &["trace", "debug", "info", "warn", "error", "off"] {
             let args = Args {
-                export: vec!["svc/127.0.0.1:8000".into()],
+                listen: vec!["svc/127.0.0.1:8000".into()],
                 log_level: level.to_string(),
                 ..Default::default()
             };
@@ -566,89 +509,12 @@ mod tests {
     #[test]
     fn test_validate_invalid_log_level() {
         let args = Args {
-            export: vec!["svc/127.0.0.1:8000".into()],
+            listen: vec!["svc/127.0.0.1:8000".into()],
             log_level: "verbose".into(),
             ..Default::default()
         };
         let err = args.validate().unwrap_err().to_string();
         assert!(err.contains("log-level"));
         assert!(err.contains("verbose"));
-    }
-
-    // --- Spec format validation through validate() ---
-
-    #[test]
-    fn test_validate_rejects_bad_export_spec() {
-        let args = Args {
-            export: vec!["invalid-no-slash".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_rejects_bad_import_spec() {
-        let args = Args {
-            import: vec!["invalid-no-slash".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_rejects_bad_http_export_spec() {
-        let args = Args {
-            http_export: vec!["only/two-parts".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_err());
-    }
-
-    #[test]
-    fn test_validate_rejects_bad_ws_export_spec() {
-        let args = Args {
-            ws_export: vec!["svc/http://not-ws".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_err());
-    }
-
-    // --- Multiple spec combinations ---
-
-    #[test]
-    fn test_validate_mixed_export_import() {
-        let args = Args {
-            export: vec!["svc1/127.0.0.1:8001".into()],
-            import: vec!["svc2/127.0.0.1:8002".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_ok());
-    }
-
-    #[test]
-    fn test_validate_all_spec_types_at_once() {
-        let args = Args {
-            export: vec!["svc/127.0.0.1:8001".into()],
-            import: vec!["svc/127.0.0.1:8002".into()],
-            http_export: vec!["http/dns.test/127.0.0.1:8003".into()],
-            http_import: vec!["http/127.0.0.1:8004".into()],
-            ws_export: vec!["ws/ws://127.0.0.1:9000".into()],
-            ws_import: vec!["ws/127.0.0.1:8005".into()],
-            auto_import: vec!["auto/127.0.0.1:8006".into()],
-            http_multiroute_import: vec!["mr/127.0.0.1:8007".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_ok());
-    }
-
-    // --- First bad spec in list fails validation ---
-
-    #[test]
-    fn test_validate_mixed_good_and_bad_specs() {
-        let args = Args {
-            export: vec!["good/127.0.0.1:8001".into(), "bad-no-slash".into()],
-            ..Default::default()
-        };
-        assert!(args.validate().is_err());
     }
 }

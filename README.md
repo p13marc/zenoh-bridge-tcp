@@ -191,71 +191,53 @@ cargo nextest run --test http_routing_integration
 zenoh-bridge-tcp [OPTIONS]
 
 Options:
-  -c, --config <FILE>                        Path to Zenoh configuration file (JSON5)
-      --export <SPEC>                        Export TCP backend as Zenoh service
-                                             Format: 'service_name/backend_addr'
-                                             Example: 'myapi/127.0.0.1:3000'
-      --import <SPEC>                        Import Zenoh service as TCP listener
-                                             Format: 'service_name/listen_addr'
-                                             Example: 'myapi/0.0.0.0:8080'
-      --http-export <SPEC>                   Export HTTP backend with DNS-based routing
-                                             Format: 'service_name/dns/backend_addr'
-                                             Example: 'http-service/api.example.com/127.0.0.1:8000'
-      --http-import <SPEC>                   Import HTTP service with DNS-based routing
-                                             Format: 'service_name/listen_addr'
-                                             Example: 'http-service/0.0.0.0:8080'
-      --http-multiroute-import <SPEC>        Import HTTP with per-request Host routing
-                                             Format: 'service_name/listen_addr'
-                                             Example: 'http-service/0.0.0.0:8080'
-      --auto-import <SPEC>                   Auto-detect protocol and route accordingly
-                                             Format: 'service_name/listen_addr'
-                                             Example: 'myservice/0.0.0.0:8080'
-      --https-terminate <SPEC>               Import HTTPS with TLS termination (feature: tls-termination)
-                                             Format: 'service_name/listen_addr'
-                                             Example: 'https-service/0.0.0.0:8443'
-      --tls-cert <PATH>                      TLS certificate for --https-terminate
-      --tls-key <PATH>                       TLS private key for --https-terminate
-      --ws-export <SPEC>                     Export WebSocket backend as Zenoh service
-                                             Format: 'service_name/ws_url'
-                                             Example: 'myws/ws://127.0.0.1:9000'
-      --ws-import <SPEC>                     Import Zenoh service as WebSocket listener
-                                             Format: 'service_name/listen_addr'
-                                             Example: 'myws/0.0.0.0:8080'
-  -m, --mode <MODE>                          Zenoh mode: peer, client, or router [default: peer]
-  -e, --connect <ENDPOINT>                   Zenoh connect endpoint (e.g., tcp/localhost:7447)
-  -l, --listen <ENDPOINT>                    Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
-      --metrics-addr <ADDR>                  Expose /healthz, /readyz, /metrics on this address
-                                             Example: '0.0.0.0:9100' (disabled when unset)
-      --buffer-size <BYTES>                  Buffer size for read operations [default: 65536]
-      --read-timeout <SECS>                  Timeout for reading headers [default: 10]
-      --drain-timeout <SECS>                 Connection drain timeout [default: 5]
-      --log-level <LEVEL>                    Log level: trace, debug, info, warn, error [default: info]
-      --log-format <FORMAT>                  Log format: pretty, compact, json [default: pretty]
-  -h, --help                                 Print help
-  -V, --version                              Print version
+      --listen <SPEC>          Accept clients on a local port and bridge them over Zenoh
+                               Format: '<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]'
+                               Default: auto-detect — TLS routes by SNI (passthrough),
+                               HTTP/1 by Host, WebSocket upgrades transparently,
+                               anything else as an opaque tunnel
+                               Example: 'web/0.0.0.0:8080'
+      --backend <SPEC>         Expose a local service onto the Zenoh bus
+                               Format: '<service>[@<host>]/<target>'
+                               Target 'host:port' is TCP; a 'ws://'/'wss://' URL is WebSocket
+                               Example: 'web@api.example.com/127.0.0.1:8003'
+      --zenoh-config <FILE>    Path to Zenoh configuration file (JSON5)
+      --zenoh-mode <MODE>      Zenoh mode: peer, client, or router [default: peer]
+      --zenoh-connect <EP>     Zenoh connect endpoint (e.g., tcp/localhost:7447)
+      --zenoh-listen <EP>      Zenoh listen endpoint (e.g., tcp/0.0.0.0:7447)
+      --metrics-addr <ADDR>    Expose /healthz, /readyz, /metrics on this address
+                               Example: '0.0.0.0:9100' (disabled when unset)
+      --buffer-size <BYTES>    Buffer size for read operations [default: 65536]
+      --read-timeout <SECS>    Timeout for reading headers [default: 10]
+      --drain-timeout <SECS>   Connection drain timeout [default: 5]
+      --log-level <LEVEL>      Log level: trace, debug, info, warn, error [default: info]
+      --log-format <FORMAT>    Log format: pretty, compact, json [default: pretty]
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
-### Export Specification Format
+### Listener options
 
-```
-service_name/backend_address:port
-```
+| Option | Meaning |
+|---|---|
+| *(none)* | Auto-detect: TLS→SNI passthrough, HTTP/1→Host, WebSocket upgrade, else opaque tunnel |
+| `proto=raw` | No detection, pure L4 tunnel — required for server-speaks-first protocols (SMTP, MySQL, …) |
+| `cert=PATH,key=PATH` | **Cert implies termination**: the bridge is the TLS endpoint; backends get plaintext. Needs the `tls-termination` build feature. Without a cert, TLS is never decrypted |
+| `route=request` | Per-request Host routing on keep-alive HTTP/1.1 (an L7 proxy plane; plaintext h1 only) |
 
-Examples:
-- `webserver/127.0.0.1:8080` - Export local web server
-- `api/backend-host:3000` - Export remote API
-- `postgres/localhost:5432` - Export PostgreSQL database
+### Migrating from 0.6.x
 
-### Import Specification Format
-
-```
-service_name/listen_address:port
-```
-
-Examples:
-- `webserver/0.0.0.0:8080` - Listen on all interfaces
-- `api/127.0.0.1:3000` - Listen only on localhost
-- `service/[::]:8080` - Listen on IPv6
+| 0.6.x | 0.7.0 |
+|---|---|
+| `--import s/a` | `--listen s/a,proto=raw` |
+| `--http-import s/a` · `--auto-import s/a` | `--listen s/a` |
+| `--ws-import s/a` | `--listen s/a` (upgrade auto-detected) |
+| `--http-multiroute-import s/a` | `--listen s/a,route=request` |
+| `--https-terminate s/a --tls-cert C --tls-key K` | `--listen s/a,cert=C,key=K` |
+| `--export s/b` | `--backend s/b` |
+| `--http-export s/d/b` | `--backend s@d/b` |
+| `--ws-export s/ws://u` | `--backend s/ws://u` |
+| `-m/--mode` `-e/--connect` `-l/--listen` `-c/--config` | `--zenoh-mode` `--zenoh-connect` `--zenoh-listen` `--zenoh-config` |
 
 ### Configuration File
 

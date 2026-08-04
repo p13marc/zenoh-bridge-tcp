@@ -85,7 +85,7 @@ Per-request HTTP routing with persistent connections (in-process).
 HTTP/HTTPS as test protocols to validate bridge with real-world protocols.
 
 ### `ws_integration.rs`
-WebSocket bridge tests using `--ws-export` and `--ws-import`.
+WebSocket bridge tests using `--backend svc/ws://…` and an auto-detecting `--listen`.
 
 ### `drain_integration.rs`
 Connection drain behavior during shutdown.
@@ -128,8 +128,8 @@ cargo nextest run --nocapture
 These tests spawn actual bridge binaries and validate the production deployment model:
 
 1. **Setup Backend** - Start a TCP server
-2. **Start Export Bridge** - `--export 'service/backend_addr'`
-3. **Start Import Bridge** - `--import 'service/listen_addr'`
+2. **Start Backend Bridge** - `--backend 'service/backend_addr'`
+3. **Start Listener Bridge** - `--listen 'service/listen_addr,proto=raw'`
 4. **Connect Client** - Client connects to import bridge
 5. **Validate** - Verify data flows end-to-end
 
