@@ -95,7 +95,6 @@ async fn handle_tls_terminated_connection(
             })?
     };
 
-    let dns_suffix = format!("/{}", dns);
     info!(
         "Client {}: TLS-terminated {} routing to DNS: {}",
         client_id,
@@ -104,20 +103,7 @@ async fn handle_tls_terminated_connection(
     );
 
     // Check backend availability
-    let service_key = format!("{}/{}/available", service_name, dns);
-    let liveliness_replies = session
-        .liveliness()
-        .get(&service_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to query liveliness: {}", e))?;
-
-    let backend_available = tokio::time::timeout(config.availability_timeout, async {
-        liveliness_replies.recv_async().await.is_ok()
-    })
-    .await
-    .unwrap_or(false);
-
-    if !backend_available {
+    if !super::connection::backend_available(&session, service_name, &dns, &config).await? {
         warn!("Client {}: No backend for DNS: {}", client_id, dns);
         return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
     }
@@ -142,7 +128,7 @@ async fn handle_tls_terminated_connection(
         writer,
         service_name,
         client_id,
-        &dns_suffix,
+        Some(&dns),
         Some(buffer),
         config,
         response_tap,

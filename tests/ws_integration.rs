@@ -392,3 +392,83 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
 
     Ok(())
 }
+
+/// A WS server that answers every data message with "<prefix>:<payload>", so a
+/// test can tell which backend served the connection. Payload-level: the
+/// bridge relays WS payloads (re-framed as Binary), not frame types.
+async fn start_ws_prefix_server(prefix: &'static str) -> Result<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let bound_addr = listener.local_addr()?;
+    let ws_url = format!("ws://{}", bound_addr);
+
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                if let Ok(mut ws) = accept_async(stream).await {
+                    while let Some(Ok(msg)) = ws.next().await {
+                        match msg {
+                            Message::Text(_) | Message::Binary(_) => {
+                                let mut reply = format!("{prefix}:").into_bytes();
+                                reply.extend_from_slice(&msg.into_data());
+                                if ws.send(Message::Binary(reply.into())).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Message::Close(_) => break,
+                            _ => {}
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    Ok(ws_url)
+}
+
+/// #75: two host-routed WebSocket backends behind ONE auto-detecting listener.
+/// The upgrade request's Host picks the backend, exactly like HTTP/SNI routing.
+#[tokio::test]
+async fn test_ws_host_routed_backends() -> Result<()> {
+    let url_a = start_ws_prefix_server("alpha").await?;
+    let url_b = start_ws_prefix_server("beta").await?;
+    let service = common::unique_service_name("wshost");
+
+    // One export bridge announcing both hosts.
+    let spec_a = format!("{service}@ws-a.test/{url_a}");
+    let spec_b = format!("{service}@ws-b.test/{url_b}");
+    let _export = common::BridgeProcess::new(&["--backend", &spec_a, "--backend", &spec_b]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // One auto-detecting listener.
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    for (host, expect) in [("ws-a.test", "alpha:ping"), ("ws-b.test", "beta:ping")] {
+        let tcp = tokio::net::TcpStream::connect(import_addr).await?;
+        let (mut ws, resp) = timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::client_async(format!("ws://{host}/echo"), tcp),
+        )
+        .await??;
+        assert_eq!(resp.status(), 101, "upgrade for {host}");
+
+        ws.send(Message::Binary(b"ping".to_vec().into())).await?;
+        let echoed = timeout(Duration::from_secs(10), ws.next())
+            .await?
+            .expect("stream closed before echo")?;
+        assert_eq!(
+            echoed.into_data().as_ref(),
+            expect.as_bytes(),
+            "Host {host} must reach its own backend"
+        );
+        let _ = ws.close(None).await;
+    }
+
+    Ok(())
+}

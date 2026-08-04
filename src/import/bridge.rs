@@ -16,6 +16,17 @@ use zenoh_ext::{
 /// to surface gRPC status from response trailers (#62); it never alters the bytes.
 pub(super) type ResponseTap = Box<dyn FnMut(&[u8]) + Send>;
 
+/// Assemble a per-client key under the service scope: `{service}/{tail}`, or
+/// `{service}/{dns}/{tail}` for a hostname-routed connection. The one place
+/// the dns segment is joined — everywhere else threads the bare `Option<&str>`
+/// (the export side's convention, R9/#75).
+fn scoped_key(service_name: &str, dns: Option<&str>, tail: &str) -> String {
+    match dns {
+        Some(dns) => format!("{service_name}/{dns}/{tail}"),
+        None => format!("{service_name}/{tail}"),
+    }
+}
+
 /// Shared bidirectional bridging logic for import connections.
 ///
 /// This function handles the Zenoh pub/sub setup and bidirectional data bridging
@@ -31,7 +42,7 @@ pub(super) async fn bridge_import_connection<R, W>(
     mut writer: W,
     service_name: &str,
     client_id: &str,
-    dns_suffix: &str,
+    dns: Option<&str>,
     initial_buffer: Option<Vec<u8>>,
     config: Arc<BridgeConfig>,
     mut response_tap: Option<ResponseTap>,
@@ -42,7 +53,7 @@ where
 {
     // IMPORTANT: Subscribe to error channel FIRST, before declaring liveliness
     // This prevents race condition where export bridge publishes error before we're subscribed
-    let error_key = format!("{}{}/error/{}", service_name, dns_suffix, client_id);
+    let error_key = scoped_key(service_name, dns, &format!("error/{client_id}"));
     let error_subscriber = session
         .declare_subscriber(&error_key)
         .await
@@ -71,7 +82,7 @@ where
 
     // Subscribe to responses from the service for this specific client using AdvancedSubscriber
     // This allows late publisher detection and recovery of missed samples
-    let sub_key = format!("{}{}/rx/{}", service_name, dns_suffix, client_id);
+    let sub_key = scoped_key(service_name, dns, &format!("rx/{client_id}"));
     let subscriber = session
         .declare_subscriber(&sub_key)
         .callback(rx_callback)
@@ -88,7 +99,7 @@ where
 
     // Declare AdvancedPublisher with cache and publisher detection
     // This allows the export bridge to detect when we're ready and recover any missed samples
-    let pub_key_str = format!("{}{}/tx/{}", service_name, dns_suffix, client_id);
+    let pub_key_str = scoped_key(service_name, dns, &format!("tx/{client_id}"));
     let pub_key: KeyExpr<'static> = pub_key_str
         .clone()
         .try_into()
@@ -113,7 +124,7 @@ where
     );
 
     // NOW declare liveliness token - export bridge will detect this and try to connect
-    let liveliness_key = format!("{}{}/clients/{}", service_name, dns_suffix, client_id);
+    let liveliness_key = scoped_key(service_name, dns, &format!("clients/{client_id}"));
     let liveliness_token = session
         .liveliness()
         .declare_token(&liveliness_key)
