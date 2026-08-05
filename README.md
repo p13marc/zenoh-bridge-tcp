@@ -141,6 +141,13 @@ docker-compose --profile with-router up -d
 
 `--metrics-addr 0.0.0.0:9100` serves `/healthz`, `/readyz`, and Prometheus
 `/metrics` (per-service connection, byte, outcome, and gRPC-status counters).
+
+Logs are structured, with values in fields rather than interpolated into
+messages. `--log-target` is repeatable and accepts `stdout`, `stderr`,
+`file=PATH` (with optional rotation), `journald` (native fields, so
+`journalctl CLIENT_ID=…` works), and `syslog`. Every connection emits one
+access-log record on close with its outcome, byte counts and duration.
+
 Details: [docs/observability.md](docs/observability.md).
 
 ## Documentation

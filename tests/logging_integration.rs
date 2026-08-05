@@ -102,7 +102,10 @@ async fn file_sink_writes_ansi_free_json() {
     for line in &lines {
         assert!(line["timestamp"].is_string(), "no timestamp in {line}");
         assert!(line["level"].is_string(), "no level in {line}");
-        assert!(line["fields"]["message"].is_string(), "no message in {line}");
+        assert!(
+            line["fields"]["message"].is_string(),
+            "no message in {line}"
+        );
     }
     assert!(
         lines
@@ -114,9 +117,9 @@ async fn file_sink_writes_ansi_free_json() {
     // `zenoh=warn` is a string-prefix match that also matches
     // `zenoh_bridge_tcp`, which once silenced everything.
     assert!(
-        lines
-            .iter()
-            .any(|l| l["target"].as_str().is_some_and(|t| t.starts_with("zenoh_bridge_tcp"))),
+        lines.iter().any(|l| l["target"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("zenoh_bridge_tcp"))),
         "no events from the bridge's own target: {lines:?}"
     );
 

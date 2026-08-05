@@ -43,7 +43,7 @@ use zenoh::Session;
 
 /// Run one `--listen` attachment point, dispatching on its parsed options.
 ///
-/// The contradictory option combinations were rejected by [`ListenSpec`]
+/// The contradictory option combinations were rejected by [`ListenSpec`](crate::spec::ListenSpec)
 /// parsing, leaving four: raw tunnel, auto-detect (the default door),
 /// per-request HTTP/1.1 routing, and TLS termination. TLS material is loaded
 /// here, lazily and per listener — a bad cert path fails this listener with a

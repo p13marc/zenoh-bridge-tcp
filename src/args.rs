@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "TCP <-> Zenoh bridge", long_about = None)]
 pub struct Args {
-    /// Listener spec: '<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]'
+    /// Listener spec: `<service>/<addr>[,proto=raw][,cert=PATH,key=PATH][,route=request]`.
     /// Default behavior auto-detects the protocol and routes TLS by SNI,
     /// HTTP/1 by Host, WebSocket upgrades transparently, anything else opaquely.
     /// 'proto=raw' skips detection (server-speaks-first protocols);
@@ -26,10 +26,10 @@ pub struct Args {
     #[arg(long)]
     pub listen: Vec<String>,
 
-    /// Backend spec: '<service>[@<host>]/<target>' where target is
-    /// 'host:port' (TCP) or a 'ws://'/'wss://' URL (WebSocket).
-    /// '@host' registers this backend for hostname routing at
-    /// '{service}/{host}/available'. Can be specified multiple times.
+    /// Backend spec: `<service>[@<host>]/<target>` where target is
+    /// `host:port` (TCP) or a `ws://`/`wss://` URL (WebSocket).
+    /// `@host` registers this backend for hostname routing at
+    /// `{service}/{host}/available`. Can be specified multiple times.
     #[arg(long)]
     pub backend: Vec<String>,
 
@@ -113,9 +113,9 @@ pub struct Args {
     #[arg(long, default_value = "pretty")]
     pub log_format: String,
 
-    /// Log sink: 'stdout', 'stderr',
-    /// 'file=PATH[,rotation=daily|hourly|minutely|never]', 'journald', or
-    /// 'syslog[,ident=NAME][,facility=daemon|user|local0..local7]'.
+    /// Log sink: `stdout`, `stderr`,
+    /// `file=PATH[,rotation=daily|hourly|minutely|never]`, `journald`, or
+    /// `syslog[,ident=NAME][,facility=daemon|user|local0..local7]`.
     /// Can be specified multiple times; defaults to stdout.
     #[arg(long)]
     pub log_target: Vec<String>,

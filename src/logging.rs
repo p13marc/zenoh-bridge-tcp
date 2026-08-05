@@ -11,7 +11,7 @@
 //! --log-target syslog[,ident=NAME][,facility=daemon|user|local0..local7]
 //! ```
 //!
-//! `--log-format` shapes only the three [`fmt`](tracing_subscriber::fmt) sinks
+//! `--log-format` shapes only the three [`fmt`](mod@tracing_subscriber::fmt) sinks
 //! (stdout/stderr/file). journald and syslog carry the event's fields natively
 //! — journald as its own `CLIENT_ID=`/`SERVICE=` fields, which is exactly what
 //! capturing our stdout under systemd cannot give you, since that collapses
@@ -337,7 +337,7 @@ impl FromStr for ColorChoice {
     }
 }
 
-/// Rendering of the [`fmt`](tracing_subscriber::fmt) sinks.
+/// Rendering of the [`fmt`](mod@tracing_subscriber::fmt) sinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogFormat {
     /// Multi-line human-readable rendering, one field per line.

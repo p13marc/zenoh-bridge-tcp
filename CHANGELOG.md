@@ -1,5 +1,59 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- **Log sinks** (`--log-target`, repeatable): `stdout`, `stderr`,
+  `file=PATH[,rotation=daily|hourly|minutely|never]`, `journald`, and
+  `syslog[,ident=,facility=]`. Previously there was exactly one sink (stdout)
+  and no layer composition to add another. journald and syslog are target-gated
+  rather than feature-gated, so the released binary can use them.
+- **Native journald fields.** Capturing stdout under systemd collapses every
+  field into one opaque `MESSAGE=`; `--log-target journald` sends them natively,
+  so `journalctl CLIENT_ID=… SERVICE=…` works.
+- `--log-color auto|always|never`. `tracing-subscriber` does not tty-detect, so
+  ANSI escapes were previously written unconditionally — including into
+  redirected output.
+- `--log-format` gained `full` (an alias for the existing `pretty` renderer) and
+  `verbose` (multi-line, one field per line).
+- **Per-connection access log**: one record per connection on close, on the
+  `zenoh_bridge_tcp::access` target, carrying `outcome`, `bytes_up`,
+  `bytes_down` and `duration_ms`, with identity inherited from the connection
+  span. Connection close previously logged a bare `Connection closed` with
+  nothing in it.
+- `direction` (`up`/`down`) is a log field for the first time, matching the byte
+  metrics. It was previously encoded only in English prose.
+- The observability metrics surface (G7/#43 — `--metrics-addr`, `/healthz`,
+  `/readyz`, `/metrics`) shipped without a changelog entry; recorded here.
+
+### Changed
+
+- **Log messages are static strings**, with all values in fields. This makes
+  them stable aggregation keys, but breaks anything grepping for interpolated
+  text such as `Client <id>:` — that identity is now the `client_id` field,
+  inherited from the connection span. Errors moved from `{:?}` inside the
+  message to an `error` field.
+- **Noisy dependencies are damped by default.** When `RUST_LOG` is unset, zenoh,
+  rustls and tungstenite are floored at `min(--log-level, warn)`, so
+  `--log-level debug` no longer buries the bridge under zenoh routing internals.
+  `RUST_LOG` still overrides everything.
+- **Containers no longer pin `RUST_LOG=info`** (Dockerfile, docker-compose.yml).
+  Because `RUST_LOG` takes precedence, that made `--log-level` a silent no-op in
+  every shipped container.
+- The `route=request` plane now records `zbridge_connections_outcome_total`,
+  which it never did — the counter was silently always zero for that plane.
+- Logging init moved after argument validation, so an invalid `--log-format` no
+  longer installs a fallback subscriber before being rejected.
+- `zenoh`/`zenoh-ext` bumped to 1.9.0; routine `cargo update`.
+
+### Fixed
+
+- `--log-level off` is now documented; it was already accepted.
+- `tests/auto_import_integration.rs` piped bridge stdout/stderr without ever
+  reading the pipes — at `--log-level debug` a bridge could fill the pipe buffer
+  and block forever.
+
 ## [0.7.0] - 2026-08-04
 
 ### Breaking

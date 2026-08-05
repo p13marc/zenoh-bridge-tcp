@@ -82,5 +82,10 @@ keys are rejected. Invalid combinations (`proto=raw` with `cert=` or
 | Flag | Default | Meaning |
 |---|---|---|
 | `--metrics-addr <ADDR>` | disabled | Serve `/healthz`, `/readyz`, `/metrics` on this address (e.g. `0.0.0.0:9100`). See [observability.md](observability.md). |
-| `--log-level <LEVEL>` | `info` | `trace`, `debug`, `info`, `warn`, `error`. `RUST_LOG` overrides it. |
-| `--log-format <FORMAT>` | `pretty` | `pretty`, `compact`, or `json`. |
+| `--log-level <LEVEL>` | `info` | `trace`, `debug`, `info`, `warn`, `error`, `off`. `RUST_LOG` overrides it. Noisy dependencies (zenoh, rustls) are damped by default. |
+| `--log-format <FORMAT>` | `pretty` | `pretty` (= `full`), `verbose`, `compact`, or `json`. Applies to the stdout/stderr/file sinks only. |
+| `--log-target <SPEC>` | `stdout` | Repeatable. `stdout`, `stderr`, `file=PATH[,rotation=daily\|hourly\|minutely\|never]`, `journald`, or `syslog[,ident=NAME][,facility=daemon\|user\|local0..local7]`. |
+| `--log-color <WHEN>` | `auto` | `auto` (colour only on a terminal), `always`, or `never`. |
+
+Log sinks, the structured field vocabulary, and the per-connection access log
+are documented in [observability.md](observability.md#logging).
