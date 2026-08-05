@@ -44,8 +44,8 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--backend", &export_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -63,8 +63,8 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--listen", &import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
@@ -161,8 +161,8 @@ async fn test_auto_import_http_detection() -> Result<()> {
 
     let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--backend", &http_export_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -180,8 +180,8 @@ async fn test_auto_import_http_detection() -> Result<()> {
 
     let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--listen", &import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     common::wait_for_port(import_addr, Duration::from_secs(10))
@@ -256,8 +256,8 @@ async fn test_auto_import_cli_starts() -> Result<()> {
 
     let mut bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
         .args(["--listen", &import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     // Wait for the bridge to start listening
