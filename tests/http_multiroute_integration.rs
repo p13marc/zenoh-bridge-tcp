@@ -681,3 +681,170 @@ async fn test_multiroute_pipelined_requests() {
     export_b.abort();
     import_task.abort();
 }
+
+/// A plain (default) backend serves every Host on a multiroute listener when
+/// no `@host` backend claims it — two different Hosts on one connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_default_backend() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
+
+    let backend_addr = start_backend("backend-default").await;
+
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let service = "mr-default";
+
+    // Plain export — no host segment anywhere.
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec = format!("{}/{}", service, backend_addr);
+    let bridge_config = config.clone();
+    let export_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_export_mode(s1, &spec, bridge_config, t1)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(500)).await;
+
+    let import_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let import_addr = import_listener.local_addr().unwrap();
+    drop(import_listener);
+
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let spec_import = format!("{}/{}", service, import_addr);
+    let bridge_config = config.clone();
+    let import_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
+            s2,
+            &spec_import,
+            bridge_config,
+            t2,
+        )
+        .await
+        .unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+
+    // Two requests with different (unclaimed) Hosts on one connection — both
+    // must reach the default backend.
+    let resp1 = http_request(&mut stream, "first.test").await;
+    assert!(resp1.contains("200 OK"), "Expected 200, got: {}", resp1);
+    assert!(
+        resp1.contains("backend-default"),
+        "Expected backend-default, got: {}",
+        resp1
+    );
+
+    let resp2 = http_request(&mut stream, "second.test").await;
+    assert!(resp2.contains("200 OK"), "Expected 200, got: {}", resp2);
+    assert!(
+        resp2.contains("backend-default"),
+        "Expected backend-default, got: {}",
+        resp2
+    );
+
+    drop(stream);
+
+    shutdown_token.cancel();
+    export_task.abort();
+    import_task.abort();
+}
+
+/// `@host` precedence per request on one multiroute connection: the claimed
+/// Host hits its backend, every other Host hits the default backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_mixed_host_and_default() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
+
+    let backend_a_addr = start_backend("backend-a").await;
+    let backend_default_addr = start_backend("backend-default").await;
+
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let service = "mr-mixed";
+
+    // host-a.test export + plain (default) export, same service.
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec = format!("{}/host-a.test/{}", service, backend_a_addr);
+    let bridge_config = config.clone();
+    let export_a = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, bridge_config, t1)
+            .await
+            .unwrap();
+    });
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec = format!("{}/{}", service, backend_default_addr);
+    let bridge_config = config.clone();
+    let export_default = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_export_mode(s1, &spec, bridge_config, t1)
+            .await
+            .unwrap();
+    });
+
+    sleep(Duration::from_millis(500)).await;
+
+    let import_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let import_addr = import_listener.local_addr().unwrap();
+    drop(import_listener);
+
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let spec_import = format!("{}/{}", service, import_addr);
+    let bridge_config = config.clone();
+    let import_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_multiroute_import_mode(
+            s2,
+            &spec_import,
+            bridge_config,
+            t2,
+        )
+        .await
+        .unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+
+    let resp1 = http_request(&mut stream, "host-a.test").await;
+    assert!(
+        resp1.contains("backend-a"),
+        "claimed Host must hit its @host backend, got: {}",
+        resp1
+    );
+
+    let resp2 = http_request(&mut stream, "unclaimed.test").await;
+    assert!(
+        resp2.contains("backend-default"),
+        "unclaimed Host must hit the default backend, got: {}",
+        resp2
+    );
+
+    let resp3 = http_request(&mut stream, "host-a.test").await;
+    assert!(
+        resp3.contains("backend-a"),
+        "claimed Host must keep precedence after a default-routed request, got: {}",
+        resp3
+    );
+
+    drop(stream);
+
+    shutdown_token.cancel();
+    export_a.abort();
+    export_default.abort();
+    import_task.abort();
+}

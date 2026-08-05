@@ -142,3 +142,77 @@ async fn test_drain_tasks_timeout_aborts() {
     while tasks.join_next().await.is_some() {}
     assert!(tasks.is_empty());
 }
+
+/// The backend resolver's precedence: an @host token wins, the service-level
+/// default token catches the rest, neither refuses. Also pins the non-collision
+/// between a host literally named "available" (3-segment token) and the
+/// 2-segment default token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_resolve_backend_precedence() {
+    use super::connection::{BackendRoute, resolve_backend};
+
+    /// Retry until the resolver returns `want` — token visibility across two
+    /// peer sessions depends on scouting/propagation, which has no fixed bound.
+    async fn assert_resolves(
+        session: &zenoh::Session,
+        svc: &str,
+        dns: Option<&str>,
+        config: &crate::config::BridgeConfig,
+        want: BackendRoute,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = resolve_backend(session, svc, dns, config).await.unwrap();
+            if got == want {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "resolve_backend({svc}, {dns:?}) stuck at {got:?}, wanted {want:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    let declarer = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let resolver = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let config = crate::config::BridgeConfig::default();
+    let svc = format!("resolver_test_{}", uuid::Uuid::new_v4().as_simple());
+
+    // Nothing declared: refuse, with or without a hostname.
+    assert_resolves(&resolver, &svc, Some("h.test"), &config, BackendRoute::Unavailable).await;
+    assert_resolves(&resolver, &svc, None, &config, BackendRoute::Unavailable).await;
+
+    // Default token only: everything routes to the default backend.
+    let _default_token = declarer
+        .liveliness()
+        .declare_token(format!("{svc}/available"))
+        .await
+        .unwrap();
+    assert_resolves(&resolver, &svc, Some("h.test"), &config, BackendRoute::Default).await;
+    assert_resolves(&resolver, &svc, None, &config, BackendRoute::Default).await;
+
+    // Host token added: that host resolves Host, others still Default.
+    let _host_token = declarer
+        .liveliness()
+        .declare_token(format!("{svc}/h.test/available"))
+        .await
+        .unwrap();
+    assert_resolves(&resolver, &svc, Some("h.test"), &config, BackendRoute::Host).await;
+    assert_resolves(&resolver, &svc, Some("other.test"), &config, BackendRoute::Default).await;
+
+    // A host literally named "available" declares the 3-segment
+    // {svc}/available/available and must not be confused with the default.
+    let svc2 = format!("resolver_test_{}", uuid::Uuid::new_v4().as_simple());
+    let _avail_host_token = declarer
+        .liveliness()
+        .declare_token(format!("{svc2}/available/available"))
+        .await
+        .unwrap();
+    assert_resolves(&resolver, &svc2, Some("available"), &config, BackendRoute::Host).await;
+    // No default token for svc2: an unmatched host refuses. The positive
+    // probe above proves the sessions see svc2's tokens, so this cannot pass
+    // by mere non-discovery.
+    assert_resolves(&resolver, &svc2, Some("other.test"), &config, BackendRoute::Unavailable)
+        .await;
+}

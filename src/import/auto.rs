@@ -185,21 +185,36 @@ async fn handle_h2c_connection(
     client_id: &str,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
-    use super::connection::ReadHeadOutcome;
+    use super::connection::{BackendRoute, ReadHeadOutcome};
 
-    let (dns, buffer) = match super::connection::read_h2_head(&mut stream, &config, true).await? {
+    let (dns, buffer, is_h2) = match super::connection::read_h2_head(&mut stream, &config, true)
+        .await?
+    {
         ReadHeadOutcome::Parsed(dns, buffer) => {
             info!(
                 client_id = %client_id,
                 dns = %dns,
                 "h2c routing by :authority"
             );
-            if !super::connection::backend_available(&session, service_name, &dns, &config).await? {
-                // No h2-level error is possible without becoming an h2
-                // endpoint; close, and the client reports a connection error.
-                return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+            match super::connection::resolve_backend(&session, service_name, Some(&dns), &config)
+                .await?
+            {
+                BackendRoute::Host => (Some(dns), buffer, true),
+                BackendRoute::Default => {
+                    info!(
+                        client_id = %client_id,
+                        dns = %dns,
+                        routed_by = "default",
+                        "Routing to the service default backend"
+                    );
+                    (None, buffer, true)
+                }
+                BackendRoute::Unavailable => {
+                    // No h2-level error is possible without becoming an h2
+                    // endpoint; close, and the client reports a connection error.
+                    return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+                }
             }
-            (Some(dns), buffer)
         }
         ReadHeadOutcome::Timeout(partial) => {
             info!(
@@ -207,7 +222,7 @@ async fn handle_h2c_connection(
                 consumed = partial.len(),
                 "h2c client sent no request head; falling back to opaque relay"
             );
-            (None, partial)
+            (None, partial, false)
         }
     };
 
@@ -216,10 +231,9 @@ async fn handle_h2c_connection(
     let writer = crate::transport::TcpWriter::new(tcp_writer);
 
     // Surface gRPC status trailers from the response stream (#62) only when
-    // the connection actually routed as h2.
-    let response_tap = dns
-        .is_some()
-        .then(|| super::connection::h2_response_tap(service_name.to_string()));
+    // the connection actually routed as h2. Keyed on the head parse, not on
+    // `dns` — a default-routed h2c connection has no host key but is still h2.
+    let response_tap = is_h2.then(|| super::connection::h2_response_tap(service_name.to_string()));
 
     super::bridge::bridge_import_connection(
         session,
@@ -238,7 +252,7 @@ async fn handle_h2c_connection(
 /// Handle an auto-detected HTTP connection, which might be a WebSocket upgrade.
 async fn handle_auto_http_connection(
     session: Arc<Session>,
-    stream: TcpStream,
+    mut stream: TcpStream,
     service_name: &str,
     client_id: &str,
     config: Arc<BridgeConfig>,
@@ -250,29 +264,40 @@ async fn handle_auto_http_connection(
     if let Some(head) = peek_full_http_head(&stream, &config).await
         && super::connection::head_is_websocket_upgrade(&head)
     {
-        // Host-routed WS (#75): if a backend announced itself for this
-        // upgrade's Host, scope the connection to it; otherwise fall back to
-        // the bare service key (a plain `--backend svc/ws://…` — WS requests
-        // always carry a Host, so bare deployments depend on this fallback).
-        // A Zenoh liveliness failure is an error, not a routing decision:
-        // falling back on it could silently deliver a host-routed client to
-        // the wrong backend during a transient bus hiccup.
-        let dns = match super::connection::routing_key_from_head(&head) {
-            Ok(dns) => {
-                if super::connection::backend_available(&session, service_name, &dns, &config)
-                    .await?
-                {
-                    Some(dns)
-                } else {
-                    info!(
-                        client_id = %client_id,
-                        host = %dns,
-                        "No host-routed WS backend announced; using the bare service key"
-                    );
-                    None
-                }
+        // Host-routed WS (#75): an `@host` backend matching this upgrade's
+        // Host wins; else the service's default (plain) backend takes it on
+        // the bare service key; else fail fast with a 502 — the upgrade
+        // request is still plain HTTP at this point, so an error response is
+        // expressible. A Zenoh liveliness failure is an error, not a routing
+        // decision: falling back on it could silently deliver a host-routed
+        // client to the wrong backend during a transient bus hiccup.
+        let dns_req = super::connection::routing_key_from_head(&head).ok();
+        let dns = match super::connection::resolve_backend(
+            &session,
+            service_name,
+            dns_req.as_deref(),
+            &config,
+        )
+        .await?
+        {
+            super::connection::BackendRoute::Host => dns_req,
+            super::connection::BackendRoute::Default => {
+                info!(
+                    client_id = %client_id,
+                    host = %dns_req.as_deref().unwrap_or("-"),
+                    routed_by = "default",
+                    "Routing to the service default backend"
+                );
+                None
             }
-            Err(_) => None,
+            super::connection::BackendRoute::Unavailable => {
+                use tokio::io::AsyncWriteExt;
+                let host = dns_req.as_deref().unwrap_or("-");
+                let _ = stream
+                    .write_all(&crate::http_util::http_502_response(host))
+                    .await;
+                return Err(anyhow::anyhow!("No backend available for DNS: {}", host));
+            }
         };
         info!(
             client_id = %client_id,

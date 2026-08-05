@@ -67,14 +67,21 @@ pub(super) async fn handle_import_connection(
                     tracing::Span::current().record("dns", dns.as_str());
                     info!(dns = %dns, routed_by = "sni", "Routing TLS connection");
 
-                    if !backend_available(&session, service_name, &dns, &config).await? {
-                        warn!(dns = %dns, "No backend available");
-                        // For TLS, we can't send an HTTP error, just close the connection
-                        return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+                    match resolve_backend(&session, service_name, Some(&dns), &config).await? {
+                        BackendRoute::Host => {
+                            debug!(dns = %dns, "Backend available");
+                            (Some(dns), Some(buffer))
+                        }
+                        BackendRoute::Default => {
+                            info!(dns = %dns, routed_by = "default", "Routing to the service default backend");
+                            (None, Some(buffer))
+                        }
+                        BackendRoute::Unavailable => {
+                            warn!(dns = %dns, "No backend available");
+                            // For TLS, we can't send an HTTP error, just close the connection
+                            return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+                        }
                     }
-
-                    debug!(dns = %dns, "Backend available");
-                    (Some(dns), Some(buffer))
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to parse TLS ClientHello");
@@ -90,15 +97,22 @@ pub(super) async fn handle_import_connection(
                     tracing::Span::current().record("dns", dns.as_str());
                     info!(dns = %dns, routed_by = "host", "Routing HTTP connection");
 
-                    if !backend_available(&session, service_name, &dns, &config).await? {
-                        warn!(dns = %dns, "No backend available");
-                        // Send HTTP 502 Bad Gateway
-                        let _ = stream.write_all(&http_502_response(&dns)).await;
-                        return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+                    match resolve_backend(&session, service_name, Some(&dns), &config).await? {
+                        BackendRoute::Host => {
+                            debug!(dns = %dns, "Backend available");
+                            (Some(dns), Some(buffer))
+                        }
+                        BackendRoute::Default => {
+                            info!(dns = %dns, routed_by = "default", "Routing to the service default backend");
+                            (None, Some(buffer))
+                        }
+                        BackendRoute::Unavailable => {
+                            warn!(dns = %dns, "No backend available");
+                            // Send HTTP 502 Bad Gateway
+                            let _ = stream.write_all(&http_502_response(&dns)).await;
+                            return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+                        }
                     }
-
-                    debug!(dns = %dns, "Backend available");
-                    (Some(dns), Some(buffer))
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to parse HTTP request");
@@ -536,25 +550,77 @@ pub(super) fn head_is_websocket_upgrade(head: &RequestHead) -> bool {
     head.is_websocket_upgrade()
 }
 
-/// Query whether a backend has announced `{service}/{dns}/available`, bounded
-/// by `config.availability_timeout`.
-pub(super) async fn backend_available(
-    session: &Session,
-    service_name: &str,
-    dns: &str,
-    config: &BridgeConfig,
-) -> Result<bool> {
-    let service_key = format!("{}/{}/available", service_name, dns);
+/// Where a host-keyed connection goes after consulting liveliness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackendRoute {
+    /// `{service}/{dns}/available` is alive — scope the keys to the host.
+    Host,
+    /// No host token, but the default `{service}/available` is alive — use
+    /// bare service keys (a plain backend serves as the service's catch-all).
+    Default,
+    /// Neither token is alive — refuse the connection (502 / close).
+    Unavailable,
+}
+
+/// One-shot liveliness probe: any reply for `key` within `timeout` means alive.
+async fn token_alive(session: &Session, key: &str, timeout: std::time::Duration) -> Result<bool> {
     let replies = session
         .liveliness()
-        .get(&service_key)
+        .get(key)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to query service liveliness: {}", e))?;
-    Ok(tokio::time::timeout(config.availability_timeout, async {
+    Ok(tokio::time::timeout(timeout, async {
         replies.recv_async().await.is_ok()
     })
     .await
     .unwrap_or(false))
+}
+
+/// Resolve which backend serves a connection: an `@host` backend matching
+/// `dns` wins, else the service's default (plain) backend, else nobody.
+/// `dns = None` (no routable hostname) consults only the default token.
+/// Each probe is bounded by `config.availability_timeout`.
+pub(super) async fn resolve_backend(
+    session: &Session,
+    service_name: &str,
+    dns: Option<&str>,
+    config: &BridgeConfig,
+) -> Result<BackendRoute> {
+    let t = config.availability_timeout;
+    let default_key = format!("{}/available", service_name);
+    let Some(dns) = dns else {
+        return Ok(if token_alive(session, &default_key, t).await? {
+            BackendRoute::Default
+        } else {
+            BackendRoute::Unavailable
+        });
+    };
+
+    // Probe both tokens concurrently, but return the moment the host probe is
+    // positive: making the host-routed happy path wait for the default probe
+    // would tax every connection with up to a full availability timeout.
+    let host_key = format!("{}/{}/available", service_name, dns);
+    let mut host_fut = std::pin::pin!(token_alive(session, &host_key, t));
+    let mut default_fut = std::pin::pin!(token_alive(session, &default_key, t));
+    let mut default_done: Option<bool> = None;
+    let host_alive = loop {
+        tokio::select! {
+            h = &mut host_fut => break h?,
+            d = &mut default_fut, if default_done.is_none() => default_done = Some(d?),
+        }
+    };
+    if host_alive {
+        return Ok(BackendRoute::Host);
+    }
+    let default_alive = match default_done {
+        Some(d) => d,
+        None => default_fut.await?,
+    };
+    Ok(if default_alive {
+        BackendRoute::Default
+    } else {
+        BackendRoute::Unavailable
+    })
 }
 
 #[cfg(test)]

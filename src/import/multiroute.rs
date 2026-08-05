@@ -1,4 +1,4 @@
-use super::connection::routing_key_from_head;
+use super::connection::{BackendRoute, resolve_backend, routing_key_from_head};
 use crate::config::BridgeConfig;
 use crate::http_util::{http_400_response, http_502_response};
 use anyhow::Result;
@@ -161,24 +161,44 @@ async fn handle_multiroute_connection(
         };
         info!(request_id = %request_id, dns = %dns, "Routing HTTP request");
 
-        // 3. Check backend availability.
-        let service_key = format!("{}/{}/available", service_name, dns);
-        if !check_backend_available(&session, &service_key, config.availability_timeout).await {
-            warn!(request_id = %request_id, dns = %dns, "No backend available");
-            let _ = stream.write_all(&http_502_response(&dns)).await;
-            // Keep the connection alive: the client may retry a different Host on
-            // it. Consume this request's body first so the next request frames
-            // from the right offset.
-            consume_request_body(
-                &mut parser,
-                &mut stream,
-                &mut events,
-                &mut client_eof,
-                &config,
-            )
-            .await;
-            continue;
-        }
+        // 3. Resolve the backend: a matching @host backend wins, else the
+        // service's default (plain) backend on bare keys. A Zenoh failure
+        // refuses this one request (502), same posture as before.
+        let route = match resolve_backend(&session, service_name, Some(&dns), &config).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(request_id = %request_id, error = %e, "Backend resolution failed");
+                BackendRoute::Unavailable
+            }
+        };
+        let route_dns = match route {
+            BackendRoute::Host => Some(dns.as_str()),
+            BackendRoute::Default => {
+                info!(
+                    request_id = %request_id,
+                    dns = %dns,
+                    routed_by = "default",
+                    "Routing to the service default backend"
+                );
+                None
+            }
+            BackendRoute::Unavailable => {
+                warn!(request_id = %request_id, dns = %dns, "No backend available");
+                let _ = stream.write_all(&http_502_response(&dns)).await;
+                // Keep the connection alive: the client may retry a different Host on
+                // it. Consume this request's body first so the next request frames
+                // from the right offset.
+                consume_request_body(
+                    &mut parser,
+                    &mut stream,
+                    &mut events,
+                    &mut client_eof,
+                    &config,
+                )
+                .await;
+                continue;
+            }
+        };
 
         // 4. Run the exchange over a per-request Zenoh channel.
         // One span per request on this keep-alive connection. Instrumenting
@@ -198,6 +218,7 @@ async fn handle_multiroute_connection(
             &mut client_eof,
             &head,
             &dns,
+            route_dns,
             service_name,
             &request_id,
             &config,
@@ -383,14 +404,17 @@ async fn run_exchange(
     client_eof: &mut bool,
     head: &flowscope::http::RequestHead,
     dns: &str,
+    route_dns: Option<&str>,
     service_name: &str,
     request_id: &str,
     config: &BridgeConfig,
     svc: &Arc<crate::metrics::ConnCounters>,
 ) -> Result<ExchangeOutcome> {
-    // Per-request Zenoh entities.
+    // Per-request Zenoh entities. `dns` is the requested host (for error
+    // bodies and logs); `route_dns` scopes the keys — `None` routes on the
+    // bare service keys to the default backend.
     let sub_request_id = format!("{}_{}", request_id, uuid::Uuid::new_v4().as_simple());
-    let dns_suffix = format!("/{}", dns);
+    let dns_suffix = route_dns.map(|d| format!("/{d}")).unwrap_or_default();
 
     let rx_key: KeyExpr<'static> = format!("{}{}/rx/{}", service_name, dns_suffix, sub_request_id)
         .try_into()
@@ -686,18 +710,3 @@ async fn run_exchange(
     Ok(ExchangeOutcome::Completed { keep_alive })
 }
 
-/// Check if a backend is available via liveliness query.
-pub(super) async fn check_backend_available(
-    session: &Session,
-    service_key: &str,
-    availability_timeout: Duration,
-) -> bool {
-    match session.liveliness().get(service_key).await {
-        Ok(replies) => tokio::time::timeout(availability_timeout, async {
-            replies.recv_async().await.is_ok()
-        })
-        .await
-        .unwrap_or(false),
-        Err(_) => false,
-    }
-}

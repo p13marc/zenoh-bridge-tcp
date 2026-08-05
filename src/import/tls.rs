@@ -116,13 +116,28 @@ async fn handle_tls_terminated_connection(
         "Routing TLS-terminated connection"
     );
 
-    // Check backend availability
-    if !super::connection::backend_available(&session, service_name, &dns, &config).await? {
-        warn!(dns = %dns, "No backend available");
-        return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
-    }
-
-    debug!(dns = %dns, "Backend available");
+    // Resolve the backend: matching @host backend, else the service default.
+    let route_dns = match super::connection::resolve_backend(
+        &session,
+        service_name,
+        Some(&dns),
+        &config,
+    )
+    .await?
+    {
+        super::connection::BackendRoute::Host => {
+            debug!(dns = %dns, "Backend available");
+            Some(dns.as_str())
+        }
+        super::connection::BackendRoute::Default => {
+            info!(dns = %dns, routed_by = "default", "Routing to the service default backend");
+            None
+        }
+        super::connection::BackendRoute::Unavailable => {
+            warn!(dns = %dns, "No backend available");
+            return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+        }
+    };
 
     // Bridge the decrypted connection through Zenoh
     // Wrap TLS halves with transport traits (same as TCP — both implement AsyncReadExt/AsyncWriteExt)
@@ -142,7 +157,7 @@ async fn handle_tls_terminated_connection(
         writer,
         service_name,
         client_id,
-        Some(&dns),
+        route_dns,
         Some(buffer),
         config,
         response_tap,
