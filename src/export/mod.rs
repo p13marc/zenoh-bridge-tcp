@@ -49,7 +49,9 @@ pub(super) enum ExportBackend {
 ///
 /// The target's scheme selects the transport (`host:port` TCP, `ws://`/`wss://`
 /// WebSocket); an `@host` in the spec registers `{service}/{host}/available`
-/// for hostname routing, for either transport.
+/// for hostname routing, for either transport. Without `@host` the backend is
+/// the service's default: it registers `{service}/available` and listeners
+/// route to it any traffic whose hostname no `@host` backend claims.
 pub async fn run_backend(
     session: Arc<Session>,
     spec: crate::spec::BackendSpec,

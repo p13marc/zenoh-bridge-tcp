@@ -54,19 +54,20 @@ pub(super) async fn run_export_loop(
         format!("{}/clients/*", service_name)
     };
 
-    // Declare service availability liveliness token for HTTP mode
-    let _service_liveliness = if let Some(ref dns) = dns_suffix {
-        let service_key = format!("{}/{}/available", service_name, dns);
-        let token = session
-            .liveliness()
-            .declare_token(&service_key)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to declare service liveliness: {}", e))?;
-        debug!(service_key = %service_key, "Declared service availability");
-        Some(token)
+    // Declare service availability: host-scoped when the backend serves one
+    // host, else the service-level default token — a plain backend is the
+    // service's catch-all and listeners fall back to it when no host matches.
+    let service_key = if let Some(ref dns) = dns_suffix {
+        format!("{}/{}/available", service_name, dns)
     } else {
-        None
+        format!("{}/available", service_name)
     };
+    let _service_liveliness = session
+        .liveliness()
+        .declare_token(&service_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare service liveliness: {}", e))?;
+    debug!(service_key = %service_key, "Declared service availability");
 
     let liveliness_subscriber = session
         .liveliness()
