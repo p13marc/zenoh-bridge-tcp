@@ -1,6 +1,6 @@
 [package]
 name = "zenoh-bridge-tcp"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 # MSRV: matches flowscope's and the edition-2024 floor; enforced by the CI msrv job.
 rust-version = "1.97"
