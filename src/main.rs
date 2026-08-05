@@ -3,7 +3,7 @@
 //! This bridge allows TCP services to be exposed over Zenoh and vice versa.
 //! Supports multiple simultaneous imports and exports.
 
-use zenoh_bridge_tcp::{args, config, export, import, metrics};
+use zenoh_bridge_tcp::{args, config, export, import, logging, metrics};
 
 use anyhow::Result;
 use args::Args;
@@ -11,31 +11,6 @@ use clap::Parser;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use tracing_subscriber::EnvFilter;
-
-/// Initialize the tracing subscriber based on CLI arguments
-fn init_tracing(log_level: &str, log_format: &str) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
-
-    match log_format {
-        "json" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .json()
-                .init();
-        }
-        "compact" => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .compact()
-                .init();
-        }
-        _ => {
-            // "pretty" or default
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-        }
-    }
-}
 
 /// Wait for SIGINT or SIGTERM
 async fn shutdown_signal() {
@@ -89,14 +64,16 @@ fn spawn_bridge_tasks<S, F, Fut>(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Parse command-line arguments first (before tracing init)
     let args = Args::parse();
 
-    // Initialize tracing with configured level and format
-    init_tracing(&args.log_level, &args.log_format);
-
-    // Validate arguments
+    // Validate before installing the subscriber: validation emits no logs, and
+    // doing it the other way round meant a bad --log-format silently installed
+    // a fallback subscriber before being rejected.
     args.validate()?;
+
+    // Held for the whole process: dropping the guards stops the background
+    // file writers and truncates whatever they had buffered.
+    let _log_guards = logging::init(&args.log_options()?)?;
 
     // Configure Zenoh session
     let config = if let Some(config_file) = &args.zenoh_config {

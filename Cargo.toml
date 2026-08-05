@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 flowscope = { version = "0.24.1", default-features = false, features = ["http", "tls", "http2"] }
 bytes = "1"
 thiserror = "1"
@@ -35,6 +36,15 @@ backon = "1"
 tokio-rustls = { version = "0.26", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
+
+# Log sinks that only exist on Unix. Deliberately target-gated rather than
+# feature-gated: the release job builds default features only, so a cargo
+# feature would ship a binary that cannot reach `--log-target journald`.
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald = "0.3"
+
+[target.'cfg(unix)'.dependencies]
+syslog-tracing = "0.3"
 
 [features]
 # flowscope's http2 parser is a base dependency since #74: the auto-detect

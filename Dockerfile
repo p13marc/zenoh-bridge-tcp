@@ -42,8 +42,9 @@ USER zenoh
 # optionally serves /healthz + /readyz + /metrics on
 # --metrics-addr; publish those at run time (e.g. -p) rather than pinning one here.
 
-# Set environment variables
-ENV RUST_LOG=info
+# Deliberately no RUST_LOG: it takes precedence over --log-level, so baking it
+# in here made that flag a silent no-op in every container. `info` is already
+# the default; set RUST_LOG at run time when you want per-module filters.
 ENV RUST_BACKTRACE=1
 
 # No usable default run configuration exists (specs are deployment-specific), so

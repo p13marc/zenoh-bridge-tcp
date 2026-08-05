@@ -11,6 +11,7 @@ pub mod error;
 pub mod export;
 pub mod http_util;
 pub mod import;
+pub mod logging;
 pub mod metrics;
 pub mod spec;
 #[cfg(feature = "tls-termination")]

@@ -7,6 +7,7 @@
 //! the Zenoh key space (`docs/routing.md`).
 
 use crate::config::BridgeConfig;
+use crate::logging::{LogOptions, LogTarget};
 use crate::spec::{BackendSpec, ListenSpec};
 use clap::Parser;
 use std::net::SocketAddr;
@@ -101,13 +102,27 @@ pub struct Args {
     #[arg(long)]
     pub metrics_addr: Option<SocketAddr>,
 
-    /// Log level: trace, debug, info, warn, error
+    /// Log level: trace, debug, info, warn, error, off.
+    /// `RUST_LOG` overrides this and allows per-module filters.
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Log format: pretty, compact, json
+    /// Log format for the stdout/stderr/file sinks:
+    /// pretty (= full), verbose, compact, json.
+    /// journald and syslog carry fields natively and ignore this.
     #[arg(long, default_value = "pretty")]
     pub log_format: String,
+
+    /// Log sink: 'stdout', 'stderr',
+    /// 'file=PATH[,rotation=daily|hourly|minutely|never]', 'journald', or
+    /// 'syslog[,ident=NAME][,facility=daemon|user|local0..local7]'.
+    /// Can be specified multiple times; defaults to stdout.
+    #[arg(long)]
+    pub log_target: Vec<String>,
+
+    /// When to colour log output: auto (only on a terminal), always, never
+    #[arg(long, default_value = "auto")]
+    pub log_color: String,
 }
 
 #[cfg(test)]
@@ -134,6 +149,8 @@ impl Default for Args {
             metrics_addr: None,
             log_level: "info".to_string(),
             log_format: "pretty".to_string(),
+            log_target: Vec::new(),
+            log_color: "auto".to_string(),
         }
     }
 }
@@ -231,16 +248,9 @@ impl Args {
             ));
         }
 
-        // Validate log_format
-        match self.log_format.as_str() {
-            "pretty" | "compact" | "json" => {}
-            other => {
-                return Err(anyhow::anyhow!(
-                    "--log-format must be one of: pretty, compact, json (got '{}')",
-                    other
-                ));
-            }
-        }
+        // Validate the logging surface by building the very options `init`
+        // will use, so a bad sink fails at startup and not on first write.
+        self.log_options()?;
 
         // Validate log_level
         match self.log_level.as_str() {
@@ -254,6 +264,25 @@ impl Args {
         }
 
         Ok(())
+    }
+
+    /// Resolve the logging surface. Sinks default to stdout when none are
+    /// named, which is the pre-`--log-target` behaviour.
+    pub fn log_options(&self) -> anyhow::Result<LogOptions> {
+        let targets = if self.log_target.is_empty() {
+            vec![LogTarget::Stdout]
+        } else {
+            self.log_target
+                .iter()
+                .map(|s| s.parse::<LogTarget>())
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        Ok(LogOptions {
+            level: self.log_level.clone(),
+            format: self.log_format.parse()?,
+            color: self.log_color.parse()?,
+            targets,
+        })
     }
 
     /// Build a BridgeConfig from command-line arguments
@@ -462,7 +491,7 @@ mod tests {
 
     #[test]
     fn test_validate_all_log_formats() {
-        for fmt in &["pretty", "compact", "json"] {
+        for fmt in &["pretty", "full", "verbose", "compact", "json"] {
             let args = Args {
                 listen: vec!["svc/127.0.0.1:8000".into()],
                 log_format: fmt.to_string(),
@@ -516,5 +545,77 @@ mod tests {
         let err = args.validate().unwrap_err().to_string();
         assert!(err.contains("log-level"));
         assert!(err.contains("verbose"));
+    }
+
+    // --- Log sink and colour validation ---
+
+    #[test]
+    fn test_log_targets_default_to_stdout() {
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8000".into()],
+            ..Default::default()
+        };
+        let opts = args.log_options().unwrap();
+        assert_eq!(opts.targets, vec![crate::logging::LogTarget::Stdout]);
+    }
+
+    #[test]
+    fn test_multiple_log_targets_are_kept_in_flag_order() {
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8000".into()],
+            log_target: vec!["stderr".into(), "file=/tmp/zb.log,rotation=daily".into()],
+            ..Default::default()
+        };
+        let opts = args.log_options().unwrap();
+        assert_eq!(
+            opts.targets,
+            vec![
+                crate::logging::LogTarget::Stderr,
+                crate::logging::LogTarget::File {
+                    path: "/tmp/zb.log".into(),
+                    rotation: crate::logging::Rotation::Daily,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_log_target() {
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8000".into()],
+            log_target: vec!["elasticsearch".into()],
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("log-target"), "got: {err}");
+        assert!(err.contains("elasticsearch"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_all_log_colors() {
+        for color in &["auto", "always", "never"] {
+            let args = Args {
+                listen: vec!["svc/127.0.0.1:8000".into()],
+                log_color: color.to_string(),
+                ..Default::default()
+            };
+            assert!(
+                args.validate().is_ok(),
+                "log_color '{}' should be valid",
+                color
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_invalid_log_color() {
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8000".into()],
+            log_color: "sometimes".into(),
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("log-color"));
+        assert!(err.contains("sometimes"));
     }
 }
