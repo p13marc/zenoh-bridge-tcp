@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
 use zenoh_ext::{
@@ -112,6 +112,10 @@ async fn handle_multiroute_connection(
     // run_exchange records relayed bytes per direction (#63).
     let conn_metrics = crate::metrics::conn_start(service_name);
     let svc = conn_metrics.counters();
+    // How the connection ended, for the outcome metric and the access log.
+    // Optimistic until a break says otherwise; a refused or unroutable request
+    // is a reset, an exchange error is a failure.
+    let mut outcome = crate::metrics::ConnOutcome::Completed;
 
     let mut parser = super::connection::http_head_parser(&config);
     let mut events: VecDeque<HttpEvent> = VecDeque::new();
@@ -136,7 +140,8 @@ async fn handle_multiroute_connection(
                 if client_fault {
                     let _ = stream.write_all(&http_400_response()).await;
                 }
-                warn!("Client {}: refusing malformed request", client_id);
+                warn!("Refusing malformed request");
+                outcome = crate::metrics::ConnOutcome::Reset;
                 break;
             }
         };
@@ -148,8 +153,9 @@ async fn handle_multiroute_connection(
         let dns = match routing_key_from_head(&head) {
             Ok(d) => d,
             Err(e) => {
-                warn!(request_id = %request_id, "Unroutable request: {}", e);
+                warn!(request_id = %request_id, error = %e, "Unroutable request");
                 let _ = stream.write_all(&http_400_response()).await;
+                outcome = crate::metrics::ConnOutcome::Reset;
                 break;
             }
         };
@@ -175,7 +181,16 @@ async fn handle_multiroute_connection(
         }
 
         // 4. Run the exchange over a per-request Zenoh channel.
-        let outcome = run_exchange(
+        // One span per request on this keep-alive connection. Instrumenting
+        // the future (rather than holding an entered guard across the awaits
+        // inside it) keeps the span scoped to this task.
+        let request_span = tracing::info_span!(
+            "request",
+            request_id = %request_id,
+            request_num,
+            dns = %dns,
+        );
+        let exchange = run_exchange(
             &session,
             &mut parser,
             &mut stream,
@@ -188,9 +203,20 @@ async fn handle_multiroute_connection(
             &config,
             &svc,
         )
-        .await?;
+        .instrument(request_span)
+        .await;
 
-        match outcome {
+        // Report the access log before propagating, so a failed exchange is
+        // still one closed-connection record rather than a silent gap.
+        let exchange = match exchange {
+            Ok(o) => o,
+            Err(e) => {
+                conn_metrics.finish(crate::metrics::ConnOutcome::Failed);
+                return Err(e);
+            }
+        };
+
+        match exchange {
             ExchangeOutcome::Completed { keep_alive } => {
                 if !keep_alive || parser.is_done() {
                     debug!(request_id = %request_id, "Closing persistent connection");
@@ -202,6 +228,7 @@ async fn handle_multiroute_connection(
         }
     }
 
+    conn_metrics.finish(outcome);
     Ok(())
 }
 
@@ -359,7 +386,7 @@ async fn run_exchange(
     service_name: &str,
     request_id: &str,
     config: &BridgeConfig,
-    svc: &Arc<crate::metrics::Counters>,
+    svc: &Arc<crate::metrics::ConnCounters>,
 ) -> Result<ExchangeOutcome> {
     // Per-request Zenoh entities.
     let sub_request_id = format!("{}_{}", request_id, uuid::Uuid::new_v4().as_simple());
@@ -477,7 +504,7 @@ async fn run_exchange(
                     bytes_written += raw.len();
                     svc.add_down(raw.len());
                     if bytes_written > config.max_response_size {
-                        warn!(request_id = %request_id, "Response exceeded max size");
+                        warn!("Response exceeded max size");
                         keep_alive = false;
                         stop_exchange = true;
                         break;
@@ -500,7 +527,7 @@ async fn run_exchange(
                     break;
                 }
                 HttpEvent::SwitchProtocols { kind } => {
-                    debug!(request_id = %request_id, "Protocol switch: {:?}", kind);
+                    debug!(kind = ?kind, "Protocol switch");
                     switched = true;
                     stop_exchange = true;
                     break;
@@ -520,7 +547,7 @@ async fn run_exchange(
 
         // A framing violation refuses the connection (E6).
         if let Some(reason) = parser.poison() {
-            warn!(request_id = %request_id, "Framing violation: {}", reason.as_str());
+            warn!(reason = %reason.as_str(), "Framing violation");
             if bytes_written == 0 {
                 let resp = if reason.implies_client_fault().unwrap_or(true) {
                     http_400_response()
@@ -565,7 +592,7 @@ async fn run_exchange(
                     }
                     Ok(None) => break, // subscriber closed
                     Err(_) => {
-                        warn!(request_id = %request_id, "Response timeout");
+                        warn!("Response timeout");
                         if bytes_written == 0 {
                             let _ = stream.write_all(&crate::http_util::http_504_response()).await;
                         }
@@ -577,7 +604,7 @@ async fn run_exchange(
             _ = rx_cancel.cancelled() => {
                 // D2 overflow (Stream mode): this client is too slow to drain its
                 // response — reset the exchange rather than block the session.
-                warn!(request_id = %request_id, "Reception buffer full — resetting slow multiroute exchange");
+                warn!("Reception buffer full, resetting slow multiroute exchange");
                 keep_alive = false;
                 break;
             }

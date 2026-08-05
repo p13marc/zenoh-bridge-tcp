@@ -59,60 +59,49 @@ pub(super) async fn handle_import_connection(
         if is_tls {
             // This is a TLS/HTTPS connection - extract SNI (TLS is not
             // terminated; the ClientHello is forwarded verbatim).
-            info!("Client {}: Detected TLS/HTTPS connection", client_id);
+            info!(proto = "tls", "Detected TLS/HTTPS connection");
             match read_tls_sni(&mut stream, &config).await {
                 Ok((dns, buffer)) => {
-                    info!(
-                        "Client {}: TLS SNI routing to DNS: {} (service: {})",
-                        client_id, dns, service_name
-                    );
+                    // Record the routed host on the connection span so every
+                    // later line in this connection carries it for free.
+                    tracing::Span::current().record("dns", dns.as_str());
+                    info!(dns = %dns, routed_by = "sni", "Routing TLS connection");
 
                     if !backend_available(&session, service_name, &dns, &config).await? {
-                        warn!(
-                            "Client {}: No backend available for DNS: {}",
-                            client_id, dns
-                        );
+                        warn!(dns = %dns, "No backend available");
                         // For TLS, we can't send an HTTP error, just close the connection
                         return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
                     }
 
-                    info!("Client {}: Backend available for DNS: {}", client_id, dns);
+                    debug!(dns = %dns, "Backend available");
                     (Some(dns), Some(buffer))
                 }
                 Err(e) => {
-                    warn!(
-                        "Client {}: Failed to parse TLS ClientHello: {}",
-                        client_id, e
-                    );
+                    warn!(error = %e, "Failed to parse TLS ClientHello");
                     // For TLS, we can't send an HTTP error, just close the connection
                     return Err(anyhow::anyhow!("{}", e));
                 }
             }
         } else {
             // This is a plain HTTP connection - parse the request head for Host.
-            info!("Client {}: Detected plain HTTP connection", client_id);
+            info!(proto = "http", "Detected plain HTTP connection");
             match read_http_head(&mut stream, &config).await {
                 Ok((dns, buffer)) => {
-                    info!(
-                        "Client {}: HTTP routing to DNS: {} (service: {})",
-                        client_id, dns, service_name
-                    );
+                    tracing::Span::current().record("dns", dns.as_str());
+                    info!(dns = %dns, routed_by = "host", "Routing HTTP connection");
 
                     if !backend_available(&session, service_name, &dns, &config).await? {
-                        warn!(
-                            "Client {}: No backend available for DNS: {}",
-                            client_id, dns
-                        );
+                        warn!(dns = %dns, "No backend available");
                         // Send HTTP 502 Bad Gateway
                         let _ = stream.write_all(&http_502_response(&dns)).await;
                         return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
                     }
 
-                    info!("Client {}: Backend available for DNS: {}", client_id, dns);
+                    debug!(dns = %dns, "Backend available");
                     (Some(dns), Some(buffer))
                 }
                 Err(e) => {
-                    warn!("Client {}: Failed to parse HTTP request: {}", client_id, e);
+                    warn!(error = %e, "Failed to parse HTTP request");
                     // Send HTTP 400 Bad Request
                     let _ = stream.write_all(&http_400_response()).await;
                     return Err(anyhow::anyhow!("{}", e));

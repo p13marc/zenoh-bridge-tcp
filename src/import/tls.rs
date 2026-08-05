@@ -2,7 +2,7 @@ use crate::config::BridgeConfig;
 use anyhow::Result;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zenoh::Session;
 
 /// Run HTTPS import mode with TLS termination.
@@ -106,20 +106,23 @@ async fn handle_tls_terminated_connection(
             })?
     };
 
+    // Record the routed host on the connection span so every later line in this
+    // connection carries it for free.
+    tracing::Span::current().record("dns", dns.as_str());
     info!(
-        "Client {}: TLS-terminated {} routing to DNS: {}",
-        client_id,
-        if is_h2 { "h2" } else { "HTTP/1.1" },
-        dns
+        dns = %dns,
+        alpn = if is_h2 { "h2" } else { "http/1.1" },
+        routed_by = if is_h2 { "authority" } else { "host" },
+        "Routing TLS-terminated connection"
     );
 
     // Check backend availability
     if !super::connection::backend_available(&session, service_name, &dns, &config).await? {
-        warn!("Client {}: No backend for DNS: {}", client_id, dns);
+        warn!(dns = %dns, "No backend available");
         return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
     }
 
-    info!("Client {}: Backend available for DNS: {}", client_id, dns);
+    debug!(dns = %dns, "Backend available");
 
     // Bridge the decrypted connection through Zenoh
     // Wrap TLS halves with transport traits (same as TCP — both implement AsyncReadExt/AsyncWriteExt)

@@ -79,10 +79,9 @@ pub(super) async fn handle_ws_client_connect(
             .await;
         }
         Err(e) => {
-            error!(
-                "Failed to connect to WebSocket backend after retries for client {}: {:?}",
-                client_id, e
-            );
+            // The ws_client_bridge span is built here but only entered by the
+            // spawned bridge, so this path names the client itself.
+            error!(client_id = %client_id, error = %e, "Failed to connect to WebSocket backend after retries");
 
             // Publish error signal to notify import bridge (host-routed
             // backends signal on their {service}/{dns} key, like the TCP path).
@@ -91,9 +90,9 @@ pub(super) async fn handle_ws_client_connect(
                 None => format!("{}/error/{}", service_name, client_id),
             };
             if let Err(pub_err) = session.put(&error_key, "backend_unavailable").await {
-                error!("Failed to publish error signal: {:?}", pub_err);
+                error!(client_id = %client_id, key = %error_key, error = %pub_err, "Failed to publish error signal");
             }
-            info!("Sent backend unavailable signal for client: {}", client_id);
+            info!(client_id = %client_id, "Sent backend unavailable signal");
         }
     }
 }

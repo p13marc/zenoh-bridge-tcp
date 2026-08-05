@@ -2,7 +2,7 @@ use crate::config::{BridgeConfig, ReliabilityMode};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use zenoh::Session;
 use zenoh::key_expr::KeyExpr;
 use zenoh::qos::CongestionControl;
@@ -59,10 +59,7 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe to error channel: {}", e))?;
 
-    debug!(
-        "Client {}: Subscribed to error channel {}",
-        client_id, error_key
-    );
+    debug!(key = %error_key, "Subscribed to error channel");
 
     // Single abort token for the whole connection. A clean directional EOF ends
     // only its own direction (a half-close); a hard error, external teardown, an
@@ -92,10 +89,7 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
 
-    debug!(
-        "Client {}: Subscribed to {} with late publisher detection",
-        client_id, sub_key
-    );
+    debug!(key = %sub_key, "Subscribed with late publisher detection");
 
     // Declare AdvancedPublisher with cache and publisher detection
     // This allows the export bridge to detect when we're ready and recover any missed samples
@@ -118,10 +112,7 @@ where
     .await
     .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
-    debug!(
-        "Client {}: Declared AdvancedPublisher on {} with cache",
-        client_id, pub_key_str
-    );
+    debug!(key = %pub_key_str, "Declared AdvancedPublisher with cache");
 
     // NOW declare liveliness token - export bridge will detect this and try to connect
     let liveliness_key = scoped_key(service_name, dns, &format!("clients/{client_id}"));
@@ -131,23 +122,13 @@ where
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
 
-    info!(
-        "Client {} declared liveliness: {}",
-        client_id, liveliness_key
-    );
+    info!(key = %liveliness_key, "Declared liveliness");
 
     // Send the initial HTTP request if we buffered it
     if let Some(buffer) = initial_buffer {
-        debug!(
-            "Client {}: Forwarding initial HTTP request ({} bytes)",
-            client_id,
-            buffer.len()
-        );
+        debug!(bytes = buffer.len(), "Forwarding initial HTTP request");
         if let Err(e) = publisher.put(&buffer).await {
-            error!(
-                "Client {}: Failed to publish initial request: {:?}",
-                client_id, e
-            );
+            error!(error = %e, "Failed to publish initial request");
             return Err(anyhow::anyhow!("Failed to publish initial request: {}", e));
         }
     }
@@ -155,20 +136,20 @@ where
     // No sleep needed! The AdvancedPublisher/Subscriber with cache and history
     // handle synchronization automatically through publisher detection and late joiner support
 
-    let client_id_for_error = client_id.to_string();
-
     // Stream reliability: reset the connection on an unrecoverable sample miss
     // rather than deliver a corrupted byte stream to the client.
     if config.reliability == ReliabilityMode::Stream {
         let miss_cancel = conn_cancel.clone();
+        // This callback runs on the session's reception thread, outside the
+        // connection span, so it must carry client_id itself.
         let miss_client = client_id.to_string();
         subscriber
             .sample_miss_listener()
             .callback(move |miss| {
                 warn!(
-                    "Client {}: unrecoverable sample miss ({} sample(s)) — resetting connection",
-                    miss_client,
-                    miss.nb()
+                    client_id = %miss_client,
+                    missed = miss.nb(),
+                    "Unrecoverable sample miss, resetting connection"
                 );
                 miss_cancel.cancel();
             })
@@ -180,17 +161,21 @@ where
     // Monitor error signals from the export bridge. An error means the backend
     // side is gone, so reset the whole connection.
     let error_cancel = conn_cancel.clone();
-    let error_monitor = tokio::spawn(async move {
-        if let Ok(sample) = error_subscriber.recv_async().await {
-            let error_msg = sample.payload().to_bytes();
-            warn!(
-                "Client {}: Backend error: {} — resetting connection",
-                client_id_for_error,
-                String::from_utf8_lossy(&error_msg)
-            );
-            error_cancel.cancel();
+    let error_monitor = tokio::spawn(
+        async move {
+            if let Ok(sample) = error_subscriber.recv_async().await {
+                let error_msg = sample.payload().to_bytes();
+                warn!(
+                    error = %String::from_utf8_lossy(&error_msg),
+                    "Backend error, resetting connection"
+                );
+                error_cancel.cancel();
+            }
         }
-    });
+        // A spawned task does not inherit the ambient span, so attach the
+        // connection's identity explicitly.
+        .instrument(tracing::info_span!("error_monitor")),
+    );
 
     // Metrics (G7): count this connection for the service; the guard decrements
     // the active gauge on every exit path. `svc` is resolved once and cloned into
@@ -204,92 +189,101 @@ where
     // only. The reverse direction keeps flowing. Samples arrive via the bounded
     // backpressure channel (D2); the subscriber is kept alive so its callback
     // keeps delivering.
-    let z2c_client = client_id.to_string();
     let z2c_cancel = conn_cancel.clone();
     let mut rx = rx_channel_rx;
-    let zenoh_to_client = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                maybe_sample = rx.recv() => {
-                    match maybe_sample {
-                        Some(sample) => {
-                            let payload = sample.payload().to_bytes().to_vec();
-                            if payload.is_empty() {
-                                debug!("Client {}: backend half-close -> FIN to client", z2c_client);
-                                let _ = writer.send_eof().await;
-                                break;
+    // A spawned task does not inherit the ambient span. This child of the
+    // connection span carries the identity across the spawn and adds the
+    // direction, using the same up/down vocabulary as the byte metrics.
+    let z2c_span = tracing::info_span!("relay", direction = "down");
+    let zenoh_to_client = tokio::spawn(
+        async move {
+            loop {
+                tokio::select! {
+                    maybe_sample = rx.recv() => {
+                        match maybe_sample {
+                            Some(sample) => {
+                                let payload = sample.payload().to_bytes().to_vec();
+                                if payload.is_empty() {
+                                    debug!("Backend half-close, sending FIN to client");
+                                    let _ = writer.send_eof().await;
+                                    break;
+                                }
+                                svc_z2c.add_down(payload.len());
+                                // Read-only observation of the response stream (e.g.
+                                // gRPC status trailers, #62) before relaying it on.
+                                if let Some(tap) = response_tap.as_mut() {
+                                    tap(&payload);
+                                }
+                                if let Err(e) = writer.write_data(&payload).await {
+                                    error!(error = %e, "Failed to write to client");
+                                    z2c_cancel.cancel();
+                                    break;
+                                }
                             }
-                            svc_z2c.add_down(payload.len());
-                            // Read-only observation of the response stream (e.g.
-                            // gRPC status trailers, #62) before relaying it on.
-                            if let Some(tap) = response_tap.as_mut() {
-                                tap(&payload);
-                            }
-                            if let Err(e) = writer.write_data(&payload).await {
-                                error!("Client {}: Failed to write to client: {:?}", z2c_client, e);
+                            None => {
+                                // Reception channel closed (subscriber gone) — reset.
                                 z2c_cancel.cancel();
                                 break;
                             }
                         }
-                        None => {
-                            // Reception channel closed (subscriber gone) — reset.
-                            z2c_cancel.cancel();
-                            break;
-                        }
+                    }
+                    _ = z2c_cancel.cancelled() => {
+                        let _ = writer.shutdown().await;
+                        break;
                     }
                 }
-                _ = z2c_cancel.cancelled() => {
-                    let _ = writer.shutdown().await;
-                    break;
-                }
             }
+            // Return the subscriber so the coordinator undeclares it only after the
+            // whole connection ends (keeps it alive across a half-open connection).
+            subscriber
         }
-        // Return the subscriber so the coordinator undeclares it only after the
-        // whole connection ends (keeps it alive across a half-open connection).
-        subscriber
-    });
+        .instrument(z2c_span),
+    );
 
     // Direction: client -> Zenoh. An empty read is the client's half-close;
     // publish the EOF marker so the export half-closes the backend, then end this
     // direction only. A read error resets the whole connection.
-    let c2z_client = client_id.to_string();
     let c2z_cancel = conn_cancel.clone();
-    let client_to_zenoh = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                result = reader.read_data() => {
-                    match result {
-                        Ok(data) if data.is_empty() => {
-                            debug!("Client {}: client half-close -> EOF to Zenoh", c2z_client);
-                            let _ = publisher.put(Vec::<u8>::new()).await;
-                            break;
-                        }
-                        Ok(data) => {
-                            // Zero-copy: `data` is `Bytes`, published via Zenoh's
-                            // `From<bytes::Bytes>` without a further copy.
-                            svc_c2z.add_up(data.len());
-                            if let Err(e) = publisher.put(data).await {
-                                error!("Client {}: Failed to publish to Zenoh: {:?}", c2z_client, e);
+    let c2z_span = tracing::info_span!("relay", direction = "up");
+    let client_to_zenoh = tokio::spawn(
+        async move {
+            loop {
+                tokio::select! {
+                    result = reader.read_data() => {
+                        match result {
+                            Ok(data) if data.is_empty() => {
+                                debug!("Client half-close, sending EOF to Zenoh");
+                                let _ = publisher.put(Vec::<u8>::new()).await;
+                                break;
+                            }
+                            Ok(data) => {
+                                // Zero-copy: `data` is `Bytes`, published via Zenoh's
+                                // `From<bytes::Bytes>` without a further copy.
+                                svc_c2z.add_up(data.len());
+                                if let Err(e) = publisher.put(data).await {
+                                    error!(error = %e, "Failed to publish to Zenoh");
+                                    c2z_cancel.cancel();
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = %e, "Read error from client");
+                                let _ = publisher.put(Vec::<u8>::new()).await;
                                 c2z_cancel.cancel();
                                 break;
                             }
                         }
-                        Err(e) => {
-                            error!("Client {}: Read error: {:?}", c2z_client, e);
-                            let _ = publisher.put(Vec::<u8>::new()).await;
-                            c2z_cancel.cancel();
-                            break;
-                        }
                     }
+                    _ = c2z_cancel.cancelled() => break,
                 }
-                _ = c2z_cancel.cancelled() => break,
             }
+            // Return the publisher (and its cache) so it stays alive until the whole
+            // connection ends — a late-joining export subscriber can then still
+            // recover the buffered samples (critical for a fast half-close).
+            publisher
         }
-        // Return the publisher (and its cache) so it stays alive until the whole
-        // connection ends — a late-joining export subscriber can then still
-        // recover the buffered samples (critical for a fast half-close).
-        publisher
-    });
+        .instrument(c2z_span),
+    );
 
     // Wait for BOTH directions to finish. Each ends on its own EOF (half-close)
     // or when the connection is reset. A healthy half-open connection keeps the
@@ -321,16 +315,14 @@ where
 
     // Explicitly undeclare liveliness token
     if let Err(e) = liveliness_token.undeclare().await {
-        debug!(
-            "Client {}: Error undeclaring liveliness: {:?}",
-            client_id, e
-        );
+        debug!(error = %e, "Error undeclaring liveliness");
     }
 
-    // Metrics (G7): a tripped cancel token means the connection was reset
-    // (error or external teardown); otherwise both directions reached a clean
-    // half-close. Import lacks the export side's finer error/reset split.
-    conn_metrics.set_outcome(if conn_cancel.is_cancelled() {
+    // Metrics (G7) and the access log: a tripped cancel token means the
+    // connection was reset (error or external teardown); otherwise both
+    // directions reached a clean half-close. Import lacks the export side's
+    // finer error/reset split.
+    conn_metrics.finish(if conn_cancel.is_cancelled() {
         crate::metrics::ConnOutcome::Reset
     } else {
         crate::metrics::ConnOutcome::Completed

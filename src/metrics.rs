@@ -19,6 +19,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -71,6 +72,17 @@ pub enum ConnOutcome {
     Failed,
 }
 
+impl ConnOutcome {
+    /// The label used for both the metric and the access log, so the two agree.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ConnOutcome::Completed => "completed",
+            ConnOutcome::Reset => "reset",
+            ConnOutcome::Failed => "failed",
+        }
+    }
+}
+
 /// The metrics registry: per-service counters plus a readiness flag.
 #[derive(Debug)]
 pub struct Metrics {
@@ -115,7 +127,14 @@ impl Metrics {
         let counters = self.service(service);
         counters.active.fetch_add(1, Ordering::Relaxed);
         counters.total.fetch_add(1, Ordering::Relaxed);
-        ConnGuard { counters }
+        ConnGuard {
+            counters: Arc::new(ConnCounters {
+                service: counters,
+                up: AtomicU64::new(0),
+                down: AtomicU64::new(0),
+            }),
+            started: Instant::now(),
+        }
     }
 
     /// Mark bridges as started (readiness).
@@ -249,32 +268,90 @@ fn metric_line(name: &str, service: &str, extra: Option<(&str, &str)>, value: u6
     }
 }
 
+/// The `tracing` target for the per-connection access log, so it can be
+/// selected on its own: `RUST_LOG=zenoh_bridge_tcp::access=info`.
+pub const ACCESS_LOG_TARGET: &str = "zenoh_bridge_tcp::access";
+
+/// Byte accounting for one connection.
+///
+/// Every add lands in two places at once: the service-wide counters that
+/// Prometheus scrapes, and this connection's own tally, which the access log
+/// reports on close. Both are relaxed atomic adds on the relay hot path.
+#[derive(Debug)]
+pub struct ConnCounters {
+    service: Arc<Counters>,
+    up: AtomicU64,
+    down: AtomicU64,
+}
+
+impl ConnCounters {
+    /// Add to the client -> backend byte counters.
+    pub fn add_up(&self, n: usize) {
+        self.service.add_up(n);
+        self.up.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    /// Add to the backend -> client byte counters.
+    pub fn add_down(&self, n: usize) {
+        self.service.add_down(n);
+        self.down.fetch_add(n as u64, Ordering::Relaxed);
+    }
+}
+
 /// RAII guard for one connection's lifetime. Decrements the active gauge on drop.
 pub struct ConnGuard {
-    counters: Arc<Counters>,
+    counters: Arc<ConnCounters>,
+    started: Instant,
 }
 
 impl ConnGuard {
-    /// The counters for this connection's service, for byte accounting on the
-    /// relay hot path (a single relaxed atomic add per chunk).
-    pub fn counters(&self) -> Arc<Counters> {
+    /// The counters for this connection, for byte accounting on the relay hot
+    /// path (a pair of relaxed atomic adds per chunk).
+    pub fn counters(&self) -> Arc<ConnCounters> {
         self.counters.clone()
+    }
+
+    /// Bytes relayed so far, and how long the connection has been open.
+    pub fn summary(&self) -> (u64, u64, Duration) {
+        (
+            self.counters.up.load(Ordering::Relaxed),
+            self.counters.down.load(Ordering::Relaxed),
+            self.started.elapsed(),
+        )
     }
 
     /// Record how the connection ended.
     pub fn set_outcome(&self, outcome: ConnOutcome) {
         let counter = match outcome {
-            ConnOutcome::Completed => &self.counters.completed,
-            ConnOutcome::Reset => &self.counters.reset,
-            ConnOutcome::Failed => &self.counters.failed,
+            ConnOutcome::Completed => &self.counters.service.completed,
+            ConnOutcome::Reset => &self.counters.service.reset,
+            ConnOutcome::Failed => &self.counters.service.failed,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record the outcome and emit the connection's access-log record.
+    ///
+    /// One queryable event per connection, pairing with
+    /// `zbridge_connections_outcome_total` and `zbridge_bytes_total`. The
+    /// identifying fields (`service`, `client_id`, `remote_addr`, …) are
+    /// inherited from the enclosing connection span rather than repeated here.
+    pub fn finish(&self, outcome: ConnOutcome) {
+        self.set_outcome(outcome);
+        let (bytes_up, bytes_down, elapsed) = self.summary();
+        tracing::info!(
+            target: ACCESS_LOG_TARGET,
+            outcome = outcome.as_str(),
+            bytes_up,
+            bytes_down,
+            duration_ms = elapsed.as_millis() as u64,
+            "connection closed"
+        );
     }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        self.counters.active.fetch_sub(1, Ordering::Relaxed);
+        self.counters.service.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -402,6 +479,44 @@ mod tests {
         assert_eq!(svc.bytes_down.load(Ordering::Relaxed), 250);
         assert_eq!(svc.failed.load(Ordering::Relaxed), 1);
         assert_eq!(svc.completed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn per_connection_totals_are_separate_from_the_service_totals() {
+        // The access log reports *this* connection; Prometheus reports the
+        // service. A second connection on the same service must not inflate
+        // the first one's record.
+        let m = Metrics::new();
+        let first = m.conn_start("api");
+        first.counters().add_up(100);
+        let second = m.conn_start("api");
+        second.counters().add_up(7);
+        second.counters().add_down(9);
+
+        let (up, down, elapsed) = first.summary();
+        assert_eq!((up, down), (100, 0));
+        let (up2, down2, _) = second.summary();
+        assert_eq!((up2, down2), (7, 9));
+
+        // Both still roll up into the service counters.
+        let svc = m.service("api");
+        assert_eq!(svc.bytes_up.load(Ordering::Relaxed), 107);
+        assert_eq!(svc.bytes_down.load(Ordering::Relaxed), 9);
+        // Duration is measured from conn_start, not from the first byte.
+        assert!(elapsed <= first.summary().2);
+    }
+
+    #[test]
+    fn finish_records_the_outcome_it_logs() {
+        let m = Metrics::new();
+        let g = m.conn_start("api");
+        g.finish(ConnOutcome::Reset);
+        assert_eq!(m.service("api").reset.load(Ordering::Relaxed), 1);
+        // The metric label and the access-log field are the same string, so
+        // the two surfaces cannot drift apart.
+        assert_eq!(ConnOutcome::Reset.as_str(), "reset");
+        assert_eq!(ConnOutcome::Completed.as_str(), "completed");
+        assert_eq!(ConnOutcome::Failed.as_str(), "failed");
     }
 
     #[test]

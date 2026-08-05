@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, info_span};
+use tracing::{Instrument, debug, error, info, info_span};
 use zenoh::Session;
 
 /// The per-listener constants of an accept loop.
@@ -100,12 +100,17 @@ where
                         let config = config.clone();
                         let handler = handler.clone();
 
+                        // `dns` is empty until the handler resolves a routing
+                        // key; recording it on the span means every later line
+                        // in this connection carries the routed host without
+                        // repeating it at each call site.
                         let span = info_span!(
                             "connection",
                             client_id = %client_id,
                             service = %service_name,
                             remote_addr = %addr,
                             mode = mode,
+                            dns = tracing::field::Empty,
                         );
 
                         tasks.spawn(
@@ -118,7 +123,10 @@ where
                                 {
                                     error!(error = %e, "Connection error");
                                 }
-                                info!("Connection closed");
+                                // The access log (metrics::ConnGuard::finish)
+                                // carries the outcome, byte counts and duration
+                                // for connections that reached a data plane.
+                                debug!("Connection task finished");
                             }
                             .instrument(span),
                         );
@@ -126,7 +134,7 @@ where
                     Err(e) => {
                         // Accept failed; release the permit we were holding.
                         drop(permit);
-                        error!("Failed to accept connection: {:?}", e);
+                        error!(error = %e, "Failed to accept connection");
                     }
                 }
             }

@@ -120,7 +120,7 @@ async fn main() -> Result<()> {
     let signal_token = shutdown_token.clone();
     tokio::spawn(async move {
         shutdown_signal().await;
-        info!("Shutdown signal received, initiating graceful shutdown...");
+        info!("Shutdown signal received, initiating graceful shutdown");
         signal_token.cancel();
     });
 
@@ -187,8 +187,8 @@ async fn main() -> Result<()> {
     tokio::select! {
         _ = shutdown_token.cancelled() => {
             info!(
-                "Waiting for tasks to drain (max {} seconds)...",
-                args.drain_timeout
+                drain_timeout_s = args.drain_timeout,
+                "Waiting for tasks to drain"
             );
             let _ = tokio::time::timeout(drain_timeout, &mut drain_all).await;
         }
@@ -197,7 +197,7 @@ async fn main() -> Result<()> {
                 "All bridge tasks exited before a shutdown signal; no listeners remain — exiting"
             );
             if let Err(e) = session.close().await {
-                warn!("Error closing Zenoh session: {}", e);
+                warn!(error = %e, "Error closing Zenoh session");
             }
             std::process::exit(1);
         }
@@ -205,7 +205,7 @@ async fn main() -> Result<()> {
 
     // Close Zenoh session explicitly
     if let Err(e) = session.close().await {
-        warn!("Error closing Zenoh session: {}", e);
+        warn!(error = %e, "Error closing Zenoh session");
     }
 
     info!("Shutdown complete");
