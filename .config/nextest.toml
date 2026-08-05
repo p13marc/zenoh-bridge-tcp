@@ -7,6 +7,12 @@
 # attempt, while a transient flake (a stray timeout, a teardown hiccup) recovers.
 retries = 2
 
+# No test in this suite legitimately runs for minutes. Without a terminate
+# bound, one test hanging on a missing response (several clients here have no
+# request timeout) wedges the whole run forever; with it, the hang becomes a
+# failed attempt that `retries` then absorbs like any other transient flake.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
 # Run all tests in the http_edge_cases test binary serially
 # This prevents port conflicts and Zenoh session interference
 [[profile.default.overrides]]

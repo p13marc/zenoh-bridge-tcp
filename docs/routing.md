@@ -20,8 +20,9 @@ space itself:
    HTTP/1 `Host`, the HTTP/2 `:authority`, or nothing at all for opaque
    traffic.
 2. Backends **self-announce** by declaring a liveliness token
-   (`{service}/{host}/available`); listeners gate on it. Registration, health
-   check, and deregistration are the same mechanism.
+   (`{service}/{host}/available`, or `{service}/available` for a backend with
+   no `@host` — the service's default); listeners gate on it. Registration,
+   health check, and deregistration are the same mechanism.
 3. N listener bridges and M backend bridges joined to one bus form a
    **many-to-many mesh**: one backend can serve five listeners, adding a node
    is joining the bus, and no other node's configuration changes.
@@ -84,12 +85,14 @@ cannot terminate (it is the plaintext-h1 plane).
 
 ## The Zenoh key space
 
-Opaque connections (no routing key):
+Opaque connections (no routing key), and hostname-routed connections that
+fell back to the default backend:
 
 ```
 {service}/tx/{client_id}        client → backend bytes
 {service}/rx/{client_id}        backend → client bytes
 {service}/clients/{client_id}   liveliness token (client presence)
+{service}/available             liveliness token (default backend presence)
 ```
 
 Hostname-routed connections (Host / SNI / `:authority`):
@@ -101,12 +104,21 @@ Hostname-routed connections (Host / SNI / `:authority`):
 {service}/{host}/available      liveliness token (backend presence)
 ```
 
+**Resolution order** for a hostname-routed connection: a backend that
+announced `{service}/{host}/available` for exactly this hostname wins; else,
+if a default backend announced `{service}/available`, the connection relays on
+the bare service keys to it; else the listener refuses fast (HTTP and
+WebSocket answer 502, TLS and h2c close). A plain `--backend '<svc>/<target>'`
+is therefore the service's catch-all: it serves opaque traffic *and* every
+hostname no `@host` backend claims.
+
 The lifecycle, from both sides:
 
 - **Listener side**: on accept, mint a unique `client_id`, declare the
   `clients/{client_id}` liveliness token, publish client bytes to `tx/`,
-  subscribe to `rx/`. For hostname-routed traffic, first check
-  `{service}/{host}/available` and answer HTTP 502 if no backend is alive.
+  subscribe to `rx/`. For hostname-routed traffic, first resolve the backend
+  (host token, else default token — both probed concurrently) and answer
+  HTTP 502 if neither is alive.
 - **Backend side**: watch for `clients/*` liveliness tokens. When one appears,
   connect to the local target (lazy — no client, no backend connection),
   subscribe to that client's `tx/`, publish backend bytes to `rx/`. Tear down
@@ -149,7 +161,8 @@ head-of-line-block other clients sharing the Zenoh session.
 
 On the backend side the protocol is a property of the target address:
 `host:port` is TCP, `ws://…` / `wss://…` is a WebSocket backend. `@host`
-composes with either.
+composes with either; leaving it off makes the backend the service's default
+(catch-all for opaque traffic and every unclaimed hostname).
 
 ## Migrating from 0.6.x
 

@@ -4,6 +4,17 @@
 
 ### Added
 
+- **A plain `--backend '<svc>/<target>'` is now the service's default
+  (catch-all) backend.** It declares the `{service}/available` liveliness
+  token, and every host-routed listener plane (plain HTTP/1 by Host, TLS
+  passthrough by SNI, h2c by `:authority`, terminated TLS, `route=request`
+  multiroute, WebSocket upgrades) falls back to it when no `@host` backend
+  claims the hostname — `@host` backends keep precedence. Previously the
+  simplest deployment (`--listen 'web/0.0.0.0:8002'` + `--backend
+  'web/127.0.0.1:8003'` + `curl http://127.0.0.1:8002`) answered 502, because
+  auto-detected HTTP routed by Host and a plain backend registered no
+  availability at all.
+
 - **Log sinks** (`--log-target`, repeatable): `stdout`, `stderr`,
   `file=PATH[,rotation=daily|hourly|minutely|never]`, `journald`, and
   `syslog[,ident=,facility=]`. Previously there was exactly one sink (stdout)
@@ -29,6 +40,14 @@
 
 ### Changed
 
+- **WebSocket upgrades with no announced backend now fail fast with a 502**
+  instead of proceeding blindly onto the bus and hanging until a timeout. The
+  previous blind fallback existed so plain backends could serve WS at all;
+  the gated default-backend resolution replaces it on every plane.
+- **Mixed-version note:** a pre-change plain *exporter* declares no
+  `{service}/available` token, so a post-change importer will 502 host-keyed
+  traffic (including WebSocket) against it. Upgrade exporters first; opaque
+  (`proto=raw`) traffic is unaffected.
 - **Log messages are static strings**, with all values in fields. This makes
   them stable aggregation keys, but breaks anything grepping for interpolated
   text such as `Client <id>:` — that identity is now the `client_id` field,

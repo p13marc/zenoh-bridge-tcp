@@ -16,7 +16,9 @@
 //!
 //! A backend's protocol is a property of its target: `host:port` is TCP,
 //! `ws://…`/`wss://…` is WebSocket. The optional `@host` registers
-//! `{service}/{host}/available` for hostname routing.
+//! `{service}/{host}/available` for hostname routing; without it the backend
+//! is the service's default (catch-all), registered as `{service}/available`
+//! and serving any hostname no `@host` backend claims.
 //!
 //! Separators are unambiguous by construction: [`validate_service_name`]
 //! rejects `@`, `,`, and `/` in service names, and an IPv6 listen address
@@ -84,7 +86,9 @@ pub enum BackendTarget {
 pub struct BackendSpec {
     pub service: String,
     /// Hostname this backend serves, registered as
-    /// `{service}/{host}/available`. `None` = the service's only backend.
+    /// `{service}/{host}/available`. `None` = the service's default
+    /// (catch-all) backend, registered as `{service}/available`: it serves
+    /// opaque traffic and any hostname no `@host` backend claims.
     pub host: Option<String>,
     pub target: BackendTarget,
 }
