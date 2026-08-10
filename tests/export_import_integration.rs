@@ -855,15 +855,19 @@ async fn test_zenoh_endpoint_flags_wire_a_pair() {
     let zenoh_connect = format!("tcp/{zenoh_addr}");
 
     let export_spec = format!("{}/{}", service, backend_addr);
-    let _export =
-        common::BridgeProcess::new(&["--backend", &export_spec, "--zenoh-listen", &zenoh_listen])
-            .await;
+    let _export = common::BridgeProcess::new_raw(&[
+        "--backend",
+        &export_spec,
+        "--zenoh-listen",
+        &zenoh_listen,
+    ])
+    .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
     let listen_spec = format!("{}/{},proto=raw", service, import_addr);
-    let _import = common::BridgeProcess::new(&[
+    let _import = common::BridgeProcess::new_raw(&[
         "--listen",
         &listen_spec,
         "--zenoh-connect",
@@ -893,7 +897,7 @@ async fn test_zenoh_endpoint_flags_wire_a_pair() {
 /// --zenoh-config with an unreadable file fails fast with a clean error.
 #[tokio::test]
 async fn test_zenoh_config_missing_file_fails_fast() {
-    let out = common::bridge_command()
+    let out = common::bridge_command_raw()
         .args([
             "--listen",
             "svc/127.0.0.1:0,proto=raw",
@@ -1055,12 +1059,15 @@ async fn error_signal_is_recoverable_by_a_late_subscriber() -> Result<()> {
     let backend_port = common::PortGuard::new();
     let backend_addr = backend_port.release(); // nothing listens here
 
+    // One domain shared by the subprocess export AND the in-process probe
+    // session below — they must discover each other.
+    let domain = common::ScoutDomain::new();
     let service = common::unique_service_name("laterr");
     let export_spec = format!("{service}/{backend_addr}");
-    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+    let _export = domain.bridge(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let session = zenoh::open(domain.config()).await.unwrap();
     let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
 
     // Play the import's liveliness half only — the export will dial its dead

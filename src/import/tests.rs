@@ -1,5 +1,24 @@
 use super::*;
 
+/// A per-call private multicast scouting domain, so these concurrently-run lib
+/// tests do not contend on the default Zenoh group (the same isolation the
+/// integration harness uses). Ports walk from a pid-seeded base.
+#[cfg(test)]
+fn isolated_zenoh_config() -> zenoh::Config {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20000u16.wrapping_add((std::process::id() % 20000) as u16);
+    let port = 20000 + base.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) % 45000;
+    let mut config = zenoh::Config::default();
+    config
+        .insert_json5(
+            "scouting/multicast/address",
+            &format!("\"224.0.0.224:{port}\""),
+        )
+        .expect("set multicast address");
+    config
+}
+
 #[test]
 fn test_parse_import_spec_valid() {
     let result = parse_import_spec("myservice/127.0.0.1:8080");
@@ -174,8 +193,9 @@ async fn test_resolve_backend_precedence() {
         }
     }
 
-    let declarer = zenoh::open(zenoh::Config::default()).await.unwrap();
-    let resolver = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let cfg = isolated_zenoh_config();
+    let declarer = zenoh::open(cfg.clone()).await.unwrap();
+    let resolver = zenoh::open(cfg).await.unwrap();
     let config = crate::config::BridgeConfig::default();
     let svc = format!("resolver_test_{}", uuid::Uuid::new_v4().as_simple());
 
@@ -264,7 +284,7 @@ async fn test_resolve_backend_precedence() {
 async fn test_resolve_backend_is_bounded_when_nothing_is_declared() {
     use super::connection::{BackendRoute, resolve_backend};
 
-    let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let session = zenoh::open(isolated_zenoh_config()).await.unwrap();
     let config = crate::config::BridgeConfig {
         availability_timeout: Duration::from_millis(200),
         ..Default::default()

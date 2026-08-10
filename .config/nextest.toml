@@ -1,16 +1,18 @@
 [profile.default]
 # Default configuration for nextest
 
-# The integration suite drives real sockets + Zenoh sessions, so it is mildly
-# timing-sensitive under heavy parallel load (e.g. on CI runners). Retry a failed
-# test in a fresh process a couple of times; a genuine failure still fails every
-# attempt, while a transient flake (a stray timeout, a teardown hiccup) recovers.
-retries = 2
+# NO retries: every test gets a private Zenoh scouting domain (see
+# `common::ScoutDomain` — each test's sessions and bridges discover only each
+# other, never sibling tests' peers), which removed the cross-test multicast
+# contention that made this suite flaky. A failure now is a real failure to
+# investigate, not something to paper over. If CI ever flakes here, fix the
+# cause; do not restore blanket retries.
+retries = 0
 
 # No test in this suite legitimately runs for minutes. Without a terminate
 # bound, one test hanging on a missing response (several clients here have no
 # request timeout) wedges the whole run forever; with it, the hang becomes a
-# failed attempt that `retries` then absorbs like any other transient flake.
+# failed attempt — and with retries=0 a real, visible failure.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
 # Run all tests in the http_edge_cases test binary serially

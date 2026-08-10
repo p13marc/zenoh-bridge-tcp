@@ -16,7 +16,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 
 /// A minimal looping HTTP/1.1 backend answering every request 200 with `body`.
 async fn start_http_backend(body: &'static str) -> SocketAddr {
@@ -107,8 +106,9 @@ async fn test_plain_backend_declares_default_token() {
     let config = Arc::new(zenoh_bridge_tcp::config::BridgeConfig::default());
 
     let service = unique_service_name("defback_token");
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Plain export — the backend address does not need to be reachable for
     // token declaration (connections are lazy).

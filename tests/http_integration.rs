@@ -22,7 +22,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -90,8 +89,9 @@ async fn spawn_tcp_bridge_pair(backend_addr: SocketAddr) -> (CancellationToken, 
     let config = Arc::new(BridgeConfig::default());
     let service = common::unique_service_name("httpint");
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start export
     let export_spec = format!("{}/{}", service, backend_addr);

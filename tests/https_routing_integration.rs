@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -120,8 +119,9 @@ async fn test_https_routing_multiple_backends() {
     let service = common::unique_service_name("httpsrt");
 
     // Create Zenoh sessions
-    let config1 = Config::default();
-    let config2 = Config::default();
+    let _scout = common::ScoutDomain::new();
+    let config1 = _scout.config();
+    let config2 = _scout.config();
 
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
@@ -345,8 +345,9 @@ async fn test_https_routing_concurrent_clients() {
     let service = common::unique_service_name("httpsconc");
 
     // Setup
-    let config1 = Config::default();
-    let config2 = Config::default();
+    let _scout = common::ScoutDomain::new();
+    let config1 = _scout.config();
+    let config2 = _scout.config();
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
@@ -457,8 +458,9 @@ async fn test_https_backend_becomes_available() {
 
     let service = common::unique_service_name("httpsdelay");
 
-    let config1 = Config::default();
-    let config2 = Config::default();
+    let _scout = common::ScoutDomain::new();
+    let config1 = _scout.config();
+    let config2 = _scout.config();
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
@@ -576,7 +578,11 @@ async fn test_sni_connection_refused_before_backend_exists() {
     let config = Arc::new(BridgeConfig::default());
     let service = common::unique_service_name("snirefuse");
 
-    let session = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session = Arc::new(
+        zenoh::open(common::ScoutDomain::new().config())
+            .await
+            .unwrap(),
+    );
 
     // An import listener with no export side anywhere.
     let import_port = common::PortGuard::new();

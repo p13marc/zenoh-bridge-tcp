@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -91,8 +90,9 @@ async fn test_http_routing_multiple_backends() {
     println!("===========================================");
 
     // Create Zenoh sessions
-    let config1 = Config::default();
-    let config2 = Config::default();
+    let _scout = common::ScoutDomain::new();
+    let config1 = _scout.config();
+    let config2 = _scout.config();
 
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
@@ -347,8 +347,9 @@ async fn test_http_routing_concurrent_clients() {
     println!("================================");
 
     // Setup
-    let config1 = Config::default();
-    let config2 = Config::default();
+    let _scout = common::ScoutDomain::new();
+    let config1 = _scout.config();
+    let config2 = _scout.config();
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 
@@ -453,8 +454,9 @@ async fn test_http_routing_backend_becomes_available() {
     println!("\nTEST: Backend Becomes Available After Import");
     println!("===============================================");
 
-    let config1 = Config::default();
-    let config2 = Config::default();
+    let _scout = common::ScoutDomain::new();
+    let config1 = _scout.config();
+    let config2 = _scout.config();
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
     let session2 = Arc::new(zenoh::open(config2).await.unwrap());
 

@@ -13,7 +13,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -98,8 +97,9 @@ async fn test_multiroute_single_request() {
     let backend_addr = start_backend("backend-a").await;
 
     // Open Zenoh sessions
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start HTTP export for host-a.test
     let s1 = session1.clone();
@@ -177,8 +177,9 @@ async fn test_multiroute_byte_metrics() {
     let service = "mr-metrics";
 
     let backend_addr = start_backend("backend-m").await;
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
@@ -258,8 +259,9 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let backend_b_addr = start_backend("backend-b").await;
 
     // Open Zenoh sessions
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-switch";
 
@@ -357,8 +359,9 @@ async fn test_multiroute_unavailable_host_returns_502() {
     // Start one backend only (for host-a)
     let backend_addr = start_backend("backend-a").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Unique per run: nextest runs test binaries in parallel on a shared Zenoh
     // scouting domain, so a literal name lets concurrent tests share a keyspace.
@@ -451,8 +454,9 @@ async fn spawn_multiroute(
     shutdown_token: &CancellationToken,
 ) -> SocketAddr {
     let config = Arc::new(BridgeConfig::default());
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Unique per call: nextest runs test binaries in parallel on a shared Zenoh
     // scouting domain, and several tests here call this concurrently.
@@ -589,8 +593,9 @@ async fn test_multiroute_pipelined_requests() {
     let backend_a_addr = start_backend("backend-a").await;
     let backend_b_addr = start_backend("backend-b").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-pipeline";
 
@@ -701,8 +706,9 @@ async fn test_multiroute_default_backend() {
 
     let backend_addr = start_backend("backend-default").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-default";
 
@@ -778,8 +784,9 @@ async fn test_multiroute_mixed_host_and_default() {
     let backend_a_addr = start_backend("backend-a").await;
     let backend_default_addr = start_backend("backend-default").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-mixed";
 
@@ -890,8 +897,9 @@ async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     let service = common::unique_service_name("mr502ka");
 
     let config = Arc::new(BridgeConfig::default());
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
@@ -1028,8 +1036,9 @@ where
 
     let config = Arc::new(config);
     let service = common::unique_service_name("mrcfg");
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();

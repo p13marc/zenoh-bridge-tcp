@@ -3,6 +3,8 @@
 //! This test suite validates error handling, edge cases, and boundary conditions
 //! for the HTTP routing feature.
 
+mod common;
+
 use axum::{Router, http::StatusCode, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -11,7 +13,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -75,13 +76,9 @@ async fn test_missing_host_header() {
 
     let service = unique_service("httpedge");
 
-    let mut config1 = Config::default();
-    config1.insert_json5("mode", "\"peer\"").unwrap();
-    let session1 = Arc::new(zenoh::open(config1).await.unwrap());
-
-    let mut config2 = Config::default();
-    config2.insert_json5("mode", "\"peer\"").unwrap();
-    let session2 = Arc::new(zenoh::open(config2).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start backend
     let backend_addr = start_test_backend("test-backend").await;
@@ -175,13 +172,9 @@ async fn test_malformed_http_requests() {
 
     let service = unique_service("httpedge");
 
-    let mut config1 = Config::default();
-    config1.insert_json5("mode", "\"peer\"").unwrap();
-    let session1 = Arc::new(zenoh::open(config1).await.unwrap());
-
-    let mut config2 = Config::default();
-    config2.insert_json5("mode", "\"peer\"").unwrap();
-    let session2 = Arc::new(zenoh::open(config2).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start backend
     let backend_addr = start_test_backend("test-backend").await;
@@ -282,13 +275,9 @@ async fn test_very_long_headers() {
 
     let service = unique_service("httpedge");
 
-    let mut config1 = Config::default();
-    config1.insert_json5("mode", "\"peer\"").unwrap();
-    let session1 = Arc::new(zenoh::open(config1).await.unwrap());
-
-    let mut config2 = Config::default();
-    config2.insert_json5("mode", "\"peer\"").unwrap();
-    let session2 = Arc::new(zenoh::open(config2).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start backend
     let backend_addr = start_test_backend("test-backend").await;
@@ -400,13 +389,9 @@ async fn test_special_characters_in_hostname() {
 
     let service = unique_service("httpedge");
 
-    let mut config1 = Config::default();
-    config1.insert_json5("mode", "\"peer\"").unwrap();
-    let session1 = Arc::new(zenoh::open(config1).await.unwrap());
-
-    let mut config2 = Config::default();
-    config2.insert_json5("mode", "\"peer\"").unwrap();
-    let session2 = Arc::new(zenoh::open(config2).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start backend
     let backend_addr = start_test_backend("test-backend").await;
@@ -521,13 +506,9 @@ async fn test_http_methods() {
 
     let service = unique_service("httpedge");
 
-    let mut config1 = Config::default();
-    config1.insert_json5("mode", "\"peer\"").unwrap();
-    let session1 = Arc::new(zenoh::open(config1).await.unwrap());
-
-    let mut config2 = Config::default();
-    config2.insert_json5("mode", "\"peer\"").unwrap();
-    let session2 = Arc::new(zenoh::open(config2).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start backend that handles various methods
     let app = Router::new()
@@ -672,13 +653,9 @@ async fn test_connection_lifecycle() {
 
     let service = unique_service("httpedge");
 
-    let mut config1 = Config::default();
-    config1.insert_json5("mode", "\"peer\"").unwrap();
-    let session1 = Arc::new(zenoh::open(config1).await.unwrap());
-
-    let mut config2 = Config::default();
-    config2.insert_json5("mode", "\"peer\"").unwrap();
-    let session2 = Arc::new(zenoh::open(config2).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start backend
     let backend_addr = start_test_backend("test-backend").await;
