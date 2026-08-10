@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
-use tokio::time::timeout;
 
 /// A tagged echo backend: replies `<tag>:<first-chunk>` once per connection
 /// and counts the connections it served.

@@ -649,18 +649,16 @@ async fn wss_backend_is_attempted_and_fails_closed() -> Result<()> {
     // is 5 fast retries (~3s of backoff) before the signal, so allow margin.
     let url = format!("ws://{import_addr}");
     let closed = timeout(Duration::from_secs(30), async {
-        loop {
-            match connect_async(&url).await {
-                Err(_) => break, // refused pre-upgrade counts as closed
-                Ok((mut ws, _)) => match timeout(Duration::from_secs(25), ws.next()).await {
-                    Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => break,
-                    Ok(Some(Ok(m))) => panic!("data from an undialable wss backend: {m:?}"),
-                    Err(_) => panic!(
-                        "WS client hung: the wss dial failure never reached the \
-                         import as an error signal"
-                    ),
-                },
-            }
+        match connect_async(&url).await {
+            Err(_) => {} // refused pre-upgrade counts as closed
+            Ok((mut ws, _)) => match timeout(Duration::from_secs(25), ws.next()).await {
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Ok(Some(Ok(m))) => panic!("data from an undialable wss backend: {m:?}"),
+                Err(_) => panic!(
+                    "WS client hung: the wss dial failure never reached the \
+                     import as an error signal"
+                ),
+            },
         }
     })
     .await;

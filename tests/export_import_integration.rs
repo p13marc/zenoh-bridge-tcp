@@ -497,7 +497,7 @@ async fn test_concurrent_connections() -> Result<()> {
             let n = timeout(Duration::from_secs(15), client.read(&mut buf))
                 .await
                 .map_err(|_| anyhow::anyhow!("client {i}: no response"))??;
-            anyhow::ensure!(&buf[..n] == msg, "client {i}: got {:?}", &buf[..n]);
+            anyhow::ensure!(buf[..n] == msg, "client {i}: got {:?}", &buf[..n]);
             Ok::<(), anyhow::Error>(())
         }));
     }
@@ -541,7 +541,7 @@ async fn test_large_message_transfer() -> Result<()> {
     let service = common::unique_service_name("largetest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
 
-    let mut client =
+    let client =
         common::connected_raw_client(pair.import_addr, b"ready?\n", common::BACKEND_READY_TIMEOUT)
             .await
             .expect("could not establish a served connection");

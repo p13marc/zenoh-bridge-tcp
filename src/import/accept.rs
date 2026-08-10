@@ -31,6 +31,7 @@ pub(super) struct AcceptLoopCfg {
 /// The handler is invoked inside the spawned task — handshakes and
 /// per-connection errors belong to it; the loop only logs its `Err` and
 /// moves on.
+#[allow(clippy::too_many_arguments)] // internal, named call sites in 5 flavor modules
 pub(super) async fn run_accept_loop<H, Fut>(
     cfg: AcceptLoopCfg,
     session: Arc<Session>,
