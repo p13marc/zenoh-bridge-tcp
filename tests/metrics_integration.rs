@@ -300,3 +300,130 @@ async fn metrics_server_hangs_up_on_idle_clients_and_stays_available() {
 
     let _ = child.kill().await;
 }
+
+/// A5 regression: ANY listener failing to bind must fail the process — even
+/// when other listeners bound fine.
+///
+/// Previously the failed task just logged and main kept running with readiness
+/// green as long as at least one other task lived: a bridge partially deaf on
+/// a configured port, invisible to orchestration.
+#[tokio::test]
+async fn bind_failure_is_fatal_and_never_ready() {
+    // Occupy one port so that listener cannot bind it; give the other listener
+    // a perfectly good port so the process would otherwise stay alive.
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = blocker.local_addr().unwrap();
+    let good_port = common::PortGuard::new();
+    let good = good_port.release();
+
+    let metrics_port = common::PortGuard::new();
+    let metrics_addr = metrics_port.release();
+
+    let mut child = common::bridge_command()
+        .args([
+            "--listen",
+            &format!("bindok/{good},proto=raw"),
+            "--listen",
+            &format!("bindfail/{taken},proto=raw"),
+            "--metrics-addr",
+            &metrics_addr.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn");
+
+    // The process must EXIT (nonzero), not linger deaf.
+    let status = tokio::time::timeout(Duration::from_secs(40), child.wait())
+        .await
+        .expect("bridge lingered after a bind failure — it must exit")
+        .expect("wait failed");
+    assert!(
+        !status.success(),
+        "a bind failure must produce a nonzero exit, got {status:?}"
+    );
+}
+
+/// A5 regression: /readyz answers 503 during the drain window instead of the
+/// old behaviour (metrics server killed at t=0 of shutdown -> connection
+/// refused while connections were still draining).
+#[tokio::test]
+async fn readyz_serves_503_during_drain() {
+    let port = common::PortGuard::new();
+    let listen_addr = port.release();
+    let metrics_port = common::PortGuard::new();
+    let metrics_addr = metrics_port.release();
+
+    let mut child = common::bridge_command()
+        .args([
+            "--listen",
+            &format!("drain503/{listen_addr},proto=raw"),
+            "--metrics-addr",
+            &metrics_addr.to_string(),
+            "--drain-timeout",
+            "5",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn");
+
+    common::wait_for_port(metrics_addr, Duration::from_secs(10))
+        .await
+        .expect("metrics server never started");
+
+    // Ready once all listeners bound.
+    let base = format!("http://{metrics_addr}");
+    common::retry_client(
+        || async {
+            let resp = reqwest::get(format!("{base}/readyz"))
+                .await
+                .map_err(std::io::Error::other)?;
+            if resp.status() == 200 {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("status {}", resp.status())))
+            }
+        },
+        Duration::from_secs(15),
+        "readyz 200",
+    )
+    .await
+    .expect("bridge never became ready");
+
+    // Hold a client connection open so the drain window is non-trivial, then
+    // ask for graceful shutdown.
+    let _held = tokio::net::TcpStream::connect(listen_addr).await.unwrap();
+    #[cfg(unix)]
+    {
+        let pid = child.id().expect("child pid") as i32;
+        // SIGTERM: graceful shutdown.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+
+    // During the drain, /readyz must answer 503 — not connection-refused.
+    let resp = common::retry_client(
+        || async {
+            let resp = reqwest::Client::new()
+                .get(format!("{base}/readyz"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .map_err(std::io::Error::other)?;
+            if resp.status() == 503 {
+                Ok(resp.status())
+            } else {
+                Err(std::io::Error::other(format!("status {}", resp.status())))
+            }
+        },
+        Duration::from_secs(5),
+        "readyz 503 during drain",
+    )
+    .await
+    .expect("readyz never turned 503 during the drain window");
+    assert_eq!(resp, 503);
+
+    let _ = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+}

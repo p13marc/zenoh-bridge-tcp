@@ -17,6 +17,7 @@ pub(super) async fn run_ws_import_mode(
     import_spec: &str,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let (service_name, listen_addr) = super::parse_import_spec(import_spec)?;
 
@@ -30,6 +31,7 @@ pub(super) async fn run_ws_import_mode(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         handle_ws_import_connection,
     )
     .await

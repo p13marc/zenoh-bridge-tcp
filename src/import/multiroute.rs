@@ -28,6 +28,7 @@ pub(super) async fn run_http_multiroute_import_mode(
     import_spec: &str,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let (service_name, listen_addr) = super::parse_import_spec(import_spec)?;
 
@@ -41,6 +42,7 @@ pub(super) async fn run_http_multiroute_import_mode(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         |session, stream, service, client_id, config| async move {
             handle_multiroute_connection(session, stream, &service, &client_id, config).await
         },

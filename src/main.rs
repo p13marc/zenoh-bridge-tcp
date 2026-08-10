@@ -105,10 +105,13 @@ async fn main() -> Result<()> {
     // Create a global cancellation token
     let shutdown_token = CancellationToken::new();
 
-    // Spawn the health/metrics server if requested (G7). Liveness is up
-    // immediately; readiness is flipped on once all bridge tasks are started.
-    if let Some(metrics_addr) = args.metrics_addr {
-        let token = shutdown_token.clone();
+    // Spawn the health/metrics server if requested (G7), on a CHILD token that
+    // main cancels only AFTER the drain: during shutdown /readyz must answer
+    // 503 (drain in progress) rather than connection-refused, or a load
+    // balancer keeps routing to a port that no longer answers.
+    let metrics_token = CancellationToken::new();
+    let metrics_task = args.metrics_addr.map(|metrics_addr| {
+        let token = metrics_token.clone();
         // Same budget the data-plane head readers use, so an idle client cannot
         // pin a task+fd on the observability port either.
         let read_timeout = std::time::Duration::from_secs(args.read_timeout);
@@ -116,12 +119,12 @@ async fn main() -> Result<()> {
             if let Err(e) = metrics::serve(metrics_addr, read_timeout, token).await {
                 tracing::error!(addr = %metrics_addr, error = %e, "Metrics server failed to bind");
             }
-        });
-    }
+        })
+    });
 
-    // Spawn signal handler
+    // Spawn signal handler (tracked so it is aborted on exit).
     let signal_token = shutdown_token.clone();
-    tokio::spawn(async move {
+    let signal_task = tokio::spawn(async move {
         shutdown_signal().await;
         info!("Shutdown signal received, initiating graceful shutdown");
         signal_token.cancel();
@@ -140,16 +143,34 @@ async fn main() -> Result<()> {
     // Listener tasks: each --listen dispatches on its parsed options
     // (auto/raw, passthrough/terminate, per-connection/per-request). TLS
     // material, if any, is loaded lazily inside run_listener, per listener.
+    // Each listener reports through a oneshot once its socket is ACCEPTING;
+    // readiness is only declared when all of them have.
+    let mut bound_rxs = Vec::with_capacity(listener_count);
     {
         let session = session.clone();
         let bridge_config = bridge_config.clone();
-        spawn_bridge_tasks(&mut tasks, listens, "listen", &shutdown_token, {
-            move |spec, token| {
-                let session = session.clone();
-                let config = bridge_config.clone();
-                async move { import::run_listener(session, spec, config, token).await }
-            }
-        });
+        for spec in listens {
+            let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+            bound_rxs.push((spec.to_string(), bound_rx));
+            let token = shutdown_token.child_token();
+            let session = session.clone();
+            let config = bridge_config.clone();
+            debug!(mode = "listen", spec = %spec, "Spawning task");
+            tasks.push(tokio::spawn(async move {
+                let label = spec.to_string();
+                if let Err(e) = import::run_listener_with_readiness(
+                    session,
+                    spec,
+                    config,
+                    token,
+                    Some(bound_tx),
+                )
+                .await
+                {
+                    tracing::error!(mode = "listen", spec = %label, error = %e, "Task failed");
+                }
+            }));
+        }
     }
 
     // Backend tasks: each --backend exposes a local target onto the bus.
@@ -165,21 +186,51 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Readiness truth (A5): wait for every listener to actually bind before
+    // /readyz says 200. A dropped sender means that listener FAILED to bind
+    // (EADDRINUSE, bad cert, ...) — a configuration error; fail the process
+    // rather than run partially deaf with readiness green.
+    for (spec, bound_rx) in bound_rxs {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), bound_rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                shutdown_token.cancel();
+                metrics_token.cancel();
+                signal_task.abort();
+                return Err(anyhow::anyhow!(
+                    "listener '{spec}' failed to start; aborting (see the error above)"
+                ));
+            }
+            Err(_) => {
+                shutdown_token.cancel();
+                metrics_token.cancel();
+                signal_task.abort();
+                return Err(anyhow::anyhow!(
+                    "listener '{spec}' did not become ready within 30s; aborting"
+                ));
+            }
+        }
+    }
+
     info!(
         listeners = listener_count,
         backends = backend_count,
         "All bridge tasks started"
     );
 
-    // Bridges are up: report readiness on /readyz.
+    // Every listener is accepting: report readiness on /readyz.
     metrics::metrics().set_ready(true);
 
-    let drain_timeout = tokio::time::Duration::from_secs(args.drain_timeout);
+    // Outer budget exceeds the accept loops' own drain_timeout so their
+    // orderly drain (cancel connections, wait, abort leftovers) actually gets
+    // to run — with equal budgets the outer timer always fired first and the
+    // session was closed under still-relaying tasks.
+    let drain_budget =
+        tokio::time::Duration::from_secs(args.drain_timeout) + tokio::time::Duration::from_secs(2);
 
-    // Wait for a shutdown signal — or detect that every bridge task exited on its
-    // own first. Bridges run until cancelled, so if they all finish while no
-    // shutdown was requested, no listeners remain (e.g. every bind failed with
-    // EADDRINUSE); fail fast rather than linger as a live process doing nothing.
+    // Wait for a shutdown signal — or detect that every bridge task exited on
+    // its own first (bridges run until cancelled; all of them finishing with no
+    // shutdown requested means nothing remains to serve).
     let drain_all = async move {
         for task in tasks {
             let _ = task.await;
@@ -187,30 +238,45 @@ async fn main() -> Result<()> {
     };
     tokio::pin!(drain_all);
 
-    tokio::select! {
+    let clean = tokio::select! {
         _ = shutdown_token.cancelled() => {
+            // Stop advertising readiness the moment shutdown begins: the LB
+            // must stop sending new work while existing connections drain.
+            metrics::metrics().set_ready(false);
             info!(
                 drain_timeout_s = args.drain_timeout,
                 "Waiting for tasks to drain"
             );
-            let _ = tokio::time::timeout(drain_timeout, &mut drain_all).await;
+            let _ = tokio::time::timeout(drain_budget, &mut drain_all).await;
+            true
         }
         _ = &mut drain_all => {
             tracing::error!(
                 "All bridge tasks exited before a shutdown signal; no listeners remain — exiting"
             );
-            if let Err(e) = session.close().await {
-                warn!(error = %e, "Error closing Zenoh session");
-            }
-            std::process::exit(1);
+            metrics::metrics().set_ready(false);
+            false
         }
-    }
+    };
 
-    // Close Zenoh session explicitly
+    // Close Zenoh session explicitly, stop the observability server last, and
+    // return through main so the log guards flush (process::exit here used to
+    // discard the very error being reported when a file sink was buffered).
     if let Err(e) = session.close().await {
         warn!(error = %e, "Error closing Zenoh session");
     }
+    metrics_token.cancel();
+    if let Some(handle) = metrics_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+    signal_task.abort();
 
-    info!("Shutdown complete");
-    Ok(())
+    if clean {
+        info!("Shutdown complete");
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "all bridge tasks exited unexpectedly; nothing left to serve"
+        ))
+    }
 }

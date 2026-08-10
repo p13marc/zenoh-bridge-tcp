@@ -21,6 +21,7 @@ pub(super) async fn run_https_terminate_import_mode(
     tls_config: Arc<rustls::ServerConfig>,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     use tokio_rustls::TlsAcceptor;
 
@@ -38,6 +39,7 @@ pub(super) async fn run_https_terminate_import_mode(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         move |session, tcp_stream, service, client_id, config| {
             let tls_acceptor = tls_acceptor.clone();
             async move {

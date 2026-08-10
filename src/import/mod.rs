@@ -55,6 +55,18 @@ pub async fn run_listener(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
+    run_listener_with_readiness(session, spec, config, shutdown_token, None).await
+}
+
+/// [`run_listener`], signalling on `on_bound` once the socket is accepting.
+/// main uses this so /readyz only reports ready when every port truly is.
+pub async fn run_listener_with_readiness(
+    session: Arc<Session>,
+    spec: crate::spec::ListenSpec,
+    config: Arc<BridgeConfig>,
+    shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     use crate::spec::{ProtoMode, RouteMode, TlsMode};
 
     // The internal mode runners consume the canonical 'service/addr' spec.
@@ -62,15 +74,28 @@ pub async fn run_listener(
 
     match (&spec.proto, &spec.tls, &spec.route) {
         (ProtoMode::Raw, TlsMode::Passthrough, RouteMode::Connection) => {
-            listener::run_import_mode_internal(session, &mode_spec, false, config, shutdown_token)
-                .await
+            listener::run_import_mode_internal(
+                session,
+                &mode_spec,
+                false,
+                config,
+                shutdown_token,
+                on_bound,
+            )
+            .await
         }
         (ProtoMode::Auto, TlsMode::Passthrough, RouteMode::Connection) => {
-            auto::run_auto_import_mode(session, &mode_spec, config, shutdown_token).await
+            auto::run_auto_import_mode(session, &mode_spec, config, shutdown_token, on_bound).await
         }
         (ProtoMode::Auto, TlsMode::Passthrough, RouteMode::Request) => {
-            multiroute::run_http_multiroute_import_mode(session, &mode_spec, config, shutdown_token)
-                .await
+            multiroute::run_http_multiroute_import_mode(
+                session,
+                &mode_spec,
+                config,
+                shutdown_token,
+                on_bound,
+            )
+            .await
         }
         #[cfg(feature = "tls-termination")]
         (ProtoMode::Auto, TlsMode::Terminate { cert, key }, RouteMode::Connection) => {
@@ -81,6 +106,7 @@ pub async fn run_listener(
                 tls_config,
                 config,
                 shutdown_token,
+                on_bound,
             )
             .await
         }
@@ -147,7 +173,8 @@ pub async fn run_import_mode(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    listener::run_import_mode_internal(session, import_spec, false, config, shutdown_token).await
+    listener::run_import_mode_internal(session, import_spec, false, config, shutdown_token, None)
+        .await
 }
 
 /// Run HTTP-aware import mode for a single service
@@ -163,7 +190,8 @@ pub async fn run_http_import_mode(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    listener::run_import_mode_internal(session, import_spec, true, config, shutdown_token).await
+    listener::run_import_mode_internal(session, import_spec, true, config, shutdown_token, None)
+        .await
 }
 
 /// Run HTTP import mode with per-request routing.
@@ -177,7 +205,8 @@ pub async fn run_http_multiroute_import_mode(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    multiroute::run_http_multiroute_import_mode(session, import_spec, config, shutdown_token).await
+    multiroute::run_http_multiroute_import_mode(session, import_spec, config, shutdown_token, None)
+        .await
 }
 
 /// Run WebSocket import mode for a single service
@@ -192,7 +221,7 @@ pub async fn run_ws_import_mode(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    ws::run_ws_import_mode(session, import_spec, config, shutdown_token).await
+    ws::run_ws_import_mode(session, import_spec, config, shutdown_token, None).await
 }
 
 /// Run auto-detecting import mode for a single service.
@@ -207,7 +236,7 @@ pub async fn run_auto_import_mode(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    auto::run_auto_import_mode(session, import_spec, config, shutdown_token).await
+    auto::run_auto_import_mode(session, import_spec, config, shutdown_token, None).await
 }
 
 /// Run HTTPS import mode with TLS termination.
@@ -228,6 +257,13 @@ pub async fn run_https_terminate_import_mode(
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
 ) -> Result<()> {
-    tls::run_https_terminate_import_mode(session, import_spec, tls_config, config, shutdown_token)
-        .await
+    tls::run_https_terminate_import_mode(
+        session,
+        import_spec,
+        tls_config,
+        config,
+        shutdown_token,
+        None,
+    )
+    .await
 }

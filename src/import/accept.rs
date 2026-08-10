@@ -38,6 +38,7 @@ pub(super) async fn run_accept_loop<H, Fut>(
     listen_addr: SocketAddr,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
     handler: H,
 ) -> Result<()>
 where
@@ -62,6 +63,13 @@ where
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", listen_addr, e))?;
+
+    // Readiness truth (A5): /readyz must not say 200 before this port can
+    // actually accept. The sender is dropped un-sent on a bind failure, which
+    // main treats as fatal.
+    if let Some(tx) = on_bound {
+        let _ = tx.send(());
+    }
 
     info!(listen_addr = %listen_addr, service = %service_name, mode = mode, "Import bridge ready");
 
