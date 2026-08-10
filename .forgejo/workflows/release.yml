@@ -13,7 +13,7 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://data.forgejo.org/actions/checkout@v7
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
         with:
@@ -58,18 +58,40 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build and push image
         run: |
+          set -eu
           image="$REGISTRY/${GITHUB_REPOSITORY,,}"
+          cache="$REGISTRY/${GITHUB_REPOSITORY,,}-cache"
           cd src
           buildah login --tls-verify=false -u marcpardo -p "${{ secrets.REGISTRY_TOKEN }}" "$REGISTRY"
-          # layer cache lives in the registry (real TLS via the hairpin fix);
-          # pruned by the Forgejo packages cleanup rule on *-cache
-          buildah login -u marcpardo -p "${{ secrets.REGISTRY_TOKEN }}" git.marcpardo.eu
-          buildah build --layers \
-            --cache-from=git.marcpardo.eu/marcpardo/zenoh-bridge-tcp-cache \
-            --cache-to=git.marcpardo.eu/marcpardo/zenoh-bridge-tcp-cache \
-            --cache-ttl=168h \
+
+          # The layer cache lives in the SAME internal registry we just logged
+          # into. It used to point at the public vhost git.marcpardo.eu, which
+          # the runner zone cannot hairpin to — the same constraint the release
+          # job above documents — so every tagged build died here before it
+          # built anything. Pruned by the Forgejo packages cleanup rule on *-cache.
+          #
+          # A cache miss must never fail a release, so probe the cache first and
+          # drop the flags entirely if it is not reachable.
+          cache_args=""
+          if buildah pull --tls-verify=false "$cache" >/dev/null 2>&1 \
+            || buildah manifest inspect --tls-verify=false "$cache" >/dev/null 2>&1; then
+            cache_args="--cache-from=$cache --cache-to=$cache --cache-ttl=168h"
+          else
+            echo "::warning::layer cache $cache unreachable; building without it"
+            cache_args="--cache-to=$cache --cache-ttl=168h"
+          fi
+
+          # shellcheck disable=SC2086
+          if ! buildah build --layers $cache_args --tls-verify=false \
             --label "org.opencontainers.image.source=https://git.marcpardo.eu/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-            -t "$image:${GITHUB_REF_NAME}" -t "$image:latest" -f Dockerfile .
+            -t "$image:${GITHUB_REF_NAME}" -t "$image:latest" -f Dockerfile .; then
+            echo "::warning::build with layer cache failed; retrying without it"
+            buildah build --tls-verify=false \
+              --label "org.opencontainers.image.source=https://git.marcpardo.eu/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              -t "$image:${GITHUB_REF_NAME}" -t "$image:latest" -f Dockerfile .
+          fi
+
           buildah push --tls-verify=false "$image:${GITHUB_REF_NAME}"
           buildah push --tls-verify=false "$image:latest"

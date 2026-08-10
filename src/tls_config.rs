@@ -140,7 +140,7 @@ mod tests {
         let cert_path = dir.join("test_alpn_cert.pem");
         let key_path = dir.join("test_alpn_key.pem");
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+        std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
         let config = load_tls_config(&cert_path, &key_path).unwrap();
         assert_eq!(
@@ -157,7 +157,7 @@ mod tests {
         install_crypto_provider();
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let cert_pem = cert.cert.pem();
-        let key_pem = cert.key_pair.serialize_pem();
+        let key_pem = cert.signing_key.serialize_pem();
 
         let dir = std::env::temp_dir();
         let cert_path = dir.join("test_tls_valid_cert.pem");

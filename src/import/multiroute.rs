@@ -709,4 +709,3 @@ async fn run_exchange(
     let keep_alive = keep_alive && response_done && !*client_eof;
     Ok(ExchangeOutcome::Completed { keep_alive })
 }
-

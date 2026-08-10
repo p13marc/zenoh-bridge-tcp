@@ -563,17 +563,26 @@ pub(super) enum BackendRoute {
 }
 
 /// One-shot liveliness probe: any reply for `key` within `timeout` means alive.
+///
+/// The timeout covers the WHOLE probe, declaration included, not just the wait
+/// for a reply. Declaring the query is itself an async round-trip through the
+/// session, and a session that is congested or mid-reconnect can leave it
+/// pending indefinitely — which would hang `resolve_backend`, and with it the
+/// connection it is routing, with no bound at all. A probe that cannot complete
+/// in time is indistinguishable from "not alive", so treat it as such.
 async fn token_alive(session: &Session, key: &str, timeout: std::time::Duration) -> Result<bool> {
-    let replies = session
-        .liveliness()
-        .get(key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to query service liveliness: {}", e))?;
-    Ok(tokio::time::timeout(timeout, async {
-        replies.recv_async().await.is_ok()
-    })
-    .await
-    .unwrap_or(false))
+    let probe = async {
+        let replies = session
+            .liveliness()
+            .get(key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to query service liveliness: {}", e))?;
+        Ok::<bool, anyhow::Error>(replies.recv_async().await.is_ok())
+    };
+    match tokio::time::timeout(timeout, probe).await {
+        Ok(result) => result,
+        Err(_) => Ok(false),
+    }
 }
 
 /// Resolve which backend serves a connection: an `@host` backend matching

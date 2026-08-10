@@ -26,20 +26,19 @@ async fn test_backend_available() {
     let mut pair = BridgePair::tcp(&service, backend_addr).await;
     let import_addr = pair.import_addr;
 
-    // Connect and wait for liveliness propagation
-    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Retry the exchange rather than sleeping: the client's connection is what
+    // starts the liveliness chain, so bytes sent before the export side has
+    // dialled the backend can be dropped, and a fixed wait only makes that less
+    // likely rather than impossible.
+    let echo = common::echo_roundtrip(
+        import_addr,
+        b"Hello Backend!",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("backend never echoed");
 
-    stream.write_all(b"Hello Backend!").await.unwrap();
-
-    let mut buf = [0u8; 1024];
-    let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
-        .await
-        .expect("Timeout waiting for echo")
-        .expect("Read error");
-
-    assert!(n > 0, "Should receive echo data");
-    assert_eq!(&buf[..n], b"Hello Backend!");
+    assert_eq!(echo, b"Hello Backend!");
 
     pair.kill_and_wait().await;
 }

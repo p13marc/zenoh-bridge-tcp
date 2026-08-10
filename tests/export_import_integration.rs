@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 
@@ -592,7 +591,7 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
     println!("2. Starting export bridge...");
     let service = common::unique_service_name("nobackend");
     let export_spec = format!("{}/{}", service, backend_addr);
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut export_bridge = common::bridge_command()
         .args(["--backend", &export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -606,7 +605,7 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
 
     let import_spec = format!("{}/{},proto=raw", service, import_addr);
     println!("3. Starting import bridge...");
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut import_bridge = common::bridge_command()
         .args(["--listen", &import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1058,7 +1057,7 @@ async fn test_rapid_data_send() -> Result<()> {
     // Start bridges
     let service = common::unique_service_name("rapiddata");
     let export_spec = format!("{}/{}", service, backend_addr);
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut export_bridge = common::bridge_command()
         .args(["--backend", &export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1071,7 +1070,7 @@ async fn test_rapid_data_send() -> Result<()> {
     drop(import_listener);
 
     let import_spec = format!("{}/{},proto=raw", service, import_addr);
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut import_bridge = common::bridge_command()
         .args(["--listen", &import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1166,7 +1165,7 @@ async fn test_backend_restart_recovery() -> Result<()> {
     // Start bridges WITHOUT backend initially
     let service = common::unique_service_name("restarttest");
     let export_spec = format!("{}/{}", service, backend_addr);
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut export_bridge = common::bridge_command()
         .args(["--backend", &export_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1179,7 +1178,7 @@ async fn test_backend_restart_recovery() -> Result<()> {
     drop(import_listener);
 
     let import_spec = format!("{}/{},proto=raw", service, import_addr);
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut import_bridge = common::bridge_command()
         .args(["--listen", &import_spec])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1367,7 +1366,7 @@ async fn test_zenoh_endpoint_flags_wire_a_pair() {
 /// --zenoh-config with an unreadable file fails fast with a clean error.
 #[tokio::test]
 async fn test_zenoh_config_missing_file_fails_fast() {
-    let out = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let out = common::bridge_command()
         .args([
             "--listen",
             "svc/127.0.0.1:0,proto=raw",

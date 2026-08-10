@@ -10,7 +10,6 @@ mod common;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 /// Read a log file as JSON lines, skipping anything unparseable.
 fn json_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
@@ -54,7 +53,7 @@ async fn file_sink_writes_ansi_free_json() {
     let metrics_port = common::PortGuard::new();
     let metrics_addr = metrics_port.release();
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut child = common::bridge_command()
         .args([
             "--backend",
             "logsvc/127.0.0.1:1",
@@ -142,7 +141,7 @@ async fn access_log_reports_outcome_bytes_and_duration() {
     let metrics_port = common::PortGuard::new();
     let metrics_addr = metrics_port.release();
 
-    let mut exporter = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut exporter = common::bridge_command()
         .args([
             "--backend",
             &format!("accesssvc/{backend_addr}"),
@@ -157,7 +156,7 @@ async fn access_log_reports_outcome_bytes_and_duration() {
         .spawn()
         .expect("Failed to spawn exporter");
 
-    let mut importer = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut importer = common::bridge_command()
         .args([
             "--listen",
             &format!("accesssvc/{listen_addr},proto=raw"),
@@ -318,7 +317,7 @@ async fn access_log_reports_outcome_bytes_and_duration() {
 /// flag and the offending value, not accepted and silently ignored.
 #[tokio::test]
 async fn invalid_log_target_is_rejected_at_startup() {
-    let out = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let out = common::bridge_command()
         .args([
             "--backend",
             "svc/127.0.0.1:1",
@@ -342,7 +341,7 @@ async fn stderr_sink_leaves_stdout_empty() {
     let metrics_port = common::PortGuard::new();
     let metrics_addr = metrics_port.release();
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut child = common::bridge_command()
         .args([
             "--backend",
             "stderrsvc/127.0.0.1:1",

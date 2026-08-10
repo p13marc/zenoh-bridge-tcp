@@ -131,21 +131,23 @@ async fn test_ws_export_import_basic() -> Result<()> {
         .expect("Import bridge did not start listening in time");
     println!("5. WebSocket import bridge started and listening");
 
-    // Step 4: Connect WebSocket client to import bridge
+    // Step 4: Connect WebSocket client to import bridge.
+    // The WS door resolves the backend DURING the upgrade, so an upgrade that
+    // beats the export side's availability token is answered with a 502. Retry
+    // until it is routed rather than sleeping and hoping.
     let client_ws_url = format!("ws://{}", import_addr);
     println!("6. Client connecting to {}", client_ws_url);
 
-    let (ws_stream, _) = timeout(Duration::from_secs(5), connect_async(&client_ws_url))
-        .await
-        .map_err(|_| anyhow::anyhow!("Timeout connecting to import bridge"))??;
+    let (ws_stream, _) = common::retry_client(
+        || connect_async(&client_ws_url),
+        common::BACKEND_READY_TIMEOUT,
+        "WebSocket upgrade through the import bridge",
+    )
+    .await?;
 
     println!("7. Client WebSocket connected");
 
     let (mut sender, mut receiver) = ws_stream.split();
-
-    // Give bridges time to establish Zenoh connections.
-    // Liveliness must propagate between two separate OS processes via Zenoh scouting.
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Step 5: Send binary message
     let test_data = b"Hello WebSocket through Zenoh!";
@@ -214,16 +216,17 @@ async fn test_ws_multiple_messages() -> Result<()> {
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .expect("Import bridge did not start listening in time");
-
-    // Connect client
+    // Connect client. The upgrade is routed at connect time, so retry until the
+    // export side is announced rather than racing it with a sleep.
     let client_ws_url = format!("ws://{}", import_addr);
-    let (ws_stream, _) = timeout(Duration::from_secs(5), connect_async(&client_ws_url)).await??;
+    let (ws_stream, _) = common::retry_client(
+        || connect_async(&client_ws_url),
+        common::BACKEND_READY_TIMEOUT,
+        "WebSocket upgrade through the import bridge",
+    )
+    .await?;
 
     let (mut sender, mut receiver) = ws_stream.split();
-
-    // Give bridges time to establish Zenoh connections.
-    // Liveliness must propagate between two separate OS processes via Zenoh scouting.
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Send multiple messages
     let messages = ["First message", "Second message", "Third message"];
@@ -329,11 +332,17 @@ async fn test_ws_connection_lifecycle() -> Result<()> {
         .expect("Import bridge did not start listening in time");
     println!("2. Bridges started");
 
-    // Connect first client
+    // Connect first client. The upgrade is routed at connect time, so retry
+    // until the export side is announced rather than racing it with a sleep.
     let client_ws_url = format!("ws://{}", import_addr);
     println!("3. Connecting first client...");
 
-    let (ws_stream1, _) = timeout(Duration::from_secs(5), connect_async(&client_ws_url)).await??;
+    let (ws_stream1, _) = common::retry_client(
+        || connect_async(&client_ws_url),
+        common::BACKEND_READY_TIMEOUT,
+        "WebSocket upgrade through the import bridge",
+    )
+    .await?;
 
     let (mut sender1, _receiver1) = ws_stream1.split();
 
@@ -523,6 +532,79 @@ async fn test_ws_upgrade_split_across_segments() -> Result<()> {
         response.starts_with("HTTP/1.1 101"),
         "a split WS handshake must still upgrade (got: {response:.60})"
     );
+
+    Ok(())
+}
+
+/// A WebSocket upgrade that arrives before any backend exists must be refused
+/// with a 502, and the SAME listener must start upgrading once an export bridge
+/// appears — without restarting anything.
+///
+/// This is the availability race the WS tests used to hit by accident (they
+/// connected right after `wait_for_port` and flaked on a 502), turned into an
+/// assertion. It pins both halves: the refusal is a real, deliberate answer
+/// rather than a stall, and it is transient rather than sticky — a listener
+/// must not cache "no backend" from a probe taken before the export side booted.
+#[tokio::test]
+async fn test_ws_backend_appears_after_client_arrives() -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let service = common::unique_service_name("wslate");
+
+    // Import listener only — deliberately no export side yet.
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let listen_spec = format!("{service}/{import_addr}");
+    let _import = common::BridgeProcess::new(&["--listen", &listen_spec]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+
+    let upgrade = concat!(
+        "GET /chat HTTP/1.1\r\n",
+        "Host: late.test\r\n",
+        "Upgrade: websocket\r\n",
+        "Connection: Upgrade\r\n",
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+        "Sec-WebSocket-Version: 13\r\n",
+        "\r\n"
+    );
+
+    // Phase 1: no backend anywhere -> a definite 502, not a hang.
+    let mut tcp = tokio::net::TcpStream::connect(import_addr).await?;
+    tcp.write_all(upgrade.as_bytes()).await?;
+    let mut buf = vec![0u8; 256];
+    let n = timeout(Duration::from_secs(10), tcp.read(&mut buf)).await??;
+    let response = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        response.starts_with("HTTP/1.1 502"),
+        "an upgrade with no backend must be refused with 502 (got: {response:.60})"
+    );
+    drop(tcp);
+
+    // Phase 2: the backend and its export bridge show up late.
+    let ws_server_url = start_ws_echo_server("127.0.0.1:0").await?;
+    let export_spec = format!("{service}/{ws_server_url}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
+
+    // The same listener must now upgrade. Retrying IS the assertion: the 502
+    // has to give way on its own once the export side announces itself.
+    let client_ws_url = format!("ws://{import_addr}");
+    let (ws_stream, _) = common::retry_client(
+        || connect_async(&client_ws_url),
+        common::BACKEND_READY_TIMEOUT,
+        "WebSocket upgrade after the backend appeared",
+    )
+    .await?;
+
+    // And the upgraded connection must actually carry data end to end.
+    let (mut sender, mut receiver) = ws_stream.split();
+    sender
+        .send(Message::Binary(b"late-echo".to_vec().into()))
+        .await?;
+    let echoed = timeout(Duration::from_secs(10), receiver.next())
+        .await
+        .map_err(|_| anyhow::anyhow!("no echo after the backend appeared"))?
+        .ok_or_else(|| anyhow::anyhow!("connection closed without an echo"))??;
+    assert_eq!(echoed.into_data().as_ref(), b"late-echo");
 
     Ok(())
 }

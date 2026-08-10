@@ -180,7 +180,14 @@ async fn test_resolve_backend_precedence() {
     let svc = format!("resolver_test_{}", uuid::Uuid::new_v4().as_simple());
 
     // Nothing declared: refuse, with or without a hostname.
-    assert_resolves(&resolver, &svc, Some("h.test"), &config, BackendRoute::Unavailable).await;
+    assert_resolves(
+        &resolver,
+        &svc,
+        Some("h.test"),
+        &config,
+        BackendRoute::Unavailable,
+    )
+    .await;
     assert_resolves(&resolver, &svc, None, &config, BackendRoute::Unavailable).await;
 
     // Default token only: everything routes to the default backend.
@@ -189,7 +196,14 @@ async fn test_resolve_backend_precedence() {
         .declare_token(format!("{svc}/available"))
         .await
         .unwrap();
-    assert_resolves(&resolver, &svc, Some("h.test"), &config, BackendRoute::Default).await;
+    assert_resolves(
+        &resolver,
+        &svc,
+        Some("h.test"),
+        &config,
+        BackendRoute::Default,
+    )
+    .await;
     assert_resolves(&resolver, &svc, None, &config, BackendRoute::Default).await;
 
     // Host token added: that host resolves Host, others still Default.
@@ -199,7 +213,14 @@ async fn test_resolve_backend_precedence() {
         .await
         .unwrap();
     assert_resolves(&resolver, &svc, Some("h.test"), &config, BackendRoute::Host).await;
-    assert_resolves(&resolver, &svc, Some("other.test"), &config, BackendRoute::Default).await;
+    assert_resolves(
+        &resolver,
+        &svc,
+        Some("other.test"),
+        &config,
+        BackendRoute::Default,
+    )
+    .await;
 
     // A host literally named "available" declares the 3-segment
     // {svc}/available/available and must not be confused with the default.
@@ -209,10 +230,63 @@ async fn test_resolve_backend_precedence() {
         .declare_token(format!("{svc2}/available/available"))
         .await
         .unwrap();
-    assert_resolves(&resolver, &svc2, Some("available"), &config, BackendRoute::Host).await;
+    assert_resolves(
+        &resolver,
+        &svc2,
+        Some("available"),
+        &config,
+        BackendRoute::Host,
+    )
+    .await;
     // No default token for svc2: an unmatched host refuses. The positive
     // probe above proves the sessions see svc2's tokens, so this cannot pass
     // by mere non-discovery.
-    assert_resolves(&resolver, &svc2, Some("other.test"), &config, BackendRoute::Unavailable)
-        .await;
+    assert_resolves(
+        &resolver,
+        &svc2,
+        Some("other.test"),
+        &config,
+        BackendRoute::Unavailable,
+    )
+    .await;
+}
+
+/// `resolve_backend` must always answer within its configured budget, even when
+/// nobody has declared anything.
+///
+/// The bound is what keeps a connection from hanging: the import doors await
+/// this call before they can route, so an unbounded probe would pin the
+/// connection (and its task and fd) indefinitely rather than refusing it. The
+/// probe declares a query as well as awaiting a reply, and both halves have to
+/// be inside the timeout — covering only the reply left the declaration free to
+/// stall forever on a congested session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_resolve_backend_is_bounded_when_nothing_is_declared() {
+    use super::connection::{BackendRoute, resolve_backend};
+
+    let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+    let config = crate::config::BridgeConfig {
+        availability_timeout: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let svc = format!("resolver_bound_{}", uuid::Uuid::new_v4().as_simple());
+
+    // Both shapes: host-keyed (probes two tokens) and default-only (one).
+    for dns in [Some("nobody.test"), None] {
+        let started = tokio::time::Instant::now();
+        let route = resolve_backend(&session, &svc, dns, &config).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            route,
+            BackendRoute::Unavailable,
+            "nothing is declared for {svc}, so {dns:?} must not resolve"
+        );
+        // Generous ceiling: the two probes race concurrently, so the floor is
+        // one timeout, and this only has to catch an UNBOUNDED wait.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "resolve_backend({dns:?}) took {elapsed:?} with a 200ms budget — the probe is not bounded"
+        );
+    }
 }

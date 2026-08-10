@@ -61,16 +61,41 @@ async fn http_get(addr: SocketAddr, host: &str) -> String {
 
 /// Collect the key expressions of all live tokens matching `key`.
 async fn live_tokens(session: &zenoh::Session, key: &str) -> Vec<String> {
-    let replies = session.liveliness().get(key).await.unwrap();
-    let mut keys = Vec::new();
-    while let Ok(Ok(reply)) =
-        tokio::time::timeout(Duration::from_secs(2), replies.recv_async()).await
-    {
-        if let Ok(sample) = reply.into_result() {
-            keys.push(sample.key_expr().as_str().to_string());
+    // Bound the WHOLE probe, declaration included. Declaring the query is
+    // itself an async round-trip through the session, and a congested session
+    // can leave it pending indefinitely — which used to hang this test until
+    // nextest killed the binary, rather than failing it. (The production
+    // resolver had the same gap; see `token_alive` in src/import/connection.rs.)
+    let collect = async {
+        let replies = session.liveliness().get(key).await.unwrap();
+        let mut keys = Vec::new();
+        while let Ok(Ok(reply)) =
+            tokio::time::timeout(Duration::from_secs(2), replies.recv_async()).await
+        {
+            if let Ok(sample) = reply.into_result() {
+                keys.push(sample.key_expr().as_str().to_string());
+            }
         }
+        keys
+    };
+    tokio::time::timeout(Duration::from_secs(30), collect)
+        .await
+        .unwrap_or_else(|_| panic!("liveliness probe for '{key}' never completed"))
+}
+
+/// Join a cancelled export task, bounded.
+///
+/// A bare `.await` here turns a shutdown that never returns into a hung test —
+/// nextest then SIGKILLs the binary at its slow-timeout, which orphans nothing
+/// now but still reports 180s of nothing instead of naming the problem. Bound
+/// it, and abort so the runtime can drop.
+async fn join_export(task: tokio::task::JoinHandle<()>) {
+    if tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .is_err()
+    {
+        panic!("export task did not finish within 30s of cancellation");
     }
-    keys
 }
 
 /// A plain backend declares the 2-segment default token `{service}/available`;
@@ -119,7 +144,7 @@ async fn test_plain_backend_declares_default_token() {
     );
 
     shutdown_token.cancel();
-    let _ = export_task.await;
+    join_export(export_task).await;
 
     // An @host export declares only the 3-segment token.
     let service = unique_service_name("defback_token_host");
@@ -154,7 +179,7 @@ async fn test_plain_backend_declares_default_token() {
     );
 
     shutdown_token.cancel();
-    let _ = export_task.await;
+    join_export(export_task).await;
 }
 
 /// The exact scenario from the field report: a plain `--backend web/…`, an
@@ -200,13 +225,7 @@ async fn test_host_backend_wins_over_default() {
 
     let host_spec = format!("{service}@host-a.test/{host_backend_addr}");
     let default_spec = format!("{service}/{default_backend_addr}");
-    let _export = BridgeProcess::new(&[
-        "--backend",
-        &host_spec,
-        "--backend",
-        &default_spec,
-    ])
-    .await;
+    let _export = BridgeProcess::new(&["--backend", &host_spec, "--backend", &default_spec]).await;
     sleep(Duration::from_millis(500)).await;
 
     let import_port = PortGuard::new();
@@ -296,20 +315,29 @@ async fn test_sni_passthrough_default_backend() {
     sleep(Duration::from_secs(2)).await;
 
     let hello = build_client_hello_with_sni("unclaimed.example.com");
-    let mut stream = TcpStream::connect(pair.import_addr).await.unwrap();
-    sleep(Duration::from_millis(300)).await;
-    stream.write_all(&hello).await.unwrap();
 
-    // The backend must receive the ClientHello bytes verbatim.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    // Retry the whole connect+write, not just the wait for the capture. The SNI
+    // door resolves the backend during the handshake and CLOSES when it cannot,
+    // so an attempt that beats the export side's default token delivers nothing
+    // at all — no amount of waiting afterwards would make those bytes appear.
+    let deadline = std::time::Instant::now() + common::BACKEND_READY_TIMEOUT;
     loop {
-        if *captured.lock().await == hello {
+        if let Ok(mut stream) = TcpStream::connect(pair.import_addr).await {
+            let _ = stream.write_all(&hello).await;
+            let _ = stream.flush().await;
+        }
+
+        // Match a verbatim occurrence rather than whole-buffer equality: a
+        // refused first attempt may have delivered a partial prefix, and a
+        // retry appends to the same capture buffer.
+        let seen = captured.lock().await.clone();
+        if seen.windows(hello.len()).any(|w| w == hello.as_slice()) {
             break;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "backend did not receive the ClientHello; captured {} bytes",
-            captured.lock().await.len()
+            "backend never received the ClientHello verbatim; captured {} bytes",
+            seen.len()
         );
         sleep(Duration::from_millis(200)).await;
     }

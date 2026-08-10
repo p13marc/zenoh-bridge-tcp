@@ -11,7 +11,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
 /// Helper to start export bridge
@@ -20,7 +19,7 @@ async fn start_export_bridge(
     service_name: &str,
 ) -> Result<tokio::process::Child> {
     let export_spec = format!("{}/{}", service_name, backend_addr);
-    let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let child = common::bridge_command()
         .args(["--backend", &export_spec])
         .kill_on_drop(true)
         .spawn()?;
@@ -35,7 +34,7 @@ async fn start_import_bridge(
     service_name: &str,
 ) -> Result<tokio::process::Child> {
     let import_spec = format!("{}/{},proto=raw", service_name, listen_addr);
-    let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let child = common::bridge_command()
         .args(["--listen", &import_spec])
         .kill_on_drop(true)
         .spawn()?;
