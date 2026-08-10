@@ -6,7 +6,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 /// Test that --auto-import can handle raw TCP connections (auto-detected as RawTcp).
@@ -42,7 +41,7 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
     let export_spec = format!("{}/{}", service, backend_addr);
     println!("4. Starting export bridge: --export '{}'", export_spec);
 
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut export_bridge = common::bridge_command()
         .args(["--backend", &export_spec])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -61,7 +60,7 @@ async fn test_auto_import_raw_tcp() -> Result<()> {
         import_spec
     );
 
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut import_bridge = common::bridge_command()
         .args(["--listen", &import_spec])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -159,7 +158,7 @@ async fn test_auto_import_http_detection() -> Result<()> {
         http_export_spec
     );
 
-    let mut export_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut export_bridge = common::bridge_command()
         .args(["--backend", &http_export_spec])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -178,7 +177,7 @@ async fn test_auto_import_http_detection() -> Result<()> {
         import_spec
     );
 
-    let mut import_bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut import_bridge = common::bridge_command()
         .args(["--listen", &import_spec])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -254,7 +253,7 @@ async fn test_auto_import_cli_starts() -> Result<()> {
         import_spec
     );
 
-    let mut bridge = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut bridge = common::bridge_command()
         .args(["--listen", &import_spec])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

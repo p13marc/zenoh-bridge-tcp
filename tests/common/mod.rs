@@ -95,6 +95,116 @@ where
     ))
 }
 
+/// Retry a client handshake or request until it succeeds, or the deadline passes.
+///
+/// Import doors in HTTP mode resolve the backend AT CONNECT TIME
+/// (`resolve_backend` in `src/import/connection.rs`), so the first client can
+/// arrive before the export side's `{service}/available` liveliness token has
+/// propagated and be refused — a 502 for HTTP and WebSocket upgrades, a bare
+/// close for TLS/SNI. `wait_for_port` does not cover this: it only proves the
+/// *listener* bound its socket.
+///
+/// Retrying is both the fix and what a real client does. Prefer this over a
+/// fixed sleep, which is what made the WS and routing tests flaky.
+pub async fn retry_client<T, E, F, Fut>(
+    mut attempt: F,
+    timeout: Duration,
+    description: &str,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let start = std::time::Instant::now();
+    let mut delay = Duration::from_millis(50);
+    let mut last_err = String::from("never attempted");
+
+    while start.elapsed() < timeout {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(e) => last_err = e.to_string(),
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
+    }
+
+    Err(anyhow::anyhow!(
+        "'{}' did not succeed within {:?}; last error: {}",
+        description,
+        timeout,
+        last_err
+    ))
+}
+
+/// GET a URL through an import bridge, retrying while the door refuses it.
+///
+/// A refusal is either a `502` (the HTTP door could not resolve a backend) or a
+/// transport error (the TLS/SNI door closes instead, since it cannot speak
+/// HTTP). Both mean the export side has not announced `{service}/available`
+/// yet — see [`retry_client`]. Any other status is handed back for the caller to
+/// assert on, so this hides only the startup race, never a real failure.
+pub async fn get_through_bridge(
+    client: &reqwest::Client,
+    url: &str,
+    host: Option<&str>,
+    timeout: Duration,
+) -> anyhow::Result<reqwest::Response> {
+    retry_client(
+        || async {
+            let mut req = client.get(url).header("Connection", "close");
+            if let Some(host) = host {
+                req = req.header("Host", host);
+            }
+            let response = req.send().await?;
+            if response.status() == reqwest::StatusCode::BAD_GATEWAY {
+                anyhow::bail!("502: no backend announced yet");
+            }
+            Ok::<_, anyhow::Error>(response)
+        },
+        timeout,
+        &format!("GET {url}"),
+    )
+    .await
+}
+
+/// Send `payload` through a raw import listener and return the echo.
+///
+/// Retries the WHOLE exchange — fresh connection, write, read — rather than
+/// just the read. On the raw path the client's connection is what triggers the
+/// chain (import declares liveliness -> export detects it -> export dials the
+/// backend), so bytes written before the export side has dialled through can be
+/// lost outright; re-reading the same socket would never recover them, but a new
+/// exchange will. This replaces the `sleep(2s)`-and-hope convention.
+pub async fn echo_roundtrip(
+    import_addr: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<Vec<u8>> {
+    retry_client(
+        || async {
+            let mut stream = TcpStream::connect(import_addr).await?;
+            stream.write_all(payload).await?;
+
+            let mut buf = vec![0u8; payload.len().max(1024)];
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no echo yet"))??;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "backend not wired up yet (clean EOF)",
+                ));
+            }
+            buf.truncate(n);
+            Ok(buf)
+        },
+        timeout,
+        &format!("echo round-trip through {import_addr}"),
+    )
+    .await
+}
+
 /// Start a simple TCP echo server. Returns the listen address and a task handle.
 pub async fn start_echo_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -128,6 +238,41 @@ pub fn unique_service_name(prefix: &str) -> String {
     format!("{}_{}", prefix, uuid::Uuid::new_v4().as_simple())
 }
 
+/// Build a bridge subprocess command that cannot outlive this test process.
+///
+/// Two layers, because one is not enough:
+/// - `kill_on_drop` reaps the child when its handle drops on a normal path,
+///   including a panic that unwinds past the test's own cleanup.
+/// - `PR_SET_PDEATHSIG` has the kernel SIGKILL the child if the test binary dies
+///   without running any Rust cleanup at all — exactly what happens when nextest
+///   terminates a test that blew its slow-timeout.
+///
+/// A leaked bridge is not harmless: it keeps publishing and scouting on the
+/// shared Zenoh domain, and then interferes with every later run on the machine.
+/// Always spawn bridges through this, never `Command::new` directly.
+pub fn bridge_command() -> tokio::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"));
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // SAFETY: runs between fork and exec, so only async-signal-safe
+            // calls are permitted. `prctl` is one; it touches no allocator or
+            // lock inherited from the parent.
+            #[cfg(target_os = "linux")]
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 /// A bridge subprocess with automatic cleanup via `kill_on_drop`.
 pub struct BridgeProcess {
     child: tokio::process::Child,
@@ -136,9 +281,8 @@ pub struct BridgeProcess {
 impl BridgeProcess {
     pub async fn new(args: &[&str]) -> Self {
         use std::process::Stdio;
-        let child = tokio::process::Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+        let child = bridge_command()
             .args(args)
-            .kill_on_drop(true)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -164,8 +308,17 @@ impl Drop for BridgeProcess {
     }
 }
 
+/// How long a client may keep retrying while the export side comes up. Generous:
+/// two subprocesses have to boot and discover each other via Zenoh scouting,
+/// which is slow on a loaded CI runner. It is a ceiling, not a delay — the first
+/// successful attempt returns immediately.
+pub const BACKEND_READY_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// A pair of export + import bridge subprocesses.
-/// Encapsulates the common boilerplate of starting both sides and waiting for readiness.
+///
+/// Encapsulates the common boilerplate of starting both sides and waiting for
+/// the import listener to bind. Note that a bound listener is NOT full
+/// readiness for the HTTP-mode doors: see [`retry_client`].
 pub struct BridgePair {
     pub export: BridgeProcess,
     pub import: BridgeProcess,
@@ -175,12 +328,15 @@ pub struct BridgePair {
 impl BridgePair {
     /// Start a TCP export+import bridge pair.
     /// Waits for the import bridge to accept connections before returning.
+    ///
+    /// No availability gate here, deliberately: `proto=raw` runs the import door
+    /// with `http_mode` off, and only the HTTP-mode doors consult
+    /// `resolve_backend`. A raw connection is never refused for a missing token,
+    /// so the export side only needs a moment to reach the Zenoh network.
     pub async fn tcp(service: &str, backend_addr: SocketAddr) -> Self {
         let export_spec = format!("{}/{}", service, backend_addr);
         let export = BridgeProcess::new(&["--backend", &export_spec]).await;
 
-        // Export bridge doesn't listen on TCP, so we must give it time
-        // to connect to the Zenoh network before starting the import side.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let import_port = PortGuard::new();

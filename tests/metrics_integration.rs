@@ -8,7 +8,6 @@ mod common;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::Command;
 
 /// Extract the value of the first Prometheus line starting with `prefix`.
 fn metric_value(body: &str, prefix: &str) -> Option<u64> {
@@ -26,7 +25,7 @@ async fn metrics_endpoints_respond() {
 
     // A dummy export gives the process a bridge task to keep it alive; the
     // backend need not exist (it is only dialed when a client appears).
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut child = common::bridge_command()
         .args([
             "--backend",
             "metricsvc/127.0.0.1:1",

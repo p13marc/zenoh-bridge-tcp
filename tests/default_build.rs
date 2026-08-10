@@ -5,8 +5,9 @@
 
 #![cfg(not(feature = "tls-termination"))]
 
+mod common;
+
 use std::process::Stdio;
-use tokio::process::Command;
 
 /// The `--https-terminate` / `--tls-cert` / `--tls-key` CLI fields are
 /// `#[cfg(feature = "tls-termination")]`-gated, so a default build must not
@@ -17,7 +18,7 @@ async fn default_build_rejects_terminating_listen_by_feature_name() {
     // cert=/key= parse in every build (the grammar is feature-independent);
     // a default build must reject them at validation, naming the feature the
     // user has to enable rather than a cryptic unknown-argument error.
-    let out = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let out = common::bridge_command()
         .args(["--listen", "svc/0.0.0.0:8443,cert=/c.pem,key=/k.pem"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -27,10 +27,11 @@ struct Response {
 /// Generate self-signed certificate for testing
 fn generate_test_cert(domain: &str) -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>) {
     let subject_alt_names = vec![domain.to_string(), "localhost".to_string()];
-    let CertifiedKey { cert, key_pair } = generate_simple_self_signed(subject_alt_names).unwrap();
+    let CertifiedKey { cert, signing_key } =
+        generate_simple_self_signed(subject_alt_names).unwrap();
 
     let cert_der = cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+    let key_der = PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
     (vec![cert_der], key_der)
 }
@@ -56,7 +57,7 @@ fn create_https_server(backend_id: &str) -> Router {
             }),
         )
         .route(
-            "/api/:action",
+            "/api/{action}",
             get({
                 let backend_id = backend_id.clone();
                 move |AxumPath(action): AxumPath<String>| async move {
@@ -114,6 +115,10 @@ async fn test_https_routing_multiple_backends() {
     println!("\nTEST: HTTPS Routing with SNI and Multiple Backends");
     println!("====================================================");
 
+    // nextest runs test binaries in parallel on a shared Zenoh scouting domain,
+    // so a literal service name lets concurrent tests contend for one keyspace.
+    let service = common::unique_service_name("httpsrt");
+
     // Create Zenoh sessions
     let config1 = Config::default();
     let config2 = Config::default();
@@ -135,7 +140,7 @@ async fn test_https_routing_multiple_backends() {
     println!("HTTPS backends started");
 
     // Start HTTP export bridges (one per DNS)
-    let api_export_spec = format!("https-service/api.secure.test/{}", api_backend_addr);
+    let api_export_spec = format!("{service}/api.secure.test/{}", api_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -150,7 +155,7 @@ async fn test_https_routing_multiple_backends() {
         .unwrap();
     });
 
-    let web_export_spec = format!("https-service/web.secure.test/{}", web_backend_addr);
+    let web_export_spec = format!("{service}/web.secure.test/{}", web_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -171,7 +176,7 @@ async fn test_https_routing_multiple_backends() {
     // Start HTTP import bridge (single listener for all DNS via SNI)
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("https-service/{}", import_addr);
+    let import_spec = format!("{service}/{}", import_addr);
     let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
@@ -187,11 +192,7 @@ async fn test_https_routing_multiple_backends() {
         .unwrap();
     });
 
-    sleep(Duration::from_millis(500)).await;
     println!("HTTPS import bridge started on {}", import_addr);
-
-    // Give everything time to settle
-    sleep(Duration::from_secs(1)).await;
 
     // Create an HTTPS client that accepts any certificate and uses custom DNS resolution
     // Map the hostname to the import bridge IP so SNI is sent correctly
@@ -202,13 +203,19 @@ async fn test_https_routing_multiple_backends() {
         .build()
         .unwrap();
 
-    // Test 1: Request to api.secure.test should reach api-backend
+    // Test 1: Request to api.secure.test should reach api-backend.
+    // The SNI door resolves the backend during the handshake and CLOSES when it
+    // cannot, so a client that beats the export side's token sees a transport
+    // error. Retry past that window rather than sleeping and hoping.
     println!("\nTest 1: HTTPS Request to api.secure.test");
-    let response = client
-        .get("https://api.secure.test/")
-        .send()
-        .await
-        .expect("Failed to send request to api.secure.test");
+    let response = common::get_through_bridge(
+        &client,
+        "https://api.secure.test/",
+        None,
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("Failed to send request to api.secure.test");
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
@@ -225,11 +232,14 @@ async fn test_https_routing_multiple_backends() {
         .resolve("web.secure.test", import_addr)
         .build()
         .unwrap();
-    let response = client2
-        .get("https://web.secure.test/")
-        .send()
-        .await
-        .expect("Failed to send request to web.secure.test");
+    let response = common::get_through_bridge(
+        &client2,
+        "https://web.secure.test/",
+        None,
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("Failed to send request to web.secure.test");
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
@@ -332,6 +342,8 @@ async fn test_https_routing_concurrent_clients() {
     println!("\nTEST: Concurrent HTTPS Clients with SNI");
     println!("==========================================");
 
+    let service = common::unique_service_name("httpsconc");
+
     // Setup
     let config1 = Config::default();
     let config2 = Config::default();
@@ -344,7 +356,7 @@ async fn test_https_routing_concurrent_clients() {
     start_https_backend(backend_addr, "concurrent.secure.test", "concurrent-backend").await;
 
     // Start export
-    let export_spec = format!("https-service/concurrent.secure.test/{}", backend_addr);
+    let export_spec = format!("{service}/concurrent.secure.test/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -359,12 +371,10 @@ async fn test_https_routing_concurrent_clients() {
         .unwrap();
     });
 
-    sleep(Duration::from_millis(500)).await;
-
     // Start import
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("https-service/{}", import_addr);
+    let import_spec = format!("{service}/{}", import_addr);
     let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
@@ -380,7 +390,6 @@ async fn test_https_routing_concurrent_clients() {
         .unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
     println!("Setup complete");
 
     // Spawn 10 concurrent HTTPS clients
@@ -394,11 +403,16 @@ async fn test_https_routing_concurrent_clients() {
                 .resolve("concurrent.secure.test", import_addr)
                 .build()
                 .unwrap();
-            let response = client
-                .get(format!("https://concurrent.secure.test/api/request{}", i))
-                .send()
-                .await
-                .unwrap();
+            // Each client retries past the startup window, so the fan-out
+            // itself doubles as the readiness wait.
+            let response = common::get_through_bridge(
+                &client,
+                &format!("https://concurrent.secure.test/api/request{}", i),
+                None,
+                common::BACKEND_READY_TIMEOUT,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
             let body: Response = response.json().await.unwrap();
@@ -441,6 +455,8 @@ async fn test_https_backend_becomes_available() {
     println!("\nTEST: HTTPS Backend Becomes Available After Import");
     println!("=====================================================");
 
+    let service = common::unique_service_name("httpsdelay");
+
     let config1 = Config::default();
     let config2 = Config::default();
     let session1 = Arc::new(zenoh::open(config1).await.unwrap());
@@ -449,7 +465,7 @@ async fn test_https_backend_becomes_available() {
     // Start import FIRST (backend doesn't exist yet)
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("https-service/{}", import_addr);
+    let import_spec = format!("{service}/{}", import_addr);
     let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
@@ -465,7 +481,9 @@ async fn test_https_backend_becomes_available() {
         .unwrap();
     });
 
-    sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start listening in time");
     println!("Import bridge started (no backend yet)");
 
     // Try to connect - should fail (connection refused or timeout)
@@ -489,7 +507,7 @@ async fn test_https_backend_becomes_available() {
     let backend_addr = backend_port.release();
     start_https_backend(backend_addr, "delayed.secure.test", "delayed-backend").await;
 
-    let export_spec = format!("https-service/delayed.secure.test/{}", backend_addr);
+    let export_spec = format!("{service}/delayed.secure.test/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -504,7 +522,6 @@ async fn test_https_backend_becomes_available() {
         .unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
     println!("Backend and export started");
 
     // Now request should succeed
@@ -515,11 +532,16 @@ async fn test_https_backend_becomes_available() {
         .resolve("delayed.secure.test", import_addr)
         .build()
         .unwrap();
-    let response = client2
-        .get("https://delayed.secure.test/")
-        .send()
-        .await
-        .unwrap();
+    // Retrying is exactly the behaviour under test: the refusal must give way
+    // once the backend announces itself.
+    let response = common::get_through_bridge(
+        &client2,
+        "https://delayed.secure.test/",
+        None,
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
@@ -533,4 +555,76 @@ async fn test_https_backend_becomes_available() {
     import_task.abort();
     drop(session1);
     drop(session2);
+}
+
+/// The SNI door must REFUSE a connection whose host has no backend — and refuse
+/// it by closing, not by hanging.
+///
+/// This door cannot phrase an HTTP error (the client is mid-TLS-handshake), so
+/// unlike the plain-HTTP door it has no 502 to send and simply drops the
+/// connection. That distinction had no test, yet it is the code path behind the
+/// `test_tls_passthrough` flake: a client that beat the export side saw its
+/// write fail rather than a status code. Bounding it matters as much as the
+/// refusal itself — `resolve_backend` is awaited before any routing happens, so
+/// an unbounded probe would pin the connection instead of releasing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sni_connection_refused_before_backend_exists() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let shutdown_token = CancellationToken::new();
+    let config = Arc::new(BridgeConfig::default());
+    let service = common::unique_service_name("snirefuse");
+
+    let session = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    // An import listener with no export side anywhere.
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.addr();
+    let import_spec = format!("{service}/{import_addr}");
+    let import_addr = import_port.release();
+    let session_clone = session.clone();
+    let shutdown_clone = shutdown_token.child_token();
+    let bridge_config = config.clone();
+    let import_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_import_mode(
+            session_clone,
+            &import_spec,
+            bridge_config,
+            shutdown_clone,
+        )
+        .await
+        .unwrap();
+    });
+
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("import listener never bound");
+
+    // A real HTTPS client, so a genuine ClientHello with SNI reaches the door.
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .pool_max_idle_per_host(0)
+        .resolve("nobody.secure.test", import_addr)
+        .build()
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    let result = client.get("https://nobody.secure.test/").send().await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        result.is_err(),
+        "an SNI host with no backend must be refused, got {:?}",
+        result.map(|r| r.status())
+    );
+    // The refusal must be prompt. Ample headroom over the 1s default
+    // availability budget — this only has to catch a connection left hanging.
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "refusal took {elapsed:?}; the SNI door is hanging rather than closing"
+    );
+
+    shutdown_token.cancel();
+    import_task.abort();
 }

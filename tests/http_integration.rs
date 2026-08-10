@@ -43,7 +43,7 @@ fn create_http_app() -> Router {
         .route("/", get(|| async { "Hello from Axum!" }))
         .route("/health", get(|| async { "OK" }))
         .route(
-            "/echo/:message",
+            "/echo/{message}",
             get(|Path(message): Path<String>| async move {
                 Json(EchoResponse {
                     echo: message,
@@ -124,6 +124,10 @@ async fn spawn_tcp_bridge_pair(backend_addr: SocketAddr) -> (CancellationToken, 
         .await
         .expect("Import bridge did not start in time");
 
+    // NOTE: a bound listener is not full readiness. The auto-detect door
+    // resolves the backend at connect time (HTTP by Host, TLS by SNI), so a
+    // client that beats the export side's availability token gets a 502 or a
+    // close. Callers must drive their first client through `common::retry_client`.
     (shutdown_token, import_addr)
 }
 
@@ -141,12 +145,15 @@ async fn test_http_through_bridge() {
         .build()
         .unwrap();
 
-    let resp = client
-        .get(format!("http://{}/", import_addr))
-        .header("Connection", "close")
-        .send()
-        .await
-        .expect("HTTP request through bridge failed");
+    // First request through a fresh pair: retry past the startup 502 window.
+    let resp = common::get_through_bridge(
+        &client,
+        &format!("http://{}/", import_addr),
+        None,
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("HTTP request through bridge failed");
 
     assert_eq!(resp.status(), 200);
     let body = resp.text().await.unwrap();
@@ -174,10 +181,10 @@ async fn test_tls_passthrough() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(subject_alt_names).unwrap();
     let cert_der = cert.der().clone();
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(key_pair.serialize_der()).unwrap();
+    let key_der = rustls::pki_types::PrivateKeyDer::try_from(signing_key.serialize_der()).unwrap();
 
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -207,7 +214,11 @@ async fn test_tls_passthrough() {
 
     // Connect to the bridge and send a TLS ClientHello — the bridge should forward
     // these opaque bytes to the HTTPS backend without understanding them.
-    let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
+    //
+    // The SNI door resolves the backend during the handshake and simply CLOSES
+    // when it cannot (it has no way to phrase an HTTP error inside TLS), so a
+    // probe that beats the export side's availability token fails its write with
+    // a broken pipe. Retry the whole connect+write until the bridge accepts it.
     let client_hello = vec![
         0x16, 0x03, 0x01, // TLS Handshake, version 3.1
         0x00, 0x05, // Length
@@ -215,7 +226,17 @@ async fn test_tls_passthrough() {
         0x00, 0x00, 0x01, 0x00, // Handshake length
     ];
 
-    stream.write_all(&client_hello).await.unwrap();
+    let mut stream = common::retry_client(
+        || async {
+            let mut stream = tokio::net::TcpStream::connect(import_addr).await?;
+            stream.write_all(&client_hello).await?;
+            Ok::<_, std::io::Error>(stream)
+        },
+        common::BACKEND_READY_TIMEOUT,
+        "TLS ClientHello through the import bridge",
+    )
+    .await
+    .expect("bridge never accepted the ClientHello");
 
     // The backend may respond with a TLS alert or partial ServerHello.
     // We just verify the bridge accepted and forwarded the bytes.
@@ -249,12 +270,16 @@ async fn test_multiple_http_requests() {
         .unwrap();
 
     for i in 0..5 {
-        let resp = client
-            .get(format!("http://{}/echo/request-{}", import_addr, i))
-            .header("Connection", "close")
-            .send()
-            .await
-            .unwrap_or_else(|e| panic!("Request {} failed: {}", i, e));
+        // Only the first can race the export side, but retrying every request is
+        // harmless — a non-502 response returns on the first attempt.
+        let resp = common::get_through_bridge(
+            &client,
+            &format!("http://{}/echo/request-{}", import_addr, i),
+            None,
+            common::BACKEND_READY_TIMEOUT,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("Request {} failed: {}", i, e));
 
         assert_eq!(resp.status(), 200);
         let data: EchoResponse = resp.json().await.unwrap();

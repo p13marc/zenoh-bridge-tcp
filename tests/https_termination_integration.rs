@@ -14,13 +14,12 @@ use std::net::SocketAddr;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
 
 /// Cert implies termination — but a lone cert= without key= is a config
 /// mistake, rejected at spec validation with the missing half named.
 #[tokio::test]
 async fn test_terminate_cert_without_key_fails() {
-    let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let child = common::bridge_command()
         .args(["--listen", "svc/0.0.0.0:8443,cert=/tmp/only-cert.pem"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -48,7 +47,7 @@ async fn test_terminate_cert_without_key_fails() {
 /// key= without cert= is rejected symmetrically.
 #[tokio::test]
 async fn test_terminate_key_without_cert_fails() {
-    let child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let child = common::bridge_command()
         .args(["--listen", "svc/0.0.0.0:8443,key=/tmp/only-key.pem"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -83,7 +82,7 @@ async fn test_https_terminate_starts_with_valid_tls() {
     let cert_path = dir.join("test_integ_cert.pem");
     let key_path = dir.join("test_integ_key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     // Use port 0 style - find a free port first
     let port_guard = common::PortGuard::new();
@@ -91,7 +90,7 @@ async fn test_https_terminate_starts_with_valid_tls() {
 
     let spec = format!("tls-test/{}", addr);
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut child = common::bridge_command()
         .args([
             "--listen",
             &format!(
@@ -187,13 +186,13 @@ async fn test_https_terminate_alpn_negotiation() {
     let cert_path = dir.join("test_alpn_integ_cert.pem");
     let key_path = dir.join("test_alpn_integ_key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let port_guard = common::PortGuard::new();
     let addr = port_guard.release();
     let spec = format!("alpn-test/{}", addr);
 
-    let mut child = Command::new(assert_cmd::cargo::cargo_bin!("zenoh-bridge-tcp"))
+    let mut child = common::bridge_command()
         .args([
             "--listen",
             &format!(
@@ -302,7 +301,7 @@ async fn test_https_terminate_h2_end_to_end() {
     let cert_path = dir.join("test_h2e2e_cert.pem");
     let key_path = dir.join("test_h2e2e_key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
@@ -410,7 +409,7 @@ async fn test_https_terminate_wss_end_to_end() {
     let cert_path = dir.join("test_wsse2e_cert.pem");
     let key_path = dir.join("test_wsse2e_key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
@@ -542,7 +541,7 @@ async fn test_https_terminate_grpc_status_surfaced() {
     let cert_path = dir.join("test_grpcstatus_cert.pem");
     let key_path = dir.join("test_grpcstatus_key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
@@ -655,7 +654,7 @@ async fn test_https_terminate_h1_end_to_end() {
     let cert_path = dir.join("test_h1e2e_cert.pem");
     let key_path = dir.join("test_h1e2e_key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).unwrap();
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();

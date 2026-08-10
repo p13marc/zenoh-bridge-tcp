@@ -79,9 +79,10 @@ async fn raw_round_trip_is_byte_exact() {
 async fn large_transfer_is_byte_exact() {
     let (backend, _backend) = start_echo_server().await;
     let service = unique_service_name("regnet_large");
+
     let mut pair = BridgePair::tcp(&service, backend).await;
 
-    // Warm up so the path is wired before the bulk transfer.
+    // Warm up so the relay is live at all. This panics if it never succeeds.
     let _ = round_trip_with_retry(pair.import_addr, b"warmup", Duration::from_secs(20)).await;
 
     // 1 MiB — well past the default 64 KiB buffer, so it exercises chunking.
@@ -92,6 +93,26 @@ async fn large_transfer_is_byte_exact() {
 
     let stream = TcpStream::connect(pair.import_addr).await.unwrap();
     let (mut rd, mut wr) = stream.into_split();
+
+    // Handshake on THIS connection before the bulk write, and wait for the echo.
+    //
+    // Every connection gets its own `{service}/tx/{client_id}` key, so the
+    // warm-up above does not help this one: the export side only subscribes
+    // after it observes this client's liveliness token, a few ms after the
+    // import bridge starts publishing. Bytes published into that window are
+    // recoverable only from the publisher cache, which holds `cache_size`
+    // (default 256) SAMPLES — a 1 MiB blast is far more samples than that, so
+    // the export used to receive just the cached tail (~435 KB of the 1 MiB),
+    // relay it, and report `outcome="completed"`, leaving the client's
+    // `read_exact` at an early EOF. A round trip proves the export is attached
+    // and draining before the bulk starts.
+    wr.write_all(b"ready?").await.unwrap();
+    let mut ack = [0u8; 6];
+    tokio::time::timeout(Duration::from_secs(20), rd.read_exact(&mut ack))
+        .await
+        .expect("export side never attached to this connection")
+        .expect("handshake read");
+    assert_eq!(&ack, b"ready?");
 
     let w_payload = payload.clone();
     let writer = tokio::spawn(async move {
@@ -140,9 +161,15 @@ async fn backend_close_propagates_to_client_as_eof() {
     let mut pair = BridgePair::tcp(&service, backend).await;
 
     // Establish the connection and get the one echo (retry for liveliness).
+    //
+    // Every attempt is a fresh client_id, so every attempt races the export
+    // side's subscribe on this connection's `tx` key — a first write that lands
+    // in that window is only recoverable from the publisher cache. Keep the
+    // per-attempt read short so the budget buys many attempts rather than a
+    // handful of long ones; a single slow attempt used to eat a quarter of it.
     let start = std::time::Instant::now();
     let mut stream = loop {
-        if start.elapsed() > Duration::from_secs(20) {
+        if start.elapsed() > Duration::from_secs(30) {
             panic!("bridge/backend never became ready");
         }
         let mut s = match TcpStream::connect(pair.import_addr).await {
@@ -157,7 +184,7 @@ async fn backend_close_propagates_to_client_as_eof() {
             continue;
         }
         let mut echo = [0u8; 4];
-        match tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut echo)).await {
+        match tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut echo)).await {
             Ok(Ok(_)) => break s,
             _ => {
                 tokio::time::sleep(Duration::from_millis(200)).await;

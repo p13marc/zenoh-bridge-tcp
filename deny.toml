@@ -4,8 +4,9 @@
 # Deny configuration for security advisories
 [advisories]
 version = 2
-# The path where the advisory database is cloned/fetched into
-db-path = "~/.cargo/advisory-db"
+# db-path is deliberately left at its default (~/.cargo/advisory-db). Spelling it
+# out here used to leave a literal `./~/.cargo/advisory-db` tree in the repo root,
+# because older cargo-deny did not expand the tilde.
 # The url(s) of the advisory database to use
 db-urls = ["https://github.com/rustsec/advisory-db"]
 # Warn for yanked crates
@@ -20,6 +21,14 @@ ignore = [
     "RUSTSEC-2025-0134",
     # bincode unmaintained - transitive dependency from zenoh
     "RUSTSEC-2025-0141",
+    # lz4_flex block-decompression can leak uninitialised memory (or the previous
+    # contents of a reused output buffer) when fed invalid data. zenoh-transport
+    # 1.9.0 pins `lz4_flex = "0.10.0"`, so the 0.11.6/0.12.1 fix is unreachable
+    # until zenoh relaxes that requirement — and 1.9.0 is the newest zenoh release
+    # as of 2026-08-10. This is a suppression, not a fix: zenoh decompresses
+    # network-controlled batches, so the path is reachable.
+    # REVISIT on every zenoh bump: drop this the moment the lock resolves >= 0.11.6.
+    "RUSTSEC-2026-0041",
 ]
 
 # Deny configuration for licenses

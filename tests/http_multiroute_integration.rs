@@ -3,6 +3,8 @@
 //! Tests per-request Host-header routing where a single persistent TCP
 //! connection can reach different backends based on Host header per request.
 
+mod common;
+
 use axum::{Router, response::Json, routing::get};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -358,7 +360,10 @@ async fn test_multiroute_unavailable_host_returns_502() {
     let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
     let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
 
-    let service = "mr-502";
+    // Unique per run: nextest runs test binaries in parallel on a shared Zenoh
+    // scouting domain, so a literal name lets concurrent tests share a keyspace.
+    let service = common::unique_service_name("mr502");
+    let service = service.as_str();
 
     // Export only host-a
     let s1 = session1.clone();

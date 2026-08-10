@@ -43,7 +43,7 @@ fn create_http_server(backend_id: &str) -> Router {
             }),
         )
         .route(
-            "/api/:action",
+            "/api/{action}",
             get({
                 let backend_id = backend_id.clone();
                 move |AxumPath(action): AxumPath<String>| async move {
@@ -83,6 +83,10 @@ async fn test_http_routing_multiple_backends() {
     let shutdown_token = CancellationToken::new();
     let config = Arc::new(BridgeConfig::default());
 
+    // nextest runs test binaries in parallel on a shared Zenoh scouting domain,
+    // so a literal service name lets concurrent tests contend for one keyspace.
+    let service = common::unique_service_name("httprt");
+
     println!("\nTEST: HTTP Routing with Multiple Backends");
     println!("===========================================");
 
@@ -102,7 +106,7 @@ async fn test_http_routing_multiple_backends() {
     println!("HTTP backends started");
 
     // Start HTTP export bridges (one per DNS)
-    let api_export_spec = format!("http-service/api.example.com/{}", api_backend_addr);
+    let api_export_spec = format!("{service}/api.example.com/{}", api_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -117,7 +121,7 @@ async fn test_http_routing_multiple_backends() {
         .unwrap();
     });
 
-    let web_export_spec = format!("http-service/web.example.com/{}", web_backend_addr);
+    let web_export_spec = format!("{service}/web.example.com/{}", web_backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -132,13 +136,12 @@ async fn test_http_routing_multiple_backends() {
         .unwrap();
     });
 
-    sleep(Duration::from_millis(500)).await;
     println!("HTTP export bridges started");
 
     // Start HTTP import bridge (single listener for all DNS, dynamic port)
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("http-service/{}", import_addr);
+    let import_spec = format!("{service}/{}", import_addr);
     let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
@@ -154,25 +157,25 @@ async fn test_http_routing_multiple_backends() {
         .unwrap();
     });
 
-    sleep(Duration::from_millis(500)).await;
     println!("HTTP import bridge started on {}", import_addr);
 
-    // Give everything time to settle
-    sleep(Duration::from_secs(1)).await;
-
-    // Test 1: Request to api.example.com should reach api-backend
+    // Test 1: Request to api.example.com should reach api-backend.
+    // The Host-routed door resolves the backend when the request head arrives,
+    // so a request that beats the export side's token is answered with a 502.
+    // Retry past that window instead of sleeping and hoping.
     println!("\nTest 1: Request to api.example.com");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
         .build()
         .unwrap();
-    let response = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "api.example.com")
-        .header("Connection", "close")
-        .send()
-        .await
-        .expect("Failed to send request to api.example.com");
+    let response = common::get_through_bridge(
+        &client,
+        &format!("http://{}/", import_addr),
+        Some("api.example.com"),
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("Failed to send request to api.example.com");
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
@@ -187,13 +190,14 @@ async fn test_http_routing_multiple_backends() {
         .pool_max_idle_per_host(0)
         .build()
         .unwrap();
-    let response = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "web.example.com")
-        .header("Connection", "close")
-        .send()
-        .await
-        .expect("Failed to send request to web.example.com");
+    let response = common::get_through_bridge(
+        &client,
+        &format!("http://{}/", import_addr),
+        Some("web.example.com"),
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("Failed to send request to web.example.com");
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
@@ -337,6 +341,8 @@ async fn test_http_routing_concurrent_clients() {
     let shutdown_token = CancellationToken::new();
     let config = Arc::new(BridgeConfig::default());
 
+    let service = common::unique_service_name("httpconc");
+
     println!("\nTEST: Concurrent HTTP Clients");
     println!("================================");
 
@@ -350,7 +356,7 @@ async fn test_http_routing_concurrent_clients() {
     let backend_addr = start_http_backend("concurrent-backend").await;
 
     // Start export
-    let export_spec = format!("http-service/concurrent.example.com/{}", backend_addr);
+    let export_spec = format!("{service}/concurrent.example.com/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -370,7 +376,7 @@ async fn test_http_routing_concurrent_clients() {
     // Start import (dynamic port)
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("http-service/{}", import_addr);
+    let import_spec = format!("{service}/{}", import_addr);
     let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
@@ -386,21 +392,23 @@ async fn test_http_routing_concurrent_clients() {
         .unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
     println!("Setup complete");
 
-    // Spawn 10 concurrent clients
+    // Spawn 10 concurrent clients. Each retries past the startup 502 window,
+    // so the fan-out itself doubles as the readiness wait.
     println!("\nSending 10 concurrent requests...");
     let mut tasks = vec![];
     for i in 0..10 {
         let client = reqwest::Client::new();
         let task = tokio::spawn(async move {
-            let response = client
-                .get(format!("http://{}/api/request{}", import_addr, i))
-                .header("Host", "concurrent.example.com")
-                .send()
-                .await
-                .unwrap();
+            let response = common::get_through_bridge(
+                &client,
+                &format!("http://{}/api/request{}", import_addr, i),
+                Some("concurrent.example.com"),
+                common::BACKEND_READY_TIMEOUT,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
             let body: Response = response.json().await.unwrap();
@@ -440,6 +448,8 @@ async fn test_http_routing_backend_becomes_available() {
     let shutdown_token = CancellationToken::new();
     let config = Arc::new(BridgeConfig::default());
 
+    let service = common::unique_service_name("httpdelay");
+
     println!("\nTEST: Backend Becomes Available After Import");
     println!("===============================================");
 
@@ -451,7 +461,7 @@ async fn test_http_routing_backend_becomes_available() {
     // Start import FIRST (backend doesn't exist yet, dynamic port)
     let import_port = common::PortGuard::new();
     let import_addr = import_port.addr();
-    let import_spec = format!("http-service/{}", import_addr);
+    let import_spec = format!("{service}/{}", import_addr);
     let import_addr = import_port.release();
     let session2_clone = session2.clone();
     let shutdown_token_clone = shutdown_token.child_token();
@@ -467,7 +477,9 @@ async fn test_http_routing_backend_becomes_available() {
         .unwrap();
     });
 
-    sleep(Duration::from_millis(500)).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("Import bridge did not start listening in time");
     println!("Import bridge started (no backend yet)");
 
     // Try to connect - should get 502
@@ -486,7 +498,7 @@ async fn test_http_routing_backend_becomes_available() {
     // NOW start the backend and export (dynamic port)
     let backend_addr = start_http_backend("delayed-backend").await;
 
-    let export_spec = format!("http-service/delayed.example.com/{}", backend_addr);
+    let export_spec = format!("{service}/delayed.example.com/{}", backend_addr);
     let session1_clone = session1.clone();
     let shutdown_token_clone = shutdown_token.child_token();
     let bridge_config = config.clone();
@@ -501,17 +513,19 @@ async fn test_http_routing_backend_becomes_available() {
         .unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
     println!("Backend and export started");
 
-    // Now request should succeed
+    // Now the request should succeed — retrying is exactly the behaviour under
+    // test here: the 502 must give way once the backend announces itself.
     println!("\nTest 2: Request after backend starts");
-    let response = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "delayed.example.com")
-        .send()
-        .await
-        .unwrap();
+    let response = common::get_through_bridge(
+        &client,
+        &format!("http://{}/", import_addr),
+        Some("delayed.example.com"),
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body: Response = response.json().await.unwrap();
