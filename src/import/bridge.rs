@@ -51,83 +51,116 @@ where
     R: crate::transport::TransportReader,
     W: crate::transport::TransportWriter,
 {
-    // IMPORTANT: Subscribe to error channel FIRST, before declaring liveliness
-    // This prevents race condition where export bridge publishes error before we're subscribed
-    let error_key = scoped_key(service_name, dns, &format!("error/{client_id}"));
-    // Advanced with history (A1/R1): the export publishes this signal within
-    // microseconds of learning we exist — before our subscriber interest may
-    // have reached its session. The export caches the signal on an Advanced
-    // publisher; querying history here recovers a put we raced.
-    let error_subscriber = session
-        .declare_subscriber(&error_key)
-        .history(HistoryConfig::default().detect_late_publishers())
+    // R3: bound the WHOLE Zenoh setup phase. Each declare is an async
+    // round-trip through the session; under congestion (or a peer link dying)
+    // any of them can stall indefinitely — a connection task then hangs here
+    // holding a max_connections permit, which is exactly the class of 180s
+    // test terminations observed before this bound. A setup that cannot
+    // complete inside read_timeout fails the connection instead.
+    let setup = async {
+        // IMPORTANT: Subscribe to error channel FIRST, before declaring liveliness
+        // This prevents race condition where export bridge publishes error before we're subscribed
+        let error_key = scoped_key(service_name, dns, &format!("error/{client_id}"));
+        // Advanced with history (A1/R1): the export publishes this signal within
+        // microseconds of learning we exist — before our subscriber interest may
+        // have reached its session. The export caches the signal on an Advanced
+        // publisher; querying history here recovers a put we raced.
+        let error_subscriber = session
+            .declare_subscriber(&error_key)
+            .history(HistoryConfig::default().detect_late_publishers())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe to error channel: {}", e))?;
+
+        debug!(key = %error_key, "Subscribed to error channel");
+
+        // Single abort token for the whole connection. A clean directional EOF ends
+        // only its own direction (a half-close); a hard error, external teardown, an
+        // unrecoverable sample miss, or reception backpressure (D2) trips this token
+        // to reset both directions.
+        let conn_cancel = CancellationToken::new();
+
+        // D2: drain the client's RX subscriber through a bounded, non-blocking channel
+        // so a slow client TCP writer cannot fill the default FIFO handler and block
+        // the shared session's reception thread (head-of-line-blocking every client).
+        let (rx_callback, rx_channel_rx) = crate::backpressure::rx_channel(
+            config.rx_channel_capacity,
+            config.reliability,
+            conn_cancel.clone(),
+            client_id.to_string(),
+        );
+
+        // Subscribe to responses from the service for this specific client using AdvancedSubscriber
+        // This allows late publisher detection and recovery of missed samples
+        let sub_key = scoped_key(service_name, dns, &format!("rx/{client_id}"));
+        let subscriber = session
+            .declare_subscriber(&sub_key)
+            .callback(rx_callback)
+            .history(HistoryConfig::default().detect_late_publishers())
+            .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
+            .subscriber_detection()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
+
+        debug!(key = %sub_key, "Subscribed with late publisher detection");
+
+        // Declare AdvancedPublisher with cache and publisher detection
+        // This allows the export bridge to detect when we're ready and recover any missed samples
+        let pub_key_str = scoped_key(service_name, dns, &format!("tx/{client_id}"));
+        let pub_key: KeyExpr<'static> = pub_key_str
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+        let publisher_builder = session
+            .declare_publisher(pub_key.clone())
+            .cache(CacheConfig::default().max_samples(config.cache_size))
+            .sample_miss_detection(
+                MissDetectionConfig::default().heartbeat(config.heartbeat_interval),
+            )
+            .publisher_detection();
+        // Stream reliability: block on a full TX queue instead of Zenoh's default
+        // `Drop`, which would silently drop payload bytes and corrupt the stream.
+        let publisher = match config.reliability {
+            ReliabilityMode::Stream => {
+                publisher_builder.congestion_control(CongestionControl::Block)
+            }
+            ReliabilityMode::Telemetry => publisher_builder,
+        }
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe to error channel: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
-    debug!(key = %error_key, "Subscribed to error channel");
+        debug!(key = %pub_key_str, "Declared AdvancedPublisher with cache");
 
-    // Single abort token for the whole connection. A clean directional EOF ends
-    // only its own direction (a half-close); a hard error, external teardown, an
-    // unrecoverable sample miss, or reception backpressure (D2) trips this token
-    // to reset both directions.
-    let conn_cancel = CancellationToken::new();
+        // NOW declare liveliness token - export bridge will detect this and try to connect
+        let liveliness_key = scoped_key(service_name, dns, &format!("clients/{client_id}"));
+        let liveliness_token = session
+            .liveliness()
+            .declare_token(&liveliness_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
 
-    // D2: drain the client's RX subscriber through a bounded, non-blocking channel
-    // so a slow client TCP writer cannot fill the default FIFO handler and block
-    // the shared session's reception thread (head-of-line-blocking every client).
-    let (rx_callback, rx_channel_rx) = crate::backpressure::rx_channel(
-        config.rx_channel_capacity,
-        config.reliability,
-        conn_cancel.clone(),
-        client_id.to_string(),
-    );
+        info!(key = %liveliness_key, "Declared liveliness");
 
-    // Subscribe to responses from the service for this specific client using AdvancedSubscriber
-    // This allows late publisher detection and recovery of missed samples
-    let sub_key = scoped_key(service_name, dns, &format!("rx/{client_id}"));
-    let subscriber = session
-        .declare_subscriber(&sub_key)
-        .callback(rx_callback)
-        .history(HistoryConfig::default().detect_late_publishers())
-        .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
-        .subscriber_detection()
+        Ok::<_, anyhow::Error>((
+            error_subscriber,
+            conn_cancel,
+            rx_channel_rx,
+            publisher,
+            subscriber,
+            liveliness_token,
+            pub_key_str,
+        ))
+    };
+    let (
+        error_subscriber,
+        conn_cancel,
+        rx_channel_rx,
+        publisher,
+        subscriber,
+        liveliness_token,
+        pub_key_str,
+    ) = tokio::time::timeout(config.read_timeout, setup)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
-
-    debug!(key = %sub_key, "Subscribed with late publisher detection");
-
-    // Declare AdvancedPublisher with cache and publisher detection
-    // This allows the export bridge to detect when we're ready and recover any missed samples
-    let pub_key_str = scoped_key(service_name, dns, &format!("tx/{client_id}"));
-    let pub_key: KeyExpr<'static> = pub_key_str
-        .clone()
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
-    let publisher_builder = session
-        .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(config.cache_size))
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
-        .publisher_detection();
-    // Stream reliability: block on a full TX queue instead of Zenoh's default
-    // `Drop`, which would silently drop payload bytes and corrupt the stream.
-    let publisher = match config.reliability {
-        ReliabilityMode::Stream => publisher_builder.congestion_control(CongestionControl::Block),
-        ReliabilityMode::Telemetry => publisher_builder,
-    }
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
-
-    debug!(key = %pub_key_str, "Declared AdvancedPublisher with cache");
-
-    // NOW declare liveliness token - export bridge will detect this and try to connect
-    let liveliness_key = scoped_key(service_name, dns, &format!("clients/{client_id}"));
-    let liveliness_token = session
-        .liveliness()
-        .declare_token(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
-
-    info!(key = %liveliness_key, "Declared liveliness");
+        .map_err(|_| anyhow::anyhow!("Zenoh setup did not complete within the read timeout"))??;
 
     // The export side subscribes to our tx key only after seeing the liveliness
     // token above. Relay nothing until it has: bytes published before then are

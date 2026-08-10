@@ -519,9 +519,20 @@ pub(super) fn h2_response_tap(service: String) -> super::bridge::ResponseTap {
     })
 }
 
-/// Parse the first request head out of peeked (non-consumed) bytes, if one is
-/// complete. A partial head yields `None` — callers re-peek with more bytes.
-pub(super) fn peek_http_head(peek: &[u8], config: &BridgeConfig) -> Option<RequestHead> {
+/// What peeking at a prefix of the request produced.
+pub(super) enum PeekOutcome {
+    /// A complete request head.
+    Head(RequestHead),
+    /// Not enough bytes yet — peek again when more arrive.
+    NeedMore,
+    /// The parser refused the prefix (malformed head, oversized, or a protocol
+    /// switch): more bytes can never produce a routable head, so the caller
+    /// should stop polling and let the consuming reader answer 400.
+    Refused,
+}
+
+/// Parse the first request head out of peeked (non-consumed) bytes.
+pub(super) fn peek_http_head_outcome(peek: &[u8], config: &BridgeConfig) -> PeekOutcome {
     let mut parser = http_head_parser(config);
     let mut pending = Bytes::copy_from_slice(peek);
     while !pending.is_empty() {
@@ -533,10 +544,13 @@ pub(super) fn peek_http_head(peek: &[u8], config: &BridgeConfig) -> Option<Reque
     }
     while let Some(ev) = parser.next_event() {
         if let HttpEvent::RequestHead(head) = ev {
-            return Some(head);
+            return PeekOutcome::Head(head);
         }
     }
-    None
+    if parser.poison().is_some() || parser.is_tunnelled() {
+        return PeekOutcome::Refused;
+    }
+    PeekOutcome::NeedMore
 }
 
 /// Whether a request head asks for a WebSocket upgrade, per RFC 9110 §7.8 +
@@ -745,7 +759,17 @@ mod tests {
     #[test]
     fn ws_upgrade_detection_is_rfc_strict() {
         let cfg = BridgeConfig::default();
-        let ws = |wire: &[u8]| head_is_websocket_upgrade(&peek_http_head(wire, &cfg).unwrap());
+        let ws = |wire: &[u8]| match peek_http_head_outcome(wire, &cfg) {
+            PeekOutcome::Head(head) => head_is_websocket_upgrade(&head),
+            other => panic!(
+                "test head did not parse: {}",
+                match other {
+                    PeekOutcome::NeedMore => "NeedMore",
+                    PeekOutcome::Refused => "Refused",
+                    PeekOutcome::Head(_) => unreachable!(),
+                }
+            ),
+        };
 
         // Comma-listed Connection token + case variants: an upgrade.
         assert!(ws(

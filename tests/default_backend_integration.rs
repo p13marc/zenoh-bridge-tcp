@@ -516,3 +516,132 @@ fn build_client_hello_with_sni(hostname: &str) -> Vec<u8> {
     ]
     .concat()
 }
+
+/// A4 regression: a TLS ClientHello whose FIRST segment is shorter than the
+/// classifier's need (6 bytes for TLS) must still be classified TLS and routed
+/// by SNI — not silently downgraded to opaque relay on the default backend.
+///
+/// The auto-detect door used to classify on a single peek: `NeedMore` (a
+/// 3-byte record-header fragment) fell through to `Raw`, so a client whose
+/// first `write()` was small was delivered to the WRONG backend with no error
+/// anywhere. The door now re-peeks until the classifier can decide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn split_client_hello_routes_by_sni_not_default() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    // Two backends: the @host one that MUST win, and a default catch-all that
+    // records what lands on it (the misroute detector).
+    let host_seen = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let host_seen_cb = host_seen.clone();
+    let (host_backend, _h) = common::start_probe_immune_backend(move |_stream, first| {
+        let host_seen = host_seen_cb.clone();
+        async move {
+            host_seen.lock().await.extend_from_slice(&first);
+        }
+    })
+    .await;
+
+    let default_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let default_hits_cb = default_hits.clone();
+    let (default_backend, _d) = common::start_probe_immune_backend(move |_stream, _first| {
+        let default_hits = default_hits_cb.clone();
+        async move {
+            default_hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    })
+    .await;
+
+    let service = unique_service_name("splittls");
+    let _host_export = BridgeProcess::new(&[
+        "--backend",
+        &format!("{service}@sni.split.test/{host_backend}"),
+    ])
+    .await;
+    let _default_export =
+        BridgeProcess::new(&["--backend", &format!("{service}/{default_backend}")]).await;
+    sleep(Duration::from_millis(700)).await;
+
+    let import_port = PortGuard::new();
+    let import_addr = import_port.release();
+    let _import = BridgeProcess::new(&["--listen", &format!("{service}/{import_addr}")]).await;
+    wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("import listener never bound");
+
+    let hello = build_client_hello_with_sni("sni.split.test");
+
+    // Retry the whole exchange until the host backend has seen the verbatim
+    // hello (covers the export-attachment window like every raw-door client).
+    let deadline = std::time::Instant::now() + common::BACKEND_READY_TIMEOUT;
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(import_addr).await {
+            // First segment: 3 bytes — the classifier cannot decide TLS yet.
+            let _ = stream.write_all(&hello[..3]).await;
+            let _ = stream.flush().await;
+            sleep(Duration::from_millis(200)).await;
+            let _ = stream.write_all(&hello[3..]).await;
+            let _ = stream.flush().await;
+            sleep(Duration::from_millis(400)).await;
+        }
+        let seen = host_seen.lock().await.clone();
+        if seen.windows(hello.len()).any(|w| w == hello.as_slice()) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "host backend never received the split ClientHello; default backend hits: {}",
+            default_hits.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    // The default backend must have seen NOTHING: any hit means the split
+    // hello was misclassified as raw and misrouted.
+    assert_eq!(
+        default_hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "split ClientHello was misrouted to the default backend"
+    );
+}
+
+/// A4 regression: an h2c client whose backend does not exist must be CLOSED
+/// promptly, not left hanging. The parsed h2c path always probed liveliness;
+/// the timeout-fallback path (client sends preface+SETTINGS and waits for the
+/// server, RFC 9113 §3.4) skipped the probe and relayed into the void.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn h2c_fallback_without_backend_closes_fast() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let service = unique_service_name("h2cnoback");
+    let import_port = PortGuard::new();
+    let import_addr = import_port.release();
+    // Import only — no backend of any kind, short read timeout to keep the
+    // test quick (the h2 head read consumes one read_timeout before falling
+    // back, then the availability probe must refuse).
+    let _import = BridgeProcess::new(&[
+        "--listen",
+        &format!("{service}/{import_addr}"),
+        "--read-timeout",
+        "2",
+    ])
+    .await;
+    wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("import listener never bound");
+
+    let mut stream = TcpStream::connect(import_addr).await.unwrap();
+    // h2 preface + an empty SETTINGS frame, then wait like a conformant client.
+    let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    bytes.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+    stream.write_all(&bytes).await.unwrap();
+
+    let mut buf = [0u8; 64];
+    match timeout(Duration::from_secs(10), stream.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // closed — correct
+        Ok(Ok(n)) => panic!("received {n} bytes from a service with no backend"),
+        Err(_) => panic!(
+            "h2c fallback connection still open 10s after connecting with no \
+             backend anywhere — it used to relay into the void and hang"
+        ),
+    }
+}

@@ -582,82 +582,99 @@ where
 {
     let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
 
-    // Single abort token for the whole connection. A clean directional EOF ends
-    // only its own direction (a half-close); a hard error, external teardown, an
-    // unrecoverable sample miss, or reception backpressure (D2) trips this token
-    // to reset both directions.
-    let conn_cancel = CancellationToken::new();
+    // R3: bound the whole Zenoh setup phase (see the mirror-image note in
+    // import::bridge) — a stalled declare must fail the connection, not hang
+    // the task indefinitely.
+    let setup = async {
+        // Single abort token for the whole connection. A clean directional EOF ends
+        // only its own direction (a half-close); a hard error, external teardown, an
+        // unrecoverable sample miss, or reception backpressure (D2) trips this token
+        // to reset both directions.
+        let conn_cancel = CancellationToken::new();
 
-    // D2: drain the client's TX subscriber through a bounded, non-blocking channel
-    // so a slow backend writer cannot fill the default FIFO handler and block the
-    // shared session's reception thread (head-of-line-blocking every other client).
-    let (rx_callback, rx_channel_rx) = crate::backpressure::rx_channel(
-        config.rx_channel_capacity,
-        config.reliability,
-        conn_cancel.clone(),
-        client_id.clone(),
-    );
+        // D2: drain the client's TX subscriber through a bounded, non-blocking channel
+        // so a slow backend writer cannot fill the default FIFO handler and block the
+        // shared session's reception thread (head-of-line-blocking every other client).
+        let (rx_callback, rx_channel_rx) = crate::backpressure::rx_channel(
+            config.rx_channel_capacity,
+            config.reliability,
+            conn_cancel.clone(),
+            client_id.clone(),
+        );
 
-    // Subscribe to messages from this specific client using AdvancedSubscriber
-    // This enables late publisher detection and recovery of missed samples
-    let sub_key = format!("{}{}/tx/{}", service_name, dns_part, client_id);
-    let subscriber = session
-        .declare_subscriber(&sub_key)
-        .callback(rx_callback)
-        .history(HistoryConfig::default().detect_late_publishers())
-        .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
-        .subscriber_detection()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
-
-    info!(key = %sub_key, "Subscribed with late publisher detection");
-
-    // Declare AdvancedPublisher with cache and publisher detection for RX channel
-    // This allows the import bridge to detect when we're ready and recover any missed samples
-    let pub_key_str = format!("{}{}/rx/{}", service_name, dns_part, client_id);
-    let pub_key: KeyExpr<'static> = pub_key_str
-        .clone()
-        .try_into()
-        .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
-    let publisher_builder = session
-        .declare_publisher(pub_key.clone())
-        .cache(CacheConfig::default().max_samples(config.cache_size))
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
-        .publisher_detection();
-    // Stream reliability: block on a full TX queue instead of Zenoh's default
-    // `Drop`, which would silently drop payload bytes and corrupt the stream.
-    let publisher = match config.reliability {
-        ReliabilityMode::Stream => publisher_builder.congestion_control(CongestionControl::Block),
-        ReliabilityMode::Telemetry => publisher_builder,
-    }
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
-
-    debug!(key = %pub_key_str, "Declared AdvancedPublisher with cache");
-
-    // Stream reliability: an unrecoverable sample miss means the byte stream has a
-    // gap that cannot be delivered faithfully. Reset the connection rather than
-    // hand corrupted bytes to the backend. The listener runs in the background for
-    // the subscriber's lifetime.
-    if config.reliability == ReliabilityMode::Stream {
-        let miss_cancel = conn_cancel.clone();
-        // This callback runs on the session's reception thread, outside the
-        // connection span, so it must carry client_id itself.
-        let miss_client = client_id.clone();
-        subscriber
-            .sample_miss_listener()
-            .callback(move |miss| {
-                warn!(
-                    client_id = %miss_client,
-                    missed = miss.nb(),
-                    "Unrecoverable sample miss, resetting connection"
-                );
-                miss_cancel.cancel();
-            })
-            .background()
+        // Subscribe to messages from this specific client using AdvancedSubscriber
+        // This enables late publisher detection and recovery of missed samples
+        let sub_key = format!("{}{}/tx/{}", service_name, dns_part, client_id);
+        let subscriber = session
+            .declare_subscriber(&sub_key)
+            .callback(rx_callback)
+            .history(HistoryConfig::default().detect_late_publishers())
+            .recovery(RecoveryConfig::default().periodic_queries(config.heartbeat_interval))
+            .subscriber_detection()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to register sample-miss listener: {:?}", e))?;
-    }
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe: {:?}", e))?;
+
+        info!(key = %sub_key, "Subscribed with late publisher detection");
+
+        // Declare AdvancedPublisher with cache and publisher detection for RX channel
+        // This allows the import bridge to detect when we're ready and recover any missed samples
+        let pub_key_str = format!("{}{}/rx/{}", service_name, dns_part, client_id);
+        let pub_key: KeyExpr<'static> = pub_key_str
+            .clone()
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
+        let publisher_builder = session
+            .declare_publisher(pub_key.clone())
+            .cache(CacheConfig::default().max_samples(config.cache_size))
+            .sample_miss_detection(
+                MissDetectionConfig::default().heartbeat(config.heartbeat_interval),
+            )
+            .publisher_detection();
+        // Stream reliability: block on a full TX queue instead of Zenoh's default
+        // `Drop`, which would silently drop payload bytes and corrupt the stream.
+        let publisher = match config.reliability {
+            ReliabilityMode::Stream => {
+                publisher_builder.congestion_control(CongestionControl::Block)
+            }
+            ReliabilityMode::Telemetry => publisher_builder,
+        }
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+        debug!(key = %pub_key_str, "Declared AdvancedPublisher with cache");
+
+        // Stream reliability: an unrecoverable sample miss means the byte stream has a
+        // gap that cannot be delivered faithfully. Reset the connection rather than
+        // hand corrupted bytes to the backend. The listener runs in the background for
+        // the subscriber's lifetime.
+        if config.reliability == ReliabilityMode::Stream {
+            let miss_cancel = conn_cancel.clone();
+            // This callback runs on the session's reception thread, outside the
+            // connection span, so it must carry client_id itself.
+            let miss_client = client_id.clone();
+            subscriber
+                .sample_miss_listener()
+                .callback(move |miss| {
+                    warn!(
+                        client_id = %miss_client,
+                        missed = miss.nb(),
+                        "Unrecoverable sample miss, resetting connection"
+                    );
+                    miss_cancel.cancel();
+                })
+                .background()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to register sample-miss listener: {:?}", e))?;
+        }
+
+        Ok::<_, anyhow::Error>((conn_cancel, rx_channel_rx, subscriber, publisher))
+    };
+    let (conn_cancel, rx_channel_rx, subscriber, publisher) =
+        tokio::time::timeout(config.read_timeout, setup)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("Zenoh setup did not complete within the read timeout")
+            })??;
 
     // Metrics (G7): count this connection for the service; the guard decrements
     // the active gauge on every exit path. Placed AFTER the last fallible setup

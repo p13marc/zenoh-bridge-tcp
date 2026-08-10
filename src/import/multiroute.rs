@@ -428,37 +428,51 @@ async fn run_exchange(
         .map_err(|e| anyhow::anyhow!("Invalid key expression: {}", e))?;
     let liveliness_key = format!("{}{}/clients/{}", service_name, dns_suffix, sub_request_id);
 
-    let liveliness_token = session
-        .liveliness()
-        .declare_token(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
-    // D2: drain this request's response subscriber through a bounded, non-blocking
-    // channel so a slow client cannot fill the default FIFO handler and block the
-    // shared session's reception thread — head-of-line-blocking every other client
-    // (the same protection the plain import/export paths already have).
-    let rx_cancel = CancellationToken::new();
-    let (rx_callback, mut rx) = crate::backpressure::rx_channel(
-        config.rx_channel_capacity,
-        config.reliability,
-        rx_cancel.clone(),
-        request_id.to_string(),
-    );
-    let rx_subscriber = session
-        .declare_subscriber(&rx_key)
-        .callback(rx_callback)
-        .history(HistoryConfig::default().detect_late_publishers())
-        .subscriber_detection()
-        .recovery(RecoveryConfig::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
-    let tx_publisher = session
-        .declare_publisher(tx_key)
-        .cache(CacheConfig::default().max_samples(config.cache_size))
-        .publisher_detection()
-        .sample_miss_detection(MissDetectionConfig::default().heartbeat(config.heartbeat_interval))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+    // R3: bound the per-request Zenoh entity setup (see import::bridge) — a
+    // stalled declare must 502 this request, not hang the whole connection.
+    let setup = async {
+        let liveliness_token = session
+            .liveliness()
+            .declare_token(&liveliness_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare liveliness: {}", e))?;
+        // D2: drain this request's response subscriber through a bounded, non-blocking
+        // channel so a slow client cannot fill the default FIFO handler and block the
+        // shared session's reception thread — head-of-line-blocking every other client
+        // (the same protection the plain import/export paths already have).
+        let rx_cancel = CancellationToken::new();
+        let (rx_callback, rx) = crate::backpressure::rx_channel(
+            config.rx_channel_capacity,
+            config.reliability,
+            rx_cancel.clone(),
+            request_id.to_string(),
+        );
+        let rx_subscriber = session
+            .declare_subscriber(&rx_key)
+            .callback(rx_callback)
+            .history(HistoryConfig::default().detect_late_publishers())
+            .subscriber_detection()
+            .recovery(RecoveryConfig::default())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))?;
+        let tx_publisher = session
+            .declare_publisher(tx_key)
+            .cache(CacheConfig::default().max_samples(config.cache_size))
+            .publisher_detection()
+            .sample_miss_detection(
+                MissDetectionConfig::default().heartbeat(config.heartbeat_interval),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
+
+        Ok::<_, anyhow::Error>((liveliness_token, rx_cancel, rx, rx_subscriber, tx_publisher))
+    };
+    let (liveliness_token, rx_cancel, mut rx, rx_subscriber, tx_publisher) =
+        tokio::time::timeout(config.read_timeout, setup)
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("Zenoh setup did not complete within the read timeout")
+            })??;
 
     // The export side subscribes to this request's tx key only after seeing the
     // liveliness token above; publishing before then leaves the bytes nowhere

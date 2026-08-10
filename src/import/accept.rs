@@ -135,6 +135,11 @@ where
                         // Accept failed; release the permit we were holding.
                         drop(permit);
                         error!(error = %e, "Failed to accept connection");
+                        // Back off: EMFILE/ENFILE do not consume the pending
+                        // connection, so accept() fails again immediately — an
+                        // unthrottled loop burned 100% CPU and flooded the log
+                        // exactly when the process was already fd-starved.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }
