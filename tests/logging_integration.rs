@@ -392,3 +392,44 @@ fn tempdir(tag: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&dir).expect("creating the temp log directory");
     dir
 }
+
+/// A6 regression: an unwritable log directory must be a clean startup error.
+///
+/// tracing-appender `.expect()`s while constructing the rolling appender, so
+/// without the preflight probe this case PANICKED (exit 101 + backtrace),
+/// contradicting init's documented no-panic contract.
+#[tokio::test]
+async fn unwritable_log_dir_fails_cleanly_not_panic() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir().join(format!("zb-ro-{}", uuid::Uuid::new_v4().as_simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let out = common::bridge_command()
+        .args([
+            "--backend",
+            "logrofail/127.0.0.1:1",
+            "--log-target",
+            &format!("file={}/bridge.log", dir.display()),
+        ])
+        .output()
+        .await
+        .expect("spawn");
+
+    // Restore permissions so temp cleanup can remove it.
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "must fail: {stderr}");
+    assert_ne!(
+        out.status.code(),
+        Some(101),
+        "an unwritable log dir must be a clean error, not a panic: {stderr}"
+    );
+    assert!(
+        stderr.contains("not writable"),
+        "the error must name the problem, got: {stderr}"
+    );
+}

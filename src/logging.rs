@@ -409,10 +409,29 @@ fn default_directives(level: &str) -> String {
     directives
 }
 
-/// `RUST_LOG` wins when set and parseable; otherwise the CLI level plus the
-/// dependency floor above.
-fn build_filter(level: &str) -> EnvFilter {
-    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_directives(level)))
+/// The testable core of the filter choice: the environment value is a
+/// parameter, so tests are not hostage to the ambient `RUST_LOG` (running the
+/// suite with one set used to fail the logging unit tests spuriously).
+fn build_filter_from(level: &str, rust_log: Option<String>) -> EnvFilter {
+    match rust_log {
+        // An empty-but-set RUST_LOG (a docker-compose `RUST_LOG:` line, a
+        // systemd `Environment=RUST_LOG=`) used to install a filter with zero
+        // directives — silencing the process COMPLETELY while --log-level was
+        // silently ignored. Treat it as unset.
+        Some(value) if value.trim().is_empty() => EnvFilter::new(default_directives(level)),
+        Some(value) => match EnvFilter::try_new(&value) {
+            Ok(filter) => filter,
+            Err(e) => {
+                // Surface the fallback: the operator believes their filter is
+                // active. eprintln, not tracing — no subscriber exists yet.
+                eprintln!(
+                    "warning: ignoring malformed RUST_LOG ({e}); falling back to --log-level {level}"
+                );
+                EnvFilter::new(default_directives(level))
+            }
+        },
+        None => EnvFilter::new(default_directives(level)),
+    }
 }
 
 /// Whether a sink should render ANSI, given the choice and whether the sink is
@@ -471,6 +490,19 @@ fn build(
     impl SubscriberInitExt + tracing::Subscriber + Send + Sync,
     LogGuards,
 )> {
+    build_with_env(opts, std::env::var("RUST_LOG").ok())
+}
+
+/// [`build`] with `RUST_LOG` as a parameter, so the unit tests are not
+/// hostage to the ambient environment (a developer running the suite with
+/// RUST_LOG set used to fail them spuriously).
+fn build_with_env(
+    opts: &LogOptions,
+    rust_log: Option<String>,
+) -> Result<(
+    impl SubscriberInitExt + tracing::Subscriber + Send + Sync,
+    LogGuards,
+)> {
     let mut guards = Vec::new();
     let mut layers: Vec<BoxedLayer> = Vec::new();
 
@@ -491,6 +523,19 @@ fn build(
                 // learn about a typo in a path.
                 std::fs::create_dir_all(&dir)
                     .with_context(|| format!("creating log directory '{}'", dir.display()))?;
+                // Probe writability NOW: RollingFileAppender::new `.expect`s
+                // internally, so an unwritable directory (read-only mount,
+                // missing permission) would PANIC instead of returning the
+                // startup error init's contract promises.
+                let probe = dir.join(".zenoh-bridge-log.probe");
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&probe)
+                    .with_context(|| {
+                        format!("log directory '{}' is not writable", dir.display())
+                    })?;
+                let _ = std::fs::remove_file(&probe);
                 let appender = match rotation {
                     Rotation::Never => tracing_appender::rolling::never(&dir, &prefix),
                     Rotation::Daily => tracing_appender::rolling::daily(&dir, &prefix),
@@ -516,7 +561,7 @@ fn build(
     // filters globally regardless of its position in the stack.
     let subscriber = Registry::default()
         .with(layers)
-        .with(build_filter(&opts.level));
+        .with(build_filter_from(&opts.level, rust_log));
 
     Ok((subscriber, LogGuards(guards)))
 }
@@ -807,6 +852,8 @@ mod tests {
     /// Uses `with_default` rather than `init`, so the test does not fight the
     /// other tests over the process-global subscriber.
     fn capture_via_file_sink(opts_level: &str, format: LogFormat, emit: impl FnOnce()) -> String {
+        // NOTE: uses build_with_env(.., None) below — ambient RUST_LOG must
+        // not leak into these assertions.
         let dir = std::env::temp_dir().join(format!(
             "zbridge-log-test-{}-{:?}",
             std::process::id(),
@@ -823,7 +870,7 @@ mod tests {
                 rotation: Rotation::Never,
             }],
         };
-        let (subscriber, guards) = build(&opts).expect("building the subscriber");
+        let (subscriber, guards) = build_with_env(&opts, None).expect("building the subscriber");
         tracing::subscriber::with_default(subscriber, emit);
         // Dropping the guards flushes and joins the background writer.
         drop(guards);
@@ -858,6 +905,38 @@ mod tests {
         });
         assert!(!out.contains("suppressed"), "got: {out}");
         assert!(out.contains("kept"), "got: {out}");
+    }
+
+    /// An empty-but-set RUST_LOG (docker-compose `RUST_LOG:`; systemd
+    /// `Environment=RUST_LOG=`) used to install a zero-directive filter —
+    /// total silence with `--log-level` ignored.
+    #[test]
+    fn empty_rust_log_falls_back_to_the_cli_level() {
+        let filter = build_filter_from("info", Some(String::new())).to_string();
+        assert!(
+            filter.contains("zenoh_bridge_tcp=info"),
+            "empty RUST_LOG must fall back to the CLI level, got: {filter}"
+        );
+        let ws = build_filter_from("info", Some("   ".into())).to_string();
+        assert!(ws.contains("zenoh_bridge_tcp=info"), "whitespace too: {ws}");
+    }
+
+    /// A malformed RUST_LOG falls back (with a stderr warning) instead of
+    /// silently pretending the operator's filter is active.
+    #[test]
+    fn malformed_rust_log_falls_back_to_the_cli_level() {
+        let filter = build_filter_from("debug", Some("!!not=a=filter,,".into())).to_string();
+        assert!(
+            filter.contains("zenoh_bridge_tcp=debug"),
+            "malformed RUST_LOG must fall back, got: {filter}"
+        );
+    }
+
+    /// A valid RUST_LOG wins over the CLI level, as documented.
+    #[test]
+    fn valid_rust_log_wins() {
+        let filter = build_filter_from("info", Some("warn".into())).to_string();
+        assert_eq!(filter, "warn");
     }
 
     #[test]
