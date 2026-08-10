@@ -27,6 +27,67 @@ fn scoped_key(service_name: &str, dns: Option<&str>, tail: &str) -> String {
     }
 }
 
+/// Wait until `publisher` has a matching subscriber, bounded by `timeout`.
+///
+/// Each connection publishes on a **fresh** `{service}/tx/{client_id}` key, and
+/// the export side only subscribes after it observes this client's liveliness
+/// token — a few milliseconds later. Relaying into that window published bytes
+/// nowhere recoverable except the publisher's cache, which holds `cache_size`
+/// *samples*: a burst larger than the cache reached the backend truncated and
+/// was still reported as a clean completion, silently breaking the byte-exact
+/// guarantee `ReliabilityMode::Stream` exists to provide.
+///
+/// Best-effort by design: on timeout we relay anyway, which is exactly the
+/// previous behaviour. This can only ever reduce loss — it never converts a
+/// working connection into a stalled one.
+///
+/// Only `Stream` gates: `Telemetry` is explicitly loss-tolerant, so making it
+/// pay setup latency to avoid a loss it accepts by definition would be a
+/// straight regression.
+pub(super) async fn await_matching_subscriber<T>(
+    publisher: &zenoh_ext::AdvancedPublisher<'_>,
+    reliability: ReliabilityMode,
+    timeout: std::time::Duration,
+    what: T,
+) where
+    T: std::fmt::Display,
+{
+    if reliability != ReliabilityMode::Stream {
+        return;
+    }
+
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    loop {
+        // Bound the query itself, not just the loop. `matching_status()` is an
+        // async round-trip through the session: if it stays pending, a loop that
+        // only checks its deadline *between* attempts never gets to check it
+        // again, and a bounded wait silently becomes a hung connection.
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, publisher.matching_status()).await {
+            Ok(Ok(status)) if status.matching() => {
+                debug!(
+                    waited_ms = started.elapsed().as_millis() as u64,
+                    "Backend subscriber attached"
+                );
+                return;
+            }
+            // Not yet, or the query failed or timed out — a failed status says
+            // nothing about the peer, so let the deadline below decide.
+            _ => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                what = %what,
+                timeout_ms = timeout.as_millis() as u64,
+                "No subscriber matched in time; relaying anyway (bytes sent now may be lost)"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
 /// Shared bidirectional bridging logic for import connections.
 ///
 /// This function handles the Zenoh pub/sub setup and bidirectional data bridging
@@ -124,6 +185,18 @@ where
 
     info!(key = %liveliness_key, "Declared liveliness");
 
+    // The export side subscribes to our tx key only after seeing the liveliness
+    // token above. Relay nothing until it has: bytes published before then are
+    // recoverable only from the publisher cache, and a burst larger than the
+    // cache used to reach the backend truncated but reported as complete.
+    await_matching_subscriber(
+        &publisher,
+        config.reliability,
+        config.availability_timeout,
+        &pub_key_str,
+    )
+    .await;
+
     // Send the initial HTTP request if we buffered it
     if let Some(buffer) = initial_buffer {
         debug!(bytes = buffer.len(), "Forwarding initial HTTP request");
@@ -202,7 +275,12 @@ where
                     maybe_sample = rx.recv() => {
                         match maybe_sample {
                             Some(sample) => {
-                                let payload = sample.payload().to_bytes().to_vec();
+                                // Borrowed, not copied: the relay forwards these
+                                // bytes and never retains them, so the `to_vec()`
+                                // that used to sit here copied every chunk on the
+                                // hot path — directly under a comment claiming
+                                // the path was zero-copy.
+                                let payload = sample.payload().to_bytes();
                                 if payload.is_empty() {
                                     debug!("Backend half-close, sending FIN to client");
                                     let _ = writer.send_eof().await;

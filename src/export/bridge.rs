@@ -430,7 +430,9 @@ where
                     maybe_sample = rx.recv() => {
                         match maybe_sample {
                             Some(sample) => {
-                                let payload = sample.payload().to_bytes().to_vec();
+                                // Borrowed, not copied — see the note on the
+                                // mirror-image loop in import/bridge.rs.
+                                let payload = sample.payload().to_bytes();
                                 if payload.is_empty() {
                                     debug!("Client half-close, sending FIN to backend");
                                     let _ = backend_writer.send_eof().await;

@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.8.1] - 2026-08-10
+
+Bug-fix and consolidation release. No new features, no CLI additions.
+
+### Fixed
+
+- **Silent byte loss in `Stream` mode (the reason for this release).** Each
+  connection publishes on a fresh `{service}/tx/{client_id}` key, but the export
+  side only subscribes after it observes that connection's liveliness token — a
+  few milliseconds later. Bytes relayed into that window survived only in the
+  publisher cache (`--cache-size`, 256 *samples*), so a client that started
+  writing immediately had everything older than the cache dropped: a 1 MiB burst
+  reached the backend as ~435 KB, was relayed on as if whole, and the connection
+  was logged `outcome="completed"`. The sample-miss listeners could not catch it,
+  because samples published before a subscriber existed are never known to have
+  been missed. The relay now waits (bounded, best-effort, `Stream` mode only) for
+  a matching subscriber before forwarding, which closes the window. This broke
+  the byte-exactness guarantee `Stream` exists to provide.
+
+- **`route=request` killed healthy streaming responses after ~30s.** The
+  response budget was computed once per exchange and used as an *absolute*
+  deadline, so a large download, an SSE stream or a long poll died with
+  "Response timeout" while bytes were actively arriving. It is now an idle
+  budget, refreshed on every response sample.
+
+- **The multiroute 502 contradicted itself.** That door deliberately keeps the
+  connection alive so a client can retry a different Host, but answered with
+  `Connection: close` — which every compliant client obeys, making the retry
+  path unreachable outside of raw-socket tests. It now sends a keep-alive 502;
+  the connection-scoped doors, which really do close, are unchanged.
+
+- **`--read-timeout 0` was accepted.** Unlike every other tunable it had no
+  floor, and zero made every head read time out instantly: the bridge started
+  cleanly and then refused every connection. Now rejected at startup.
+
+- **The `/healthz`, `/readyz`, `/metrics` server could be pinned open.** Its
+  request read had no timeout and connections were spawned uncapped, so a peer
+  that connected and said nothing held a task and a file descriptor
+  indefinitely. It now honours `--read-timeout` and bounds concurrency, matching
+  the hardening the data plane already had.
+
+- **`--max-response-size` was enforced after the fact.** The cap was checked
+  *after* writing each chunk, so it could be overshot by a whole chunk (measured:
+  65,579 bytes written against a 4,096-byte cap), and trailers were counted but
+  never checked. It is now checked before writing. Its documentation promised an
+  HTTP 502 that the code cannot send — the response head is long gone by then —
+  and now describes what actually happens: truncate and close.
+
+### Changed
+
+- The relay no longer copies every chunk it forwards. Both bridge directions did
+  `.to_bytes().to_vec()` directly beneath comments claiming the path was
+  zero-copy; the multiroute path already did it correctly.
+- `route=request` no longer reallocates a `--buffer-size` buffer (64 KiB by
+  default) on every read-loop iteration.
+
 ## [0.8.0] - 2026-08-05
 
 ### Added

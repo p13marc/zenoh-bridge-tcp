@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 static REGISTRY: LazyLock<Metrics> = LazyLock::new(Metrics::new);
 
@@ -368,15 +368,45 @@ pub fn conn_start(service: &str) -> ConnGuard {
 ///
 /// Hand-rolled HTTP/1.1 (request-line + fixed responses, `Connection: close`) —
 /// the endpoints are trivial GETs, so this stays dependency-free.
-pub async fn serve(addr: SocketAddr, shutdown: CancellationToken) -> std::io::Result<()> {
+/// How many request handlers may be in flight at once.
+///
+/// This bound, and the per-request read timeout `serve` takes, exist for the
+/// same reason the data plane has them (F4/D3): a peer that connects and then
+/// says nothing must not be able to pin a task and a file descriptor
+/// indefinitely, nor to accumulate without limit. This server had neither, so a
+/// handful of idle connections could hold resources forever.
+const MAX_CONCURRENT: usize = 64;
+
+/// `request_timeout` bounds how long a client may take to send its request
+/// head — the same `--read-timeout` budget the data-plane readers use.
+pub async fn serve(
+    addr: SocketAddr,
+    request_timeout: Duration,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "Metrics/health server listening (/healthz /readyz /metrics)");
+    let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _)) => { tokio::spawn(handle_conn(stream)); }
+                    Ok((stream, _)) => {
+                        // Shed rather than queue: health checks want a fast
+                        // failure, not an unbounded backlog behind slow peers.
+                        match limit.clone().try_acquire_owned() {
+                            Ok(permit) => {
+                                tokio::spawn(async move {
+                                    let _permit = permit;
+                                    handle_conn(stream, request_timeout).await;
+                                });
+                            }
+                            Err(_) => {
+                                warn!("metrics server at capacity, dropping connection");
+                            }
+                        }
+                    }
                     Err(e) => error!(error = %e, "metrics server accept failed"),
                 }
             }
@@ -386,22 +416,34 @@ pub async fn serve(addr: SocketAddr, shutdown: CancellationToken) -> std::io::Re
     Ok(())
 }
 
-async fn handle_conn(mut stream: TcpStream) {
-    // Read until end-of-headers (or a sane cap). GET requests have no body, so
-    // the request line is available in the first read.
+async fn handle_conn(mut stream: TcpStream, request_timeout: Duration) {
+    // Read until end-of-headers (or a sane cap), bounded in time. GET requests
+    // have no body, so the request line is available in the first read.
     let mut got: Vec<u8> = Vec::with_capacity(1024);
     let mut buf = [0u8; 1024];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                got.extend_from_slice(&buf[..n]);
-                if got.windows(4).any(|w| w == b"\r\n\r\n") || got.len() > 8192 {
-                    break;
+    // Only the tail can complete a CRLFCRLF that spans two reads, so scan a
+    // small overlap instead of re-scanning the whole buffer on every read.
+    let mut scanned = 0usize;
+    let read_head = async {
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    let from = scanned.saturating_sub(3);
+                    if got[from..].windows(4).any(|w| w == b"\r\n\r\n") || got.len() > 8192 {
+                        break;
+                    }
+                    scanned = got.len();
                 }
+                Err(_) => return false,
             }
-            Err(_) => return,
         }
+        true
+    };
+    if tokio::time::timeout(request_timeout, read_head).await != Ok(true) {
+        // Timed out or errored: drop the connection rather than hold it.
+        return;
     }
 
     let request_line = String::from_utf8_lossy(&got);

@@ -1,13 +1,12 @@
 use super::connection::{BackendRoute, resolve_backend, routing_key_from_head};
 use crate::config::BridgeConfig;
-use crate::http_util::{http_400_response, http_502_response};
+use crate::http_util::{http_400_response, http_502_response, http_502_response_keep_alive};
 use anyhow::Result;
 use bytes::Bytes;
 use flowscope::FlowSide;
 use flowscope::http::{HttpEvent, HttpProxyParser};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
@@ -184,9 +183,12 @@ async fn handle_multiroute_connection(
             }
             BackendRoute::Unavailable => {
                 warn!(request_id = %request_id, dns = %dns, "No backend available");
-                let _ = stream.write_all(&http_502_response(&dns)).await;
-                // Keep the connection alive: the client may retry a different Host on
-                // it. Consume this request's body first so the next request frames
+                // Keep-alive variant: this door routes per request, so the
+                // connection stays usable for a Host that does resolve. Sending
+                // the closing variant here told every compliant client to hang
+                // up, which made the retry path below unreachable in practice.
+                let _ = stream.write_all(&http_502_response_keep_alive(&dns)).await;
+                // Consume this request's body first so the next request frames
                 // from the right offset.
                 consume_request_body(
                     &mut parser,
@@ -265,6 +267,9 @@ async fn next_request_head(
     config: &BridgeConfig,
 ) -> NextRequest {
     let mut leftover = Bytes::new();
+    // Hoisted out of the loop: this is 64 KiB by default, and reallocating it
+    // on every read was pure churn on the request path.
+    let mut tmp = vec![0u8; config.buffer_size];
     loop {
         // A RequestHead already framed (e.g. a pipelined request) wins.
         while let Some(front) = events.front() {
@@ -306,7 +311,6 @@ async fn next_request_head(
             continue;
         }
 
-        let mut tmp = vec![0u8; config.buffer_size];
         let n = match tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) | Err(_) => {
@@ -347,6 +351,7 @@ async fn consume_request_body(
     client_eof: &mut bool,
     config: &BridgeConfig,
 ) {
+    let mut tmp = vec![0u8; config.buffer_size];
     loop {
         while let Some(front) = events.pop_front() {
             match front {
@@ -368,7 +373,6 @@ async fn consume_request_body(
             return;
         }
 
-        let mut tmp = vec![0u8; config.buffer_size];
         let n = match tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) | Err(_) => return,
@@ -456,6 +460,18 @@ async fn run_exchange(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to declare publisher: {}", e))?;
 
+    // The export side subscribes to this request's tx key only after seeing the
+    // liveliness token above; publishing before then leaves the bytes nowhere
+    // but the publisher cache. A request head fits the cache, but a large
+    // request body does not — same silent truncation as the plain import path.
+    super::bridge::await_matching_subscriber(
+        &tx_publisher,
+        config.reliability,
+        config.availability_timeout,
+        request_id,
+    )
+    .await;
+
     // Forward the request head to the backend.
     tx_publisher
         .put(&head.raw[..])
@@ -471,7 +487,16 @@ async fn run_exchange(
     let mut client_pending = Bytes::new();
     let mut resp_pending = Bytes::new();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30).max(config.drain_timeout);
+    // IDLE budget, not a total-duration cap. This used to be computed once and
+    // reused as an absolute deadline, which killed any response still streaming
+    // after ~30s — a large download, an SSE stream, a long poll — while bytes
+    // were actively flowing. It is refreshed on every sample received below, so
+    // it now bounds inactivity, which is what "Response timeout" should mean.
+    let idle_budget = config.response_idle_timeout;
+    let mut deadline = tokio::time::Instant::now() + idle_budget;
+
+    // Hoisted: reallocated on every iteration of the exchange loop before.
+    let mut tmp = vec![0u8; config.buffer_size];
 
     'exchange: loop {
         // Re-offer any backpressured tails.
@@ -519,26 +544,43 @@ async fn run_exchange(
                     bytes_written += rh.raw.len();
                     svc.add_down(rh.raw.len());
                 }
+                // The cap is checked BEFORE writing, so it is never overshot.
+                // It used to write the chunk and then notice, putting the excess
+                // on the wire anyway; trailers were counted but never checked.
                 HttpEvent::Body {
                     dir: FlowSide::Responder,
                     raw,
                     ..
                 } => {
-                    stream.write_all(&raw).await?;
-                    bytes_written += raw.len();
-                    svc.add_down(raw.len());
-                    if bytes_written > config.max_response_size {
-                        warn!("Response exceeded max size");
+                    if bytes_written + raw.len() > config.max_response_size {
+                        warn!(
+                            limit = config.max_response_size,
+                            written = bytes_written,
+                            "Response exceeded max size; truncating and closing"
+                        );
                         keep_alive = false;
                         stop_exchange = true;
                         break;
                     }
+                    stream.write_all(&raw).await?;
+                    bytes_written += raw.len();
+                    svc.add_down(raw.len());
                 }
                 HttpEvent::Trailers {
                     dir: FlowSide::Responder,
                     raw,
                     ..
                 } => {
+                    if bytes_written + raw.len() > config.max_response_size {
+                        warn!(
+                            limit = config.max_response_size,
+                            written = bytes_written,
+                            "Response trailers exceeded max size; truncating and closing"
+                        );
+                        keep_alive = false;
+                        stop_exchange = true;
+                        break;
+                    }
                     stream.write_all(&raw).await?;
                     bytes_written += raw.len();
                     svc.add_down(raw.len());
@@ -586,7 +628,6 @@ async fn run_exchange(
 
         // Need more bytes. Read the client (until its request is done) and the
         // backend response concurrently.
-        let mut tmp = vec![0u8; config.buffer_size];
         tokio::select! {
             r = stream.read(&mut tmp), if !request_done && !*client_eof => {
                 match r {
@@ -605,6 +646,8 @@ async fn run_exchange(
             s = tokio::time::timeout_at(deadline, rx.recv()) => {
                 match s {
                     Ok(Some(sample)) => {
+                        // Progress: refresh the idle budget.
+                        deadline = tokio::time::Instant::now() + idle_budget;
                         let payload = sample.payload().to_bytes();
                         if payload.is_empty() {
                             parser.fin(FlowSide::Responder);

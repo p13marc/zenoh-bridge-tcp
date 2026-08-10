@@ -87,7 +87,9 @@ pub struct Args {
     #[arg(long, default_value = "1000")]
     pub availability_timeout_ms: u64,
 
-    /// Maximum response size for route=request mode in bytes (exceeding -> HTTP 502)
+    /// Maximum response size for route=request mode in bytes. A response that
+    /// would exceed it is truncated at the limit and the connection closed —
+    /// the response head is already on the wire, so no error status is possible.
     #[arg(long, default_value = "10485760")]
     pub max_response_size: usize,
 
@@ -198,6 +200,17 @@ impl Args {
             return Err(anyhow::anyhow!(
                 "--buffer-size must be at least 1024 (got {})",
                 self.buffer_size
+            ));
+        }
+
+        // Validate read_timeout. A floor matters here: every head reader wraps
+        // its socket read in `timeout(config.read_timeout, ..)`, so 0 elapses
+        // immediately and the bridge starts cleanly and then refuses *every*
+        // connection with "Client sent no data within the read timeout".
+        if self.read_timeout < 1 {
+            return Err(anyhow::anyhow!(
+                "--read-timeout must be at least 1 second (got {})",
+                self.read_timeout
             ));
         }
 
@@ -462,6 +475,34 @@ mod tests {
             ..Default::default()
         };
         assert!(args.validate().is_ok());
+    }
+
+    // --- Read timeout validation ---
+
+    #[test]
+    fn test_validate_read_timeout_minimum() {
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8000".into()],
+            read_timeout: 1,
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    /// `--read-timeout 0` used to be accepted, unlike every other tunable, and
+    /// then broke the bridge in the most confusing way available: it starts
+    /// cleanly, binds its listeners, and refuses every single connection,
+    /// because each head reader's `timeout(Duration::ZERO, ..)` elapses before
+    /// the client can possibly have sent anything.
+    #[test]
+    fn test_validate_read_timeout_zero_rejected() {
+        let args = Args {
+            listen: vec!["svc/127.0.0.1:8000".into()],
+            read_timeout: 0,
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("read-timeout"), "{err}");
     }
 
     // --- Drain timeout validation ---

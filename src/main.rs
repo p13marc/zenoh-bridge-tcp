@@ -109,8 +109,11 @@ async fn main() -> Result<()> {
     // immediately; readiness is flipped on once all bridge tasks are started.
     if let Some(metrics_addr) = args.metrics_addr {
         let token = shutdown_token.clone();
+        // Same budget the data-plane head readers use, so an idle client cannot
+        // pin a task+fd on the observability port either.
+        let read_timeout = std::time::Duration::from_secs(args.read_timeout);
         tokio::spawn(async move {
-            if let Err(e) = metrics::serve(metrics_addr, token).await {
+            if let Err(e) = metrics::serve(metrics_addr, read_timeout, token).await {
                 tracing::error!(addr = %metrics_addr, error = %e, "Metrics server failed to bind");
             }
         });
