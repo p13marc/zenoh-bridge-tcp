@@ -454,9 +454,13 @@ async fn spawn_multiroute(
     let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
     let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
 
+    // Unique per call: nextest runs test binaries in parallel on a shared Zenoh
+    // scouting domain, and several tests here call this concurrently.
+    let service = common::unique_service_name("mrecho");
+
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
-    let spec = format!("mr-echo/{}/{}", dns, backend_addr);
+    let spec = format!("{}/{}/{}", service, dns, backend_addr);
     let bc = config.clone();
     tokio::spawn(async move {
         zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, bc, t1)
@@ -470,7 +474,7 @@ async fn spawn_multiroute(
     drop(import_listener);
     let s2 = session2.clone();
     let t2 = shutdown_token.child_token();
-    let spec_import = format!("mr-echo/{}", import_addr);
+    let spec_import = format!("{}/{}", service, import_addr);
     tokio::spawn(async move {
         zenoh_bridge_tcp::import::run_http_multiroute_import_mode(s2, &spec_import, config, t2)
             .await
@@ -852,4 +856,355 @@ async fn test_multiroute_mixed_host_and_default() {
     export_a.abort();
     export_default.abort();
     import_task.abort();
+}
+
+/// Count connections the bridge has ever opened for `service`, read straight
+/// out of the in-process metrics registry.
+fn connections_total(service: &str) -> u64 {
+    let rendered = zenoh_bridge_tcp::metrics::metrics().render_prometheus();
+    rendered
+        .lines()
+        .find_map(|l| {
+            let rest = l.strip_prefix("zbridge_connections_total{service=\"")?;
+            let (svc, tail) = rest.split_once('"')?;
+            (svc == service).then(|| tail.rsplit(' ').next()?.trim().parse::<u64>().ok())?
+        })
+        .unwrap_or(0)
+}
+
+/// B3 regression: after a 502, the multiroute door keeps the connection usable
+/// **for a client that honours HTTP semantics**.
+///
+/// The door deliberately keeps routing on the same connection so a client can
+/// retry a different Host — but it used to answer with `Connection: close`,
+/// which every compliant client obeys. The existing raw-socket test could not
+/// see the contradiction because it ignores the header. This drives a real
+/// `reqwest` client with a connection pool and asserts the bridge saw exactly
+/// ONE connection across both requests, which is the property that was broken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+
+    let backend_addr = start_backend("backend-a").await;
+    let service = common::unique_service_name("mr502ka");
+
+    let config = Arc::new(BridgeConfig::default());
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec = format!("{}/host-a.test/{}", service, backend_addr);
+    let bc = config.clone();
+    let export_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, bc, t1)
+            .await
+            .unwrap();
+    });
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let spec_import = format!("{}/{}", service, import_addr);
+    let bc = config.clone();
+    let import_task = tokio::spawn(async move {
+        zenoh_bridge_tcp::import::run_http_multiroute_import_mode(s2, &spec_import, bc, t2)
+            .await
+            .unwrap();
+    });
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("multiroute listener never bound");
+
+    // Warm up until the export side is announced, so the measured windows below
+    // contain only the requests under test.
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(4)
+        .build()
+        .unwrap();
+    let resp = common::get_through_bridge(
+        &client,
+        &format!("http://{}/", import_addr),
+        Some("host-a.test"),
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("backend never became reachable");
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await;
+
+    // Calibrate: how much does the connection counter move for ONE client
+    // connection? It is not 1 — import and export both run in this process and
+    // both count against the same service — so measure it instead of assuming.
+    let base =
+        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await;
+    let fresh = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let resp = fresh
+        .get(format!("http://{}/", import_addr))
+        .header("Host", "host-a.test")
+        .send()
+        .await
+        .expect("calibration request failed");
+    assert_eq!(resp.status(), 200);
+    let _ = resp.bytes().await;
+    let per_connection =
+        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await
+            - base;
+    assert!(per_connection > 0, "calibration must observe a connection");
+
+    // Now the real measurement: a 502 followed by a 200 on a POOLED client. If
+    // the 502 still said `Connection: close`, the client would retire the
+    // connection and this window would cost two connections instead of one.
+    let before =
+        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await;
+
+    let resp = client
+        .get(format!("http://{}/", import_addr))
+        .header("Host", "nonexistent.test")
+        .send()
+        .await
+        .expect("502 request failed");
+    assert_eq!(resp.status(), 502, "unroutable Host must be refused");
+    assert_ne!(
+        resp.headers()
+            .get(reqwest::header::CONNECTION)
+            .map(|v| v.as_bytes()),
+        Some(b"close".as_ref()),
+        "the multiroute 502 must not tell the client to hang up"
+    );
+    // Drain so the connection can return to the pool.
+    let _ = resp.bytes().await.unwrap();
+
+    let resp = client
+        .get(format!("http://{}/", import_addr))
+        .header("Host", "host-a.test")
+        .send()
+        .await
+        .expect("follow-up request failed");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("backend-a"), "got: {body}");
+
+    let opened = common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5))
+        .await
+        - before;
+    assert_eq!(
+        opened, per_connection,
+        "the 502 must leave the connection reusable: two requests should cost the \
+         same as one connection ({per_connection}), but cost {opened}"
+    );
+
+    shutdown_token.cancel();
+    export_task.abort();
+    import_task.abort();
+}
+
+/// Spin up a multiroute pair with a caller-supplied config and a raw TCP backend
+/// driven by `serve`, which owns the response bytes it writes.
+async fn spawn_multiroute_with<F, Fut>(
+    dns: &'static str,
+    config: BridgeConfig,
+    shutdown_token: &CancellationToken,
+    serve: F,
+) -> SocketAddr
+where
+    F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let serve = Arc::new(serve);
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            let serve = serve.clone();
+            tokio::spawn(async move { serve(sock).await });
+        }
+    });
+
+    let config = Arc::new(config);
+    let service = common::unique_service_name("mrcfg");
+    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+
+    let s1 = session1.clone();
+    let t1 = shutdown_token.child_token();
+    let spec = format!("{}/{}/{}", service, dns, backend_addr);
+    let bc = config.clone();
+    tokio::spawn(async move {
+        let _ = zenoh_bridge_tcp::export::run_http_export_mode(s1, &spec, bc, t1).await;
+    });
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let s2 = session2.clone();
+    let t2 = shutdown_token.child_token();
+    let spec_import = format!("{}/{}", service, import_addr);
+    tokio::spawn(async move {
+        let _ =
+            zenoh_bridge_tcp::import::run_http_multiroute_import_mode(s2, &spec_import, config, t2)
+                .await;
+    });
+    common::wait_for_port(import_addr, Duration::from_secs(10))
+        .await
+        .expect("multiroute listener never bound");
+    // Leak the sessions for the test's lifetime; dropping them would tear the
+    // bridges down underneath it.
+    std::mem::forget((session1, session2));
+    import_addr
+}
+
+/// B2 regression: a response that keeps trickling must NOT be killed just
+/// because the exchange has been running a while.
+///
+/// The budget was computed once and used as an absolute deadline, so any
+/// response still streaming when it expired died with "Response timeout" even
+/// while bytes were actively arriving — large downloads, SSE, long polls. It is
+/// now an idle budget, refreshed on every response sample. The test uses a short
+/// budget and a backend that trickles for several times that long: under the old
+/// behaviour the exchange is cut off mid-body; under the fix it completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiroute_streaming_response_outlives_the_idle_budget() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+
+    const CHUNKS: usize = 10;
+    const CHUNK: &str = "0123456789";
+
+    let config = BridgeConfig {
+        // Far shorter than the total stream below, but longer than each gap.
+        response_idle_timeout: Duration::from_millis(600),
+        ..BridgeConfig::default()
+    };
+
+    let import_addr = spawn_multiroute_with(
+        "slow.test",
+        config,
+        &shutdown_token,
+        |mut sock| async move {
+            // Read the request head, then trickle a fixed-length body out slowly.
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                CHUNKS * CHUNK.len()
+            );
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            for _ in 0..CHUNKS {
+                // Well inside the idle budget, but the total run is many times it.
+                sleep(Duration::from_millis(200)).await;
+                if sock.write_all(CHUNK.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+        },
+    )
+    .await;
+
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let resp = common::get_through_bridge(
+        &client,
+        &format!("http://{}/", import_addr),
+        Some("slow.test"),
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("streaming request failed");
+
+    assert_eq!(resp.status(), 200, "a trickling response must not 504");
+    let body = resp.text().await.expect("body must arrive complete");
+    assert_eq!(
+        body.len(),
+        CHUNKS * CHUNK.len(),
+        "the whole streamed body must arrive, got {} bytes: {body:?}",
+        body.len()
+    );
+
+    shutdown_token.cancel();
+}
+
+/// B6 regression: `max_response_size` is enforced BEFORE the excess is written.
+///
+/// The check used to run after `write_all`, so the cap could be overshot by a
+/// whole chunk — the bytes were already on the client's wire by the time the
+/// bridge noticed. Trailers were counted but never checked at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multiroute_response_size_cap_is_not_overshot() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+
+    const CAP: usize = 4096;
+    const BODY: usize = 200_000;
+
+    let config = BridgeConfig {
+        max_response_size: CAP,
+        ..BridgeConfig::default()
+    };
+
+    let import_addr =
+        spawn_multiroute_with("big.test", config, &shutdown_token, |mut sock| async move {
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {BODY}\r\n\r\n");
+            if sock.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            // One big chunk: the old code wrote it whole, then noticed the cap.
+            let _ = sock.write_all(&vec![b'x'; BODY]).await;
+        })
+        .await;
+
+    // Raw socket: a client library would reject the truncated body, and it is
+    // the byte count on the wire that is under test.
+    let received = common::retry_client(
+        || async {
+            let mut sock = tokio::net::TcpStream::connect(import_addr).await?;
+            sock.write_all(b"GET / HTTP/1.1\r\nHost: big.test\r\n\r\n")
+                .await?;
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                match tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await {
+                    Ok(Ok(0)) | Err(_) => break,
+                    Ok(Ok(n)) => got.extend_from_slice(&buf[..n]),
+                    Ok(Err(e)) => return Err(e),
+                }
+            }
+            if got.starts_with(b"HTTP/1.1 502") {
+                return Err(std::io::Error::other("backend not announced yet"));
+            }
+            Ok(got)
+        },
+        common::BACKEND_READY_TIMEOUT,
+        "capped response",
+    )
+    .await
+    .expect("request failed");
+
+    assert!(
+        received.starts_with(b"HTTP/1.1 200"),
+        "expected the response head through: {:?}",
+        String::from_utf8_lossy(&received[..received.len().min(60)])
+    );
+    assert!(
+        received.len() <= CAP,
+        "the cap must not be overshot: wrote {} bytes with a {CAP}-byte cap",
+        received.len()
+    );
+    assert!(
+        received.len() < BODY,
+        "the response must actually be truncated, got {} bytes",
+        received.len()
+    );
+
+    shutdown_token.cancel();
 }

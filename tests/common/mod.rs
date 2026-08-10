@@ -470,3 +470,26 @@ impl BridgePair {
         self.import.kill_and_wait().await;
     }
 }
+
+/// Sample `probe` until it stops changing, then return the settled value.
+///
+/// For counters that a still-finishing background task may still bump: reading
+/// one straight away can capture a value that is about to move, which turns an
+/// exact assertion into a flaky one.
+pub async fn wait_for_stable<T, F>(mut probe: F, timeout: Duration) -> T
+where
+    F: FnMut() -> T,
+    T: PartialEq + Copy,
+{
+    let start = std::time::Instant::now();
+    let mut last = probe();
+    while start.elapsed() < timeout {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = probe();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    last
+}

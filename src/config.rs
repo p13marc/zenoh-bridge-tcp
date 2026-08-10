@@ -76,8 +76,25 @@ pub struct BridgeConfig {
     pub drain_timeout: Duration,
 
     /// Maximum response size for multiroute HTTP mode (default: 10 MiB).
-    /// Responses exceeding this limit receive HTTP 502.
+    ///
+    /// A response that would exceed this is **truncated** at the limit and the
+    /// connection is closed — no error status is sent, because the response head
+    /// has long since been relayed to the client by the time a body grows past
+    /// the cap. (This previously claimed a 502, which the code cannot and does
+    /// not send.)
     pub max_response_size: usize,
+
+    /// How long a `route=request` exchange may go with **no response data**
+    /// before it is abandoned with a 504 (default: 30 seconds).
+    ///
+    /// This is an *idle* budget, refreshed every time a response sample
+    /// arrives. It used to be an absolute deadline computed once per exchange,
+    /// which killed any response still streaming after 30s — a large download,
+    /// an SSE stream, a long poll — while bytes were actively flowing.
+    ///
+    /// Deliberately not a CLI flag: it is a safety net, not a tuning knob. It is
+    /// a field so tests can shrink it.
+    pub response_idle_timeout: Duration,
 
     /// Per-connection Zenoh reception buffer depth in samples (default: 256).
     ///
@@ -102,6 +119,7 @@ impl Default for BridgeConfig {
             availability_timeout: Duration::from_millis(1000),
             drain_timeout: Duration::from_secs(5),
             max_response_size: 10 * 1024 * 1024, // 10 MiB
+            response_idle_timeout: Duration::from_secs(30),
             rx_channel_capacity: 256,
         }
     }

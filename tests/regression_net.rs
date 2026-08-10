@@ -94,26 +94,16 @@ async fn large_transfer_is_byte_exact() {
     let stream = TcpStream::connect(pair.import_addr).await.unwrap();
     let (mut rd, mut wr) = stream.into_split();
 
-    // Handshake on THIS connection before the bulk write, and wait for the echo.
+    // Blast immediately on a fresh connection — no per-connection handshake.
     //
-    // Every connection gets its own `{service}/tx/{client_id}` key, so the
-    // warm-up above does not help this one: the export side only subscribes
-    // after it observes this client's liveliness token, a few ms after the
-    // import bridge starts publishing. Bytes published into that window are
-    // recoverable only from the publisher cache, which holds `cache_size`
-    // (default 256) SAMPLES — a 1 MiB blast is far more samples than that, so
-    // the export used to receive just the cached tail (~435 KB of the 1 MiB),
-    // relay it, and report `outcome="completed"`, leaving the client's
-    // `read_exact` at an early EOF. A round trip proves the export is attached
-    // and draining before the bulk starts.
-    wr.write_all(b"ready?").await.unwrap();
-    let mut ack = [0u8; 6];
-    tokio::time::timeout(Duration::from_secs(20), rd.read_exact(&mut ack))
-        .await
-        .expect("export side never attached to this connection")
-        .expect("handshake read");
-    assert_eq!(&ack, b"ready?");
-
+    // This is the shape that used to lose bytes. Every connection gets its own
+    // `{service}/tx/{client_id}` key, so the warm-up above does not help this
+    // one: the export side subscribes only after it observes this client's
+    // liveliness token, a few ms after the import bridge starts publishing.
+    // Bytes published into that window were recoverable only from the publisher
+    // cache (`cache_size`, 256 SAMPLES), so a 1 MiB blast arrived truncated and
+    // was relayed as if complete. The relay now waits for a matching subscriber
+    // before forwarding, which closes that window.
     let w_payload = payload.clone();
     let writer = tokio::spawn(async move {
         wr.write_all(&w_payload).await.unwrap();

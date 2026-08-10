@@ -218,3 +218,85 @@ async fn idle_listener_reaps_and_stays_healthy() {
         .expect("second read failed");
     assert_eq!(&buf[..n], b"pong");
 }
+
+/// B4 regression: an idle client must not be able to pin the observability
+/// server's resources, and must not be able to starve it.
+///
+/// `handle_conn` used to read until end-of-headers with **no timeout**, and
+/// connections were spawned with **no cap** — so a peer that connected and then
+/// said nothing held a task and a file descriptor indefinitely, and enough of
+/// them would exhaust the process. Every other reader in this codebase is
+/// bounded (the data plane calls this out explicitly as F4/D3); this server was
+/// simply missed.
+///
+/// The test parks a batch of silent connections and asserts (a) the server keeps
+/// answering, and (b) the silent connections are hung up on rather than held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metrics_server_hangs_up_on_idle_clients_and_stays_available() {
+    let port = common::PortGuard::new();
+    let metrics_addr = port.release();
+    let metrics_addr_str = metrics_addr.to_string();
+
+    let mut child = common::bridge_command()
+        .args([
+            "--backend",
+            "idlesvc/127.0.0.1:1",
+            "--metrics-addr",
+            &metrics_addr_str,
+            // Keep the test quick: the read bound is what is under test.
+            "--read-timeout",
+            "1",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("Failed to spawn bridge");
+
+    common::wait_for_port(metrics_addr, Duration::from_secs(10))
+        .await
+        .expect("metrics server did not start");
+
+    // Park connections that connect and then say nothing at all.
+    let mut idle = Vec::new();
+    for _ in 0..16 {
+        match tokio::net::TcpStream::connect(metrics_addr).await {
+            Ok(s) => idle.push(s),
+            Err(_) => break,
+        }
+    }
+    assert!(!idle.is_empty(), "could not open any idle connections");
+
+    // The server must still serve a real request while they are parked.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{metrics_addr}/healthz"))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .expect("/healthz must still answer while idle clients are parked");
+    assert_eq!(resp.status(), 200);
+
+    // And each idle connection must be closed by the server rather than held
+    // open forever. Reading returns 0 (clean close) once it hangs up.
+    let closed = tokio::time::timeout(Duration::from_secs(30), async {
+        let mut closed = 0usize;
+        for mut s in idle {
+            let mut buf = [0u8; 64];
+            // The server sends nothing, so a clean EOF is the close signal.
+            if let Ok(Ok(0)) = tokio::time::timeout(Duration::from_secs(25), s.read(&mut buf)).await
+            {
+                closed += 1;
+            }
+        }
+        closed
+    })
+    .await
+    .expect("timed out waiting for the server to hang up on idle clients");
+
+    assert!(
+        closed > 0,
+        "the server held every idle connection open; it must bound the read"
+    );
+
+    let _ = child.kill().await;
+}
