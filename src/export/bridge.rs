@@ -68,22 +68,96 @@ pub(super) async fn run_export_loop(
         .map_err(|e| anyhow::anyhow!("Failed to declare service liveliness: {}", e))?;
     debug!(service_key = %service_key, "Declared service availability");
 
-    let liveliness_subscriber = session
-        .liveliness()
-        .declare_subscriber(&liveliness_key)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
-
-    info!(liveliness_key = %liveliness_key, "Export bridge ready");
+    // Elect ONE active exporter per scope (A3): without this, two exporters
+    // announcing the same scope both served every client — doubled request
+    // execution and sample-interleaved responses. The scope is the service, or
+    // service/host for an @host backend.
+    let scope = match &dns_suffix {
+        Some(dns) => format!("{service_name}/{dns}"),
+        None => service_name.to_string(),
+    };
+    let mut claim = super::election::Claim::establish(&session, &scope).await?;
 
     // Track connection tasks and cancellation senders per client ID
     let cancellation_senders: Arc<Mutex<HashMap<String, CancellationSender>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Query existing clients that connected before this export started
+    // Role loop: stand by until elected, serve until demoted or shut down.
+    loop {
+        if !claim.is_active() {
+            info!(
+                scope = %scope,
+                active = %claim.current_active().unwrap_or_else(|| "-".into()),
+                "Standing by: another exporter is active for this scope"
+            );
+            match claim.wait_until_active(&shutdown_token).await {
+                super::election::WaitOutcome::Active => {}
+                super::election::WaitOutcome::Shutdown => break,
+            }
+        }
+        info!(scope = %scope, "Elected active exporter");
+
+        match serve_active(
+            &session,
+            service_name,
+            &liveliness_key,
+            &backend,
+            &cancellation_senders,
+            &config,
+            &shutdown_token,
+            &mut claim,
+        )
+        .await?
+        {
+            ServeEnd::Shutdown => break,
+            ServeEnd::Demoted => {
+                warn!(
+                    scope = %scope,
+                    "Demoted: an older exporter claim appeared; draining local connections"
+                );
+                drain_all_clients(&cancellation_senders, config.drain_timeout).await;
+            }
+        }
+    }
+
+    info!(service = %service_name, "Export bridge stopped");
+    Ok(())
+}
+
+/// Why the active serving phase ended.
+enum ServeEnd {
+    Shutdown,
+    Demoted,
+}
+
+/// The active exporter's serving phase: replay existing client tokens, then
+/// follow the live liveliness stream — until shutdown or demotion.
+#[allow(clippy::too_many_arguments)]
+async fn serve_active(
+    session: &Arc<Session>,
+    service_name: &str,
+    liveliness_key: &str,
+    backend: &ExportBackend,
+    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    config: &Arc<BridgeConfig>,
+    shutdown_token: &CancellationToken,
+    claim: &mut super::election::Claim,
+) -> Result<ServeEnd> {
+    // Subscribe FIRST, then query: tokens appearing during the query are
+    // caught by the subscriber (duplicates are dedeuped by dispatch).
+    let liveliness_subscriber = session
+        .liveliness()
+        .declare_subscriber(liveliness_key)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to subscribe to liveliness: {}", e))?;
+
+    info!(liveliness_key = %liveliness_key, "Export bridge ready");
+
+    // Query existing clients — connected before this export started, or
+    // waiting through a failover from the previous active exporter.
     let existing_clients = session
         .liveliness()
-        .get(&liveliness_key)
+        .get(liveliness_key)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to query existing clients: {}", e))?;
 
@@ -101,20 +175,20 @@ pub(super) async fn run_export_loop(
                 let client_id = client_id.to_string();
                 info!(client_id = %client_id, "Found existing client, connecting");
                 dispatch_client_connect(
-                    &session,
+                    session,
                     service_name,
-                    &backend,
+                    backend,
                     &client_id,
-                    &cancellation_senders,
-                    &config,
+                    cancellation_senders,
+                    config,
                 )
                 .await;
             }
         }
     }
 
-    // Main loop: monitor liveliness and create/destroy connections
-    loop {
+    // Main loop: monitor liveliness and create/destroy connections.
+    let end = loop {
         tokio::select! {
             result = liveliness_subscriber.recv_async() => {
                 match result {
@@ -128,17 +202,17 @@ pub(super) async fn run_export_loop(
                             match sample.kind() {
                                 zenoh::sample::SampleKind::Put => {
                                     dispatch_client_connect(
-                                        &session,
+                                        session,
                                         service_name,
-                                        &backend,
+                                        backend,
                                         &client_id,
-                                        &cancellation_senders,
-                                        &config,
+                                        cancellation_senders,
+                                        config,
                                     )
                                     .await;
                                 }
                                 zenoh::sample::SampleKind::Delete => {
-                                    handle_client_disconnect(&client_id, &cancellation_senders).await;
+                                    handle_client_disconnect(&client_id, cancellation_senders).await;
                                 }
                             }
                         }
@@ -149,41 +223,53 @@ pub(super) async fn run_export_loop(
                     }
                 }
             }
+            // Demotion watch: a smaller (older) claim appearing — clock skew or
+            // a healed partition — means another exporter is now authoritative.
+            still_active = claim.changed_still_active() => {
+                if !still_active {
+                    break ServeEnd::Demoted;
+                }
+            }
             _ = shutdown_token.cancelled() => {
                 info!(service = %service_name, "Export bridge shutting down");
-                // Collect senders and handles, then release the lock before awaiting
-                let entries: Vec<(String, CancellationSender)> =
-                    cancellation_senders.lock().await.drain().collect();
-
-                // Send cancellation signals
-                for (client_id, (tx, _)) in &entries {
-                    let _ = tx.send(()).await;
-                    debug!(client_id = %client_id, "Sent shutdown to client bridge");
-                }
-
-                // Wait for all task handles against ONE shared deadline: the
-                // tasks drain concurrently, so serial per-task budgets would
-                // make N stuck clients cost N x drain_timeout.
-                let deadline = tokio::time::Instant::now() + config.drain_timeout;
-                for (client_id, (_, handle)) in entries {
-                    match tokio::time::timeout_at(deadline, handle).await {
-                        Ok(Ok(())) => debug!(client_id = %client_id, "Client bridge drained"),
-                        Ok(Err(e)) => warn!(client_id = %client_id, error = %e, "Client bridge task error during drain"),
-                        Err(_) => warn!(client_id = %client_id, "Client bridge drain timeout"),
-                    }
-                }
-                break;
+                drain_all_clients(cancellation_senders, config.drain_timeout).await;
+                break ServeEnd::Shutdown;
             }
         }
-    }
+    };
 
-    // Explicitly undeclare liveliness subscriber
+    // Stop reacting to client tokens while inactive.
     if let Err(e) = liveliness_subscriber.undeclare().await {
         debug!(service = %service_name, error = %e, "Error undeclaring liveliness subscriber");
     }
+    Ok(end)
+}
 
-    info!(service = %service_name, "Export bridge stopped");
-    Ok(())
+/// Cancel every tracked client bridge and wait for them against one shared
+/// deadline (they drain concurrently; serial budgets would multiply).
+async fn drain_all_clients(
+    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    drain_timeout: std::time::Duration,
+) {
+    // Collect senders and handles, then release the lock before awaiting.
+    let entries: Vec<(String, CancellationSender)> =
+        cancellation_senders.lock().await.drain().collect();
+
+    for (client_id, (tx, _)) in &entries {
+        let _ = tx.send(()).await;
+        debug!(client_id = %client_id, "Sent shutdown to client bridge");
+    }
+
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    for (client_id, (_, handle)) in entries {
+        match tokio::time::timeout_at(deadline, handle).await {
+            Ok(Ok(())) => debug!(client_id = %client_id, "Client bridge drained"),
+            Ok(Err(e)) => {
+                warn!(client_id = %client_id, error = %e, "Client bridge task error during drain")
+            }
+            Err(_) => warn!(client_id = %client_id, "Client bridge drain timeout"),
+        }
+    }
 }
 
 /// Dispatch a client `Put`: dedupe, then register-and-spawn.

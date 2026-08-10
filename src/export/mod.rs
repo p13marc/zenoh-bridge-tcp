@@ -15,6 +15,7 @@
 //!   peer token and waits up to `drain_timeout` before a final `.abort()` fallback.
 
 mod bridge;
+mod election;
 mod tcp;
 mod ws;
 
