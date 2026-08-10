@@ -27,67 +27,6 @@ fn scoped_key(service_name: &str, dns: Option<&str>, tail: &str) -> String {
     }
 }
 
-/// Wait until `publisher` has a matching subscriber, bounded by `timeout`.
-///
-/// Each connection publishes on a **fresh** `{service}/tx/{client_id}` key, and
-/// the export side only subscribes after it observes this client's liveliness
-/// token — a few milliseconds later. Relaying into that window published bytes
-/// nowhere recoverable except the publisher's cache, which holds `cache_size`
-/// *samples*: a burst larger than the cache reached the backend truncated and
-/// was still reported as a clean completion, silently breaking the byte-exact
-/// guarantee `ReliabilityMode::Stream` exists to provide.
-///
-/// Best-effort by design: on timeout we relay anyway, which is exactly the
-/// previous behaviour. This can only ever reduce loss — it never converts a
-/// working connection into a stalled one.
-///
-/// Only `Stream` gates: `Telemetry` is explicitly loss-tolerant, so making it
-/// pay setup latency to avoid a loss it accepts by definition would be a
-/// straight regression.
-pub(super) async fn await_matching_subscriber<T>(
-    publisher: &zenoh_ext::AdvancedPublisher<'_>,
-    reliability: ReliabilityMode,
-    timeout: std::time::Duration,
-    what: T,
-) where
-    T: std::fmt::Display,
-{
-    if reliability != ReliabilityMode::Stream {
-        return;
-    }
-
-    let started = tokio::time::Instant::now();
-    let deadline = started + timeout;
-    loop {
-        // Bound the query itself, not just the loop. `matching_status()` is an
-        // async round-trip through the session: if it stays pending, a loop that
-        // only checks its deadline *between* attempts never gets to check it
-        // again, and a bounded wait silently becomes a hung connection.
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, publisher.matching_status()).await {
-            Ok(Ok(status)) if status.matching() => {
-                debug!(
-                    waited_ms = started.elapsed().as_millis() as u64,
-                    "Backend subscriber attached"
-                );
-                return;
-            }
-            // Not yet, or the query failed or timed out — a failed status says
-            // nothing about the peer, so let the deadline below decide.
-            _ => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            warn!(
-                what = %what,
-                timeout_ms = timeout.as_millis() as u64,
-                "No subscriber matched in time; relaying anyway (bytes sent now may be lost)"
-            );
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    }
-}
-
 /// Shared bidirectional bridging logic for import connections.
 ///
 /// This function handles the Zenoh pub/sub setup and bidirectional data bridging
@@ -115,8 +54,13 @@ where
     // IMPORTANT: Subscribe to error channel FIRST, before declaring liveliness
     // This prevents race condition where export bridge publishes error before we're subscribed
     let error_key = scoped_key(service_name, dns, &format!("error/{client_id}"));
+    // Advanced with history (A1/R1): the export publishes this signal within
+    // microseconds of learning we exist — before our subscriber interest may
+    // have reached its session. The export caches the signal on an Advanced
+    // publisher; querying history here recovers a put we raced.
     let error_subscriber = session
         .declare_subscriber(&error_key)
+        .history(HistoryConfig::default().detect_late_publishers())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to subscribe to error channel: {}", e))?;
 
@@ -189,7 +133,7 @@ where
     // token above. Relay nothing until it has: bytes published before then are
     // recoverable only from the publisher cache, and a burst larger than the
     // cache used to reach the backend truncated but reported as complete.
-    await_matching_subscriber(
+    crate::zenoh_util::await_matching_subscriber(
         &publisher,
         config.reliability,
         config.availability_timeout,
@@ -283,7 +227,11 @@ where
                                 let payload = sample.payload().to_bytes();
                                 if payload.is_empty() {
                                     debug!("Backend half-close, sending FIN to client");
-                                    let _ = writer.send_eof().await;
+                                    if writer.send_eof().await.is_err() {
+                                        // The half-close never reached the client:
+                                        // that is a reset, not a completion.
+                                        z2c_cancel.cancel();
+                                    }
                                     break;
                                 }
                                 svc_z2c.add_down(payload.len());
@@ -331,7 +279,11 @@ where
                         match result {
                             Ok(data) if data.is_empty() => {
                                 debug!("Client half-close, sending EOF to Zenoh");
-                                let _ = publisher.put(Vec::<u8>::new()).await;
+                                if publisher.put(Vec::<u8>::new()).await.is_err() {
+                                    // The backend never learned of the half-close:
+                                    // reset rather than report a completion.
+                                    c2z_cancel.cancel();
+                                }
                                 break;
                             }
                             Ok(data) => {
@@ -345,8 +297,12 @@ where
                                 }
                             }
                             Err(e) => {
+                                // Deliberately NO clean-EOF marker here: a client
+                                // crash must not look like a well-formed FIN to
+                                // the backend (it would treat a truncated request
+                                // as complete). The reset propagates via the
+                                // liveliness token this task tears down.
                                 error!(error = %e, "Read error from client");
-                                let _ = publisher.put(Vec::<u8>::new()).await;
                                 c2z_cancel.cancel();
                                 break;
                             }

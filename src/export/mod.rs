@@ -34,6 +34,7 @@ use zenoh::Session;
 pub(super) type CancellationSender = (mpsc::Sender<()>, tokio::task::JoinHandle<()>);
 
 /// Backend type for export mode, determines how client connections are established
+#[derive(Clone)]
 pub(super) enum ExportBackend {
     Tcp {
         addr: SocketAddr,

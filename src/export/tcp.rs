@@ -1,90 +1,56 @@
-use super::CancellationSender;
+//! TCP backend dialing for the export side.
+//!
+//! Just the dial: retry policy, per-attempt bound, transport wrapping. The
+//! caller (`bridge::spawn_client`) owns tracking, cancellation, and failure
+//! signalling, and runs this **inside** the per-client task so a slow dial can
+//! never stall the liveliness loop.
+
 use crate::config::BridgeConfig;
+use crate::transport::{TcpReader, TcpWriter};
+use anyhow::Result;
 use backon::{ExponentialBuilder, Retryable};
-use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tracing::{error, info, info_span, warn};
-use zenoh::Session;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tracing::{info, warn};
 
-/// Handle a client connection event for TCP backends
-pub(super) async fn handle_client_connect(
-    session: &Arc<Session>,
-    service_name: &str,
+/// Dial a TCP backend with retries, each attempt bounded by
+/// `config.connect_timeout` (backon bounds attempts and inter-attempt delay,
+/// not attempt duration — a blackholed address would otherwise run each
+/// attempt to the OS SYN timeout).
+pub(super) async fn dial(
     backend_addr: SocketAddr,
     client_id: &str,
-    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
-    dns_suffix: Option<&str>,
-    config: &Arc<BridgeConfig>,
-) {
-    info!(client_id = %client_id, "Client connected, connecting to backend");
-
-    // Retry backend connection with exponential backoff
+    config: &BridgeConfig,
+) -> Result<(TcpReader<OwnedReadHalf>, TcpWriter<OwnedWriteHalf>)> {
+    let connect_timeout = config.connect_timeout;
     let client_id_for_log = client_id.to_string();
-    let connect_result = (|| async { TcpStream::connect(backend_addr).await })
-        .retry(
-            ExponentialBuilder::default()
-                .with_min_delay(Duration::from_millis(100))
-                .with_max_delay(Duration::from_secs(5))
-                .with_max_times(5),
-        )
-        .notify(move |err, dur| {
-            warn!(
-                client_id = %client_id_for_log,
-                backend = %backend_addr,
-                error = %err,
-                retry_in = ?dur,
-                "Backend connection failed, retrying"
-            );
-        })
-        .await;
+    let stream = (|| async {
+        tokio::time::timeout(connect_timeout, TcpStream::connect(backend_addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "backend connect timed out")
+            })?
+    })
+    .retry(
+        ExponentialBuilder::default()
+            .with_min_delay(Duration::from_millis(100))
+            .with_max_delay(Duration::from_secs(5))
+            .with_max_times(5),
+    )
+    .notify(move |err, dur| {
+        warn!(
+            client_id = %client_id_for_log,
+            backend = %backend_addr,
+            error = %err,
+            retry_in = ?dur,
+            "Backend connection failed, retrying"
+        );
+    })
+    .await?;
 
-    match connect_result {
-        Ok(backend_stream) => {
-            info!(client_id = %client_id, backend = %backend_addr, "Backend connection established");
-
-            let (backend_reader, backend_writer) = backend_stream.into_split();
-            let reader = crate::transport::TcpReader::new(backend_reader, config.buffer_size);
-            let writer = crate::transport::TcpWriter::new(backend_writer);
-
-            let span = info_span!(
-                "client_bridge",
-                client_id = %client_id,
-                service = %service_name,
-                backend = %backend_addr,
-                dns = dns_suffix.unwrap_or("-")
-            );
-
-            // Cancel any prior connection, spawn the bridge, and track it so it
-            // frees its own map entry on completion (D1).
-            super::bridge::spawn_and_track(
-                session.clone(),
-                service_name.to_string(),
-                client_id.to_string(),
-                reader,
-                writer,
-                dns_suffix.map(|s| s.to_string()),
-                config.clone(),
-                cancellation_senders,
-                span,
-            )
-            .await;
-        }
-        Err(e) => {
-            // The client_bridge span is built here but only entered by the
-            // spawned bridge, so this path names the client itself.
-            error!(client_id = %client_id, error = %e, "Failed to connect to backend after retries");
-
-            // Publish error signal to notify import bridge
-            let dns_part = dns_suffix.map(|d| format!("/{}", d)).unwrap_or_default();
-            let error_key = format!("{}{}/error/{}", service_name, dns_part, client_id);
-            if let Err(pub_err) = session.put(&error_key, "backend_unavailable").await {
-                error!(client_id = %client_id, key = %error_key, error = %pub_err, "Failed to publish error signal");
-            }
-            info!(client_id = %client_id, "Sent backend unavailable signal");
-        }
-    }
+    info!(backend = %backend_addr, "Backend connection established");
+    let (r, w) = stream.into_split();
+    Ok((TcpReader::new(r, config.buffer_size), TcpWriter::new(w)))
 }

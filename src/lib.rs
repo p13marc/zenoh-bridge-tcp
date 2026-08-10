@@ -7,7 +7,6 @@ pub mod args;
 pub(crate) mod backpressure;
 pub mod config;
 pub mod dns;
-pub mod error;
 pub mod export;
 pub mod http_util;
 pub mod import;
@@ -17,3 +16,4 @@ pub mod spec;
 #[cfg(feature = "tls-termination")]
 pub mod tls_config;
 pub mod transport;
+pub(crate) mod zenoh_util;

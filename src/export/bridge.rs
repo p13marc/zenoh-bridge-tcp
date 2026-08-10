@@ -3,7 +3,6 @@ use crate::config::{BridgeConfig, ReliabilityMode};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, warn};
@@ -88,7 +87,12 @@ pub(super) async fn run_export_loop(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to query existing clients: {}", e))?;
 
-    while let Ok(reply) = existing_clients.recv_async().await {
+    loop {
+        let reply = tokio::select! {
+            r = existing_clients.recv_async() => match r { Ok(r) => r, Err(_) => break },
+            // Shutdown requested during startup must not wait out the query.
+            _ = shutdown_token.cancelled() => break,
+        };
         if let Ok(sample) = reply.into_result() {
             let key = sample.key_expr().as_str();
             if let Some(client_id) = key.rsplit('/').next()
@@ -134,7 +138,7 @@ pub(super) async fn run_export_loop(
                                     .await;
                                 }
                                 zenoh::sample::SampleKind::Delete => {
-                                    handle_client_disconnect(&client_id, &cancellation_senders, config.drain_timeout).await;
+                                    handle_client_disconnect(&client_id, &cancellation_senders).await;
                                 }
                             }
                         }
@@ -157,9 +161,12 @@ pub(super) async fn run_export_loop(
                     debug!(client_id = %client_id, "Sent shutdown to client bridge");
                 }
 
-                // Wait for all task handles to drain
+                // Wait for all task handles against ONE shared deadline: the
+                // tasks drain concurrently, so serial per-task budgets would
+                // make N stuck clients cost N x drain_timeout.
+                let deadline = tokio::time::Instant::now() + config.drain_timeout;
                 for (client_id, (_, handle)) in entries {
-                    match tokio::time::timeout(config.drain_timeout, handle).await {
+                    match tokio::time::timeout_at(deadline, handle).await {
                         Ok(Ok(())) => debug!(client_id = %client_id, "Client bridge drained"),
                         Ok(Err(e)) => warn!(client_id = %client_id, error = %e, "Client bridge task error during drain"),
                         Err(_) => warn!(client_id = %client_id, "Client bridge drain timeout"),
@@ -179,7 +186,18 @@ pub(super) async fn run_export_loop(
     Ok(())
 }
 
-/// Dispatch a client connection to the appropriate backend handler
+/// Dispatch a client `Put`: dedupe, then register-and-spawn.
+///
+/// Client ids are fresh UUIDs minted per accepted TCP connection, so a `Put`
+/// for an id already in the map can never be a new connection — it is a
+/// re-delivery (the startup query overlapping the live subscriber, or a router
+/// refresh). The old behaviour cancelled and redialed, resetting a healthy
+/// connection mid-stream; now it is skipped.
+///
+/// Everything slow — the backend dial, the bridge itself — runs INSIDE the
+/// spawned task, so the liveliness loop stays responsive no matter how slow a
+/// backend is to answer (previously one blackholed dial deafened the whole
+/// export, clients and shutdown alike, for minutes).
 async fn dispatch_client_connect(
     session: &Arc<Session>,
     service_name: &str,
@@ -188,31 +206,225 @@ async fn dispatch_client_connect(
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
     config: &Arc<BridgeConfig>,
 ) {
-    match backend {
-        ExportBackend::Tcp { addr, dns_suffix } => {
-            super::tcp::handle_client_connect(
-                session,
-                service_name,
-                *addr,
-                client_id,
-                cancellation_senders,
-                dns_suffix.as_deref(),
-                config,
-            )
-            .await;
+    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
+    let self_remove_tx = cancel_tx.clone();
+    let map = cancellation_senders.clone();
+    let task_session = session.clone();
+    let task_service = service_name.to_string();
+    let task_backend = backend.clone();
+    let task_client = client_id.to_string();
+    let task_config = config.clone();
+
+    // Hold the lock across the dedupe check AND the spawn+insert: the check
+    // and the insert must be atomic against a concurrent duplicate, and the
+    // task's self-removal takes this same lock so it cannot outrun its insert.
+    let mut guard = cancellation_senders.lock().await;
+    if guard.contains_key(client_id) {
+        debug!(client_id = %client_id, "Duplicate client Put ignored (already tracked)");
+        return;
+    }
+
+    let dns_suffix = match &task_backend {
+        ExportBackend::Tcp { dns_suffix, .. } | ExportBackend::WebSocket { dns_suffix, .. } => {
+            dns_suffix.clone()
         }
-        ExportBackend::WebSocket { url, dns_suffix } => {
-            super::ws::handle_ws_client_connect(
-                session,
-                service_name,
-                url,
-                client_id,
-                cancellation_senders,
-                dns_suffix.as_deref(),
-                config,
-            )
-            .await;
+    };
+    let span = match &task_backend {
+        ExportBackend::Tcp { addr, .. } => tracing::info_span!(
+            "client_bridge",
+            client_id = %client_id,
+            service = %service_name,
+            backend = %addr,
+            dns = dns_suffix.as_deref().unwrap_or("-")
+        ),
+        ExportBackend::WebSocket { url, .. } => tracing::info_span!(
+            "ws_client_bridge",
+            client_id = %client_id,
+            service = %service_name,
+            dns = %dns_suffix.as_deref().unwrap_or("-"),
+            ws_url = %url
+        ),
+    };
+
+    let handle = tokio::spawn(
+        run_client(
+            task_session,
+            task_service,
+            task_backend,
+            task_client,
+            cancel_rx,
+            task_config,
+            map,
+            self_remove_tx,
+        )
+        .instrument(span),
+    );
+    guard.insert(client_id.to_string(), (cancel_tx, handle));
+}
+
+/// The whole life of one exported client connection: dial (cancellable,
+/// per-attempt bounded), bridge, signal failures, self-remove.
+#[allow(clippy::too_many_arguments)]
+async fn run_client(
+    session: Arc<Session>,
+    service_name: String,
+    backend: ExportBackend,
+    client_id: String,
+    mut cancel_rx: mpsc::Receiver<()>,
+    config: Arc<BridgeConfig>,
+    map: Arc<Mutex<HashMap<String, CancellationSender>>>,
+    self_remove_tx: mpsc::Sender<()>,
+) {
+    info!(client_id = %client_id, "Client connected, connecting to backend");
+    let dns_suffix = match &backend {
+        ExportBackend::Tcp { dns_suffix, .. } | ExportBackend::WebSocket { dns_suffix, .. } => {
+            dns_suffix.clone()
         }
+    };
+
+    // Anything but a clean completion notifies the import via the recoverable
+    // error signal, so its client is reset instead of hanging on a connection
+    // whose backend side no longer exists (previously only a failed DIAL
+    // signalled; setup failures and mid-stream resets left the client waiting
+    // forever, holding an import-side connection slot).
+    let signal_error;
+
+    match &backend {
+        ExportBackend::Tcp { addr, .. } => {
+            let dialed = tokio::select! {
+                r = super::tcp::dial(*addr, &client_id, &config) => r,
+                _ = cancel_rx.recv() => {
+                    debug!(client_id = %client_id, "Cancelled during backend dial");
+                    remove_self(&map, &client_id, &self_remove_tx).await;
+                    return;
+                }
+            };
+            match dialed {
+                Ok((reader, writer)) => {
+                    signal_error = !run_bridge(
+                        &session,
+                        &service_name,
+                        &client_id,
+                        reader,
+                        writer,
+                        cancel_rx,
+                        dns_suffix.as_deref(),
+                        &config,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!(client_id = %client_id, error = %e, "Failed to connect to backend after retries");
+                    signal_error = true;
+                }
+            }
+        }
+        ExportBackend::WebSocket { url, .. } => {
+            let dialed = tokio::select! {
+                r = super::ws::dial(url, &client_id, &config) => r,
+                _ = cancel_rx.recv() => {
+                    debug!(client_id = %client_id, "Cancelled during backend dial");
+                    remove_self(&map, &client_id, &self_remove_tx).await;
+                    return;
+                }
+            };
+            match dialed {
+                Ok((reader, writer)) => {
+                    signal_error = !run_bridge(
+                        &session,
+                        &service_name,
+                        &client_id,
+                        reader,
+                        writer,
+                        cancel_rx,
+                        dns_suffix.as_deref(),
+                        &config,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!(client_id = %client_id, error = %e, "Failed to connect to WebSocket backend after retries");
+                    signal_error = true;
+                }
+            }
+        }
+    }
+
+    if signal_error {
+        let dns_part = dns_suffix
+            .as_deref()
+            .map(|d| format!("/{d}"))
+            .unwrap_or_default();
+        let error_key = format!("{service_name}{dns_part}/error/{client_id}");
+        let clients_key = format!("{service_name}{dns_part}/clients/{client_id}");
+        match crate::zenoh_util::publish_error_signal(
+            &session,
+            error_key,
+            clients_key,
+            config.availability_timeout,
+            config.heartbeat_interval,
+            "backend_unavailable",
+        )
+        .await
+        {
+            Ok(()) => info!(client_id = %client_id, "Sent backend unavailable signal"),
+            Err(e) => {
+                error!(client_id = %client_id, error = %e, "Failed to publish error signal")
+            }
+        }
+    }
+
+    remove_self(&map, &client_id, &self_remove_tx).await;
+}
+
+/// Run the bridge and report whether it ended cleanly (`true` = completed).
+#[allow(clippy::too_many_arguments)]
+async fn run_bridge<R, W>(
+    session: &Arc<Session>,
+    service_name: &str,
+    client_id: &str,
+    reader: R,
+    writer: W,
+    cancel_rx: mpsc::Receiver<()>,
+    dns_suffix: Option<&str>,
+    config: &Arc<BridgeConfig>,
+) -> bool
+where
+    R: crate::transport::TransportReader,
+    W: crate::transport::TransportWriter,
+{
+    match handle_client_bridge(
+        session.clone(),
+        service_name.to_string(),
+        client_id.to_string(),
+        reader,
+        writer,
+        cancel_rx,
+        dns_suffix,
+        config.clone(),
+    )
+    .await
+    {
+        Ok(ConnectionOutcome::Completed) => true,
+        Ok(outcome) => {
+            warn!(?outcome, "Client bridge ended non-cleanly");
+            false
+        }
+        Err(e) => {
+            error!(error = %e, "Client bridge error");
+            false
+        }
+    }
+}
+
+/// D1: free our own map entry, guarded so a replacement is never clobbered.
+async fn remove_self(
+    map: &Arc<Mutex<HashMap<String, CancellationSender>>>,
+    client_id: &str,
+    own_tx: &mpsc::Sender<()>,
+) {
+    if remove_if_current(&mut *map.lock().await, client_id, own_tx) {
+        debug!(client_id = %client_id, "Freed client map entry on completion");
     }
 }
 
@@ -337,13 +549,6 @@ where
 
     debug!(key = %pub_key_str, "Declared AdvancedPublisher with cache");
 
-    // Metrics (G7): count this connection for the service; the guard decrements
-    // the active gauge on every exit path. `svc` is resolved once and cloned into
-    // each direction for lock-free per-chunk byte accounting.
-    let conn_metrics = crate::metrics::conn_start(&service_name);
-    let svc_b2z = conn_metrics.counters();
-    let svc_z2b = conn_metrics.counters();
-
     // Stream reliability: an unrecoverable sample miss means the byte stream has a
     // gap that cannot be delivered faithfully. Reset the connection rather than
     // hand corrupted bytes to the backend. The listener runs in the background for
@@ -368,6 +573,14 @@ where
             .map_err(|e| anyhow::anyhow!("Failed to register sample-miss listener: {:?}", e))?;
     }
 
+    // Metrics (G7): count this connection for the service; the guard decrements
+    // the active gauge on every exit path. Placed AFTER the last fallible setup
+    // step so a setup failure cannot inflate `connections_total` while never
+    // reporting an outcome (the counters would silently drift apart).
+    let conn_metrics = crate::metrics::conn_start(&service_name);
+    let svc_b2z = conn_metrics.counters();
+    let svc_z2b = conn_metrics.counters();
+
     // Direction: backend -> Zenoh. A clean EOF publishes the empty EOF marker so
     // the import half-closes the client and ends this direction only. A read or
     // publish error resets the whole connection.
@@ -384,7 +597,12 @@ where
                         match result {
                             Ok(data) if data.is_empty() => {
                                 debug!("Backend half-close, sending EOF to Zenoh");
-                                let _ = publisher.put(Vec::<u8>::new()).await;
+                                if publisher.put(Vec::<u8>::new()).await.is_err() {
+                                    // The import never learned of the half-close:
+                                    // reset rather than report a completion.
+                                    b2z_cancel.cancel();
+                                    break DirectionEnd::Error;
+                                }
                                 break DirectionEnd::Eof;
                             }
                             Ok(data) => {
@@ -398,9 +616,12 @@ where
                                 }
                             }
                             Err(e) => {
+                                // Deliberately NO clean-EOF marker: a truncated
+                                // backend stream must not look like a well-formed
+                                // FIN to the client. The caller publishes the
+                                // recoverable error signal instead, which resets
+                                // the import connection (A1; supersedes C1's EOF).
                                 error!(error = %e, "Read error from backend");
-                                // C1: emit EOF so the import side doesn't hang, then reset.
-                                let _ = publisher.put(Vec::<u8>::new()).await;
                                 b2z_cancel.cancel();
                                 break DirectionEnd::Error;
                             }
@@ -435,7 +656,10 @@ where
                                 let payload = sample.payload().to_bytes();
                                 if payload.is_empty() {
                                     debug!("Client half-close, sending FIN to backend");
-                                    let _ = backend_writer.send_eof().await;
+                                    if backend_writer.send_eof().await.is_err() {
+                                        z2b_cancel.cancel();
+                                        break DirectionEnd::Error;
+                                    }
                                     break DirectionEnd::Eof;
                                 }
                                 svc_z2b.add_up(payload.len());
@@ -548,106 +772,28 @@ fn remove_if_current(
     }
 }
 
-/// Spawn the per-client bridge task and record it in the cancellation map.
+/// Handle a client disconnection event: send the cancel and move on.
 ///
-/// Shared by the TCP and WebSocket export paths. Cancels any existing connection
-/// for `client_id` first, then spawns the new bridge over the given transport
-/// halves.
-///
-/// D1 (#21): the spawned task removes its **own** map entry when it completes
-/// naturally, so entries no longer live forever after a backend-first close. The
-/// removal is guarded by `mpsc::Sender::same_channel`, so a later duplicate
-/// connect that replaced the entry is never clobbered. The insert is performed
-/// under the same lock the self-removal must acquire, so a fast-completing task
-/// cannot race ahead of its own insert and leave a stale entry behind.
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn spawn_and_track<R, W>(
-    session: Arc<Session>,
-    service_name: String,
-    client_id: String,
-    reader: R,
-    writer: W,
-    dns_suffix: Option<String>,
-    config: Arc<BridgeConfig>,
-    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
-    span: tracing::Span,
-) where
-    R: crate::transport::TransportReader,
-    W: crate::transport::TransportWriter,
-{
-    // Cancel any existing connection for this client ID before spawning the new
-    // one. Take the old entry out under the lock, then drain it without holding
-    // the lock (a drain can take up to drain_timeout).
-    let existing = cancellation_senders.lock().await.remove(&client_id);
-    if let Some((old_cancel_tx, old_handle)) = existing {
-        warn!(client_id = %client_id, "Client already has active connection, cancelling old one");
-        let _ = old_cancel_tx.send(()).await;
-        let _ = tokio::time::timeout(config.drain_timeout, old_handle).await;
-    }
-
-    let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-    let self_remove_tx = cancel_tx.clone();
-    let map = cancellation_senders.clone();
-    let client_id_task = client_id.clone();
-
-    // Hold the map lock across spawn + insert. The task's self-removal acquires
-    // this same lock, so it cannot run before its entry is recorded.
-    let mut guard = cancellation_senders.lock().await;
-    let main_handle = tokio::spawn(
-        async move {
-            match handle_client_bridge(
-                session,
-                service_name,
-                client_id_task.clone(),
-                reader,
-                writer,
-                cancel_rx,
-                dns_suffix.as_deref(),
-                config,
-            )
-            .await
-            {
-                Ok(ConnectionOutcome::Completed) => {}
-                Ok(outcome) => warn!(?outcome, "Client bridge ended non-cleanly"),
-                Err(e) => error!(error = %e, "Client bridge error"),
-            }
-            // D1: free our own entry on natural completion, but only if it is
-            // still ours (guards against a duplicate-connect replacement).
-            if remove_if_current(&mut *map.lock().await, &client_id_task, &self_remove_tx) {
-                debug!(client_id = %client_id_task, "Freed client map entry on completion");
-            }
-        }
-        .instrument(span),
-    );
-    guard.insert(client_id, (cancel_tx, main_handle));
-}
-
-/// Handle a client disconnection event
+/// Deliberately does NOT await the task. The client is gone; the task tears
+/// its backend side down on its own (bounded by the connection watchdog and
+/// the bounded error-signal publish) and self-removes from the map. Awaiting
+/// it here serialized the liveliness loop behind each dying connection —
+/// one slow teardown deafened the export for every other client. The
+/// shutdown path is the one place that waits, and it drains all tasks
+/// against a single shared deadline.
 pub(super) async fn handle_client_disconnect(
     client_id: &str,
     cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
-    drain_timeout: Duration,
 ) {
     info!(client_id = %client_id, "Client disconnected");
 
-    // Send cancellation signal and wait for task to complete
-    if let Some((cancel_tx, task_handle)) = cancellation_senders.lock().await.remove(client_id) {
-        // Send cancellation signal (ignore error if receiver already dropped)
+    // Take the entry out and release the lock before touching the channel
+    // (fix_012); the task self-removal takes this same lock.
+    let existing = cancellation_senders.lock().await.remove(client_id);
+    if let Some((cancel_tx, _task_handle)) = existing {
+        // Ignore error if the receiver is already gone (task finished).
         let _ = cancel_tx.send(()).await;
-        info!(client_id = %client_id, "Sent shutdown signal to backend connection");
-
-        // Wait for the task to drain and complete with a timeout
-        match tokio::time::timeout(drain_timeout, task_handle).await {
-            Ok(Ok(())) => {
-                info!(client_id = %client_id, "Backend connection drained and closed");
-            }
-            Ok(Err(e)) => {
-                warn!(client_id = %client_id, error = %e, "Backend connection task error during drain");
-            }
-            Err(_) => {
-                warn!(client_id = %client_id, "Drain timeout for backend connection");
-            }
-        }
+        debug!(client_id = %client_id, "Sent shutdown signal to backend connection");
     }
 }
 

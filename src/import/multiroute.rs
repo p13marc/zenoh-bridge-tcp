@@ -464,7 +464,7 @@ async fn run_exchange(
     // liveliness token above; publishing before then leaves the bytes nowhere
     // but the publisher cache. A request head fits the cache, but a large
     // request body does not — same silent truncation as the plain import path.
-    super::bridge::await_matching_subscriber(
+    crate::zenoh_util::await_matching_subscriber(
         &tx_publisher,
         config.reliability,
         config.availability_timeout,

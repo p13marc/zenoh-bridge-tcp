@@ -281,12 +281,26 @@ pub struct BridgeProcess {
 impl BridgeProcess {
     pub async fn new(args: &[&str]) -> Self {
         use std::process::Stdio;
-        let child = bridge_command()
-            .args(args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start bridge process");
+        let mut cmd = bridge_command();
+        cmd.args(args);
+        // Debug aid: BRIDGE_LOG_DIR=<dir> captures every bridge subprocess's
+        // stdout (at debug level) to a per-process file. Bridge logs are
+        // otherwise discarded, which makes cross-process failures (liveliness
+        // races, dial ordering) undiagnosable from nextest output alone. This
+        // hook has paid for itself repeatedly; keep it.
+        match std::env::var("BRIDGE_LOG_DIR") {
+            Ok(dir) => {
+                let name = format!("{}/bridge-{}.log", dir, uuid::Uuid::new_v4().as_simple());
+                cmd.arg("--log-level").arg("debug");
+                cmd.stdout(Stdio::from(std::fs::File::create(&name).unwrap()));
+                cmd.stderr(Stdio::null());
+            }
+            Err(_) => {
+                cmd.stdout(Stdio::null());
+                cmd.stderr(Stdio::null());
+            }
+        }
+        let child = cmd.spawn().expect("Failed to start bridge process");
 
         Self { child }
     }
@@ -492,4 +506,106 @@ where
         last = now;
     }
     last
+}
+
+/// A backend listener immune to the harness's port probes.
+///
+/// `wait_for_port` (and any connect-then-close prober) creates a REAL bridged
+/// connection on a `proto=raw` listener: raw doors relay unconditionally, so
+/// the export dials the backend for the probe, and the backend sees a
+/// connection that delivers zero bytes and closes. A single-accept backend is
+/// consumed by that phantom; the real client's dial then lands in the kernel
+/// queue of a listener nobody accepts on and dies with a reset when the
+/// backend task exits — a confusing, timing-dependent failure.
+///
+/// This helper loop-accepts and invokes `handler` ONLY for connections that
+/// deliver at least one byte; zero-byte connections are absorbed silently.
+/// The handler receives the stream plus the already-read first chunk.
+pub async fn start_probe_immune_backend<F, Fut>(
+    handler: F,
+) -> (SocketAddr, tokio::task::JoinHandle<()>)
+where
+    F: Fn(tokio::net::TcpStream, Vec<u8>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = spawn_probe_immune_accept_loop(listener, handler);
+    (addr, handle)
+}
+
+/// [`start_probe_immune_backend`] on a caller-chosen address — for tests that
+/// stop and later restart a backend on the same port.
+pub async fn start_probe_immune_backend_on<F, Fut>(
+    addr: SocketAddr,
+    handler: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(tokio::net::TcpStream, Vec<u8>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    spawn_probe_immune_accept_loop(listener, handler)
+}
+
+fn spawn_probe_immune_accept_loop<F, Fut>(
+    listener: tokio::net::TcpListener,
+    handler: F,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn(tokio::net::TcpStream, Vec<u8>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let mut first = vec![0u8; 65536];
+                match stream.read(&mut first).await {
+                    // Zero bytes then close: a probe phantom. Absorb it.
+                    Ok(0) | Err(_) => {}
+                    Ok(n) => {
+                        first.truncate(n);
+                        handler(stream, first).await;
+                    }
+                }
+            });
+        }
+    })
+}
+
+/// Establish a raw-door connection that is PROVABLY served: retry the whole
+/// connect + write + first-reply exchange until the backend answers, then hand
+/// the live stream back for further traffic on the same connection.
+///
+/// The first reply is consumed here (it proves the export side is attached and
+/// relaying); the caller continues the conversation from the second exchange.
+pub async fn connected_raw_client(
+    addr: SocketAddr,
+    payload: &[u8],
+    budget: Duration,
+) -> anyhow::Result<TcpStream> {
+    retry_client(
+        || async {
+            let mut stream = TcpStream::connect(addr).await?;
+            stream.write_all(payload).await?;
+            let mut buf = vec![0u8; 65536];
+            let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no reply yet"))??;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "closed before a reply (backend not wired yet)",
+                ));
+            }
+            Ok(stream)
+        },
+        budget,
+        &format!("served connection to {addr}"),
+    )
+    .await
 }

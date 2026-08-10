@@ -1,34 +1,50 @@
-use super::CancellationSender;
+//! WebSocket backend dialing for the export side.
+//!
+//! Just the dial (see `tcp.rs` for the division of labour). The per-attempt
+//! bound matters even more here: `connect_async` is a TCP connect **plus** a
+//! full HTTP upgrade round-trip, so a peer that accepts and then stalls the
+//! handshake would otherwise pin an attempt indefinitely.
+
 use crate::config::BridgeConfig;
+use crate::transport::{WsReader, WsWriter};
+use anyhow::Result;
 use backon::{ExponentialBuilder, Retryable};
 use futures_util::StreamExt;
-use std::collections::HashMap;
-use std::sync::Arc;
+use futures_util::stream::{SplitSink, SplitStream};
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio_tungstenite::connect_async;
-use tracing::{error, info, info_span, warn};
-use zenoh::Session;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tracing::{info, warn};
 
-/// Handle a WebSocket client connection event
-pub(super) async fn handle_ws_client_connect(
-    session: &Arc<Session>,
-    service_name: &str,
+type WsSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Dial a `ws://` / `wss://` backend with retries, each attempt bounded by
+/// `config.connect_timeout`.
+pub(super) async fn dial(
     ws_url: &str,
     client_id: &str,
-    cancellation_senders: &Arc<Mutex<HashMap<String, CancellationSender>>>,
-    dns_suffix: Option<&str>,
-    config: &Arc<BridgeConfig>,
-) {
-    info!(client_id = %client_id, "WebSocket client connected, connecting to backend");
-
-    // Retry WebSocket backend connection with exponential backoff
+    config: &BridgeConfig,
+) -> Result<(
+    WsReader<SplitStream<WsSocket>>,
+    WsWriter<SplitSink<WsSocket, Message>>,
+)> {
+    let connect_timeout = config.connect_timeout;
     let ws_url_owned = ws_url.to_string();
     let client_id_for_log = client_id.to_string();
     let ws_url_for_log = ws_url.to_string();
-    let connect_result = (|| {
+    let (ws_stream, _response) = (|| {
         let url = ws_url_owned.clone();
-        async move { connect_async(&url).await }
+        async move {
+            tokio::time::timeout(connect_timeout, connect_async(&url))
+                .await
+                .map_err(|_| {
+                    tokio_tungstenite::tungstenite::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WebSocket backend connect timed out",
+                    ))
+                })?
+        }
     })
     .retry(
         ExponentialBuilder::default()
@@ -45,54 +61,9 @@ pub(super) async fn handle_ws_client_connect(
             "WebSocket backend connection failed, retrying"
         );
     })
-    .await;
+    .await?;
 
-    match connect_result {
-        Ok((ws_stream, _response)) => {
-            info!(client_id = %client_id, ws_url = %ws_url, "WebSocket backend connection established");
-
-            let (ws_sender, ws_receiver) = ws_stream.split();
-            let reader = crate::transport::WsReader::new(ws_receiver);
-            let writer = crate::transport::WsWriter::new(ws_sender);
-
-            let span = info_span!(
-                "ws_client_bridge",
-                client_id = %client_id,
-                service = %service_name,
-                dns = %dns_suffix.unwrap_or("-"),
-                ws_url = %ws_url
-            );
-
-            // Cancel any prior connection, spawn the bridge, and track it so it
-            // frees its own map entry on completion (D1).
-            super::bridge::spawn_and_track(
-                session.clone(),
-                service_name.to_string(),
-                client_id.to_string(),
-                reader,
-                writer,
-                dns_suffix.map(str::to_string),
-                config.clone(),
-                cancellation_senders,
-                span,
-            )
-            .await;
-        }
-        Err(e) => {
-            // The ws_client_bridge span is built here but only entered by the
-            // spawned bridge, so this path names the client itself.
-            error!(client_id = %client_id, error = %e, "Failed to connect to WebSocket backend after retries");
-
-            // Publish error signal to notify import bridge (host-routed
-            // backends signal on their {service}/{dns} key, like the TCP path).
-            let error_key = match dns_suffix {
-                Some(dns) => format!("{}/{}/error/{}", service_name, dns, client_id),
-                None => format!("{}/error/{}", service_name, client_id),
-            };
-            if let Err(pub_err) = session.put(&error_key, "backend_unavailable").await {
-                error!(client_id = %client_id, key = %error_key, error = %pub_err, "Failed to publish error signal");
-            }
-            info!(client_id = %client_id, "Sent backend unavailable signal");
-        }
-    }
+    info!(ws_url = %ws_url, "WebSocket backend connection established");
+    let (sender, receiver) = ws_stream.split();
+    Ok((WsReader::new(receiver), WsWriter::new(sender)))
 }
