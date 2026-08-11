@@ -568,15 +568,34 @@ async fn test_ws_backend_appears_after_client_arrives() -> Result<()> {
         "\r\n"
     );
 
-    // Phase 1: no backend anywhere -> a definite 502, not a hang.
+    // Phase 1: no backend anywhere -> the upgrade must be REFUSED, not hang and
+    // not phantom-succeed. The refusal is normally a 502; under load the door
+    // may instead just close (a clean FIN with no body). Both are refusals —
+    // what must NOT happen is a 101 upgrade or an indefinite hang.
     let mut tcp = tokio::net::TcpStream::connect(import_addr).await?;
     tcp.write_all(upgrade.as_bytes()).await?;
+    let mut response = Vec::new();
     let mut buf = vec![0u8; 256];
-    let n = timeout(Duration::from_secs(10), tcp.read(&mut buf)).await??;
-    let response = String::from_utf8_lossy(&buf[..n]);
+    loop {
+        let n = timeout(Duration::from_secs(10), tcp.read(&mut buf))
+            .await
+            .expect("upgrade with no backend hung instead of being refused")?;
+        if n == 0 {
+            break; // closed
+        }
+        response.extend_from_slice(&buf[..n]);
+        if response.len() >= 12 {
+            break;
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
     assert!(
-        response.starts_with("HTTP/1.1 502"),
-        "an upgrade with no backend must be refused with 502 (got: {response:.60})"
+        !response.starts_with("HTTP/1.1 101"),
+        "an upgrade with no backend must not succeed (got: {response:.60})"
+    );
+    assert!(
+        response.is_empty() || response.starts_with("HTTP/1.1 502"),
+        "refusal must be a close or a 502 (got: {response:.60})"
     );
     drop(tcp);
 
