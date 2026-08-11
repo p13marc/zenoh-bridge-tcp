@@ -691,16 +691,29 @@ pub struct ScoutDomain {
 }
 
 impl ScoutDomain {
-    /// Allocate a fresh domain. Ports walk a wide range from a per-process
-    /// base, so two binaries' domains never collide either.
+    /// Allocate a fresh, currently-free multicast scouting port.
+    ///
+    /// Zenoh binds the multicast group on this UDP port; two domains sharing it
+    /// collide with `Address already in use`. A bare counter can repeat (the
+    /// range wraps, and separate binaries seed independently), so probe each
+    /// candidate by binding it first and only keep one the OS accepts. The bind
+    /// is released immediately; the small TOCTOU window is unproblematic in
+    /// practice because ports are handed out sparsely.
     pub fn new() -> Self {
-        use std::sync::atomic::{AtomicU16, Ordering};
-        static NEXT: AtomicU16 = AtomicU16::new(0);
-        let base = 20000u16.wrapping_add((std::process::id() % 20000) as u16);
-        let offset = NEXT.fetch_add(1, Ordering::Relaxed);
-        Self {
-            port: 20000 + (base.wrapping_add(offset) % 45000),
+        use std::net::UdpSocket;
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let seed = std::process::id().wrapping_mul(2654435761);
+        for _ in 0..10_000 {
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let port = 20000 + ((seed.wrapping_add(n)) % 45000) as u16;
+            // Binding the multicast group address on the port is the same
+            // operation Zenoh performs; if it succeeds the port is free.
+            if UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+                return Self { port };
+            }
         }
+        panic!("could not find a free scouting port");
     }
 
     fn address(&self) -> String {
@@ -782,4 +795,19 @@ pub async fn raw_http_until_served(
         "raw HTTP through the bridge",
     )
     .await
+}
+
+/// Close in-process Zenoh sessions cleanly BEFORE a `#[tokio::test]` returns.
+///
+/// A `#[tokio::test]` owns its runtime and drops it on return. A Zenoh session
+/// dropped during that teardown races Zenoh's own background runtime and panics
+/// the worker ("closure claimed permanent executor" -> SIGABRT, which fails the
+/// whole test binary). Closing explicitly, while the runtime is still live,
+/// shuts the session's tasks down in order. A short settle follows so in-flight
+/// undeclarations complete.
+pub async fn shutdown_sessions<const N: usize>(sessions: [std::sync::Arc<zenoh::Session>; N]) {
+    for s in &sessions {
+        let _ = s.close().await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }

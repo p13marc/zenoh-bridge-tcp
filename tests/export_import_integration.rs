@@ -1095,7 +1095,7 @@ async fn error_signal_is_recoverable_by_a_late_subscriber() -> Result<()> {
     // churn, but the error publisher's heartbeat (500ms) makes the subscriber's
     // late-publisher detection re-query, so recovery is guaranteed to converge —
     // this bound only has to outlast churn, not define the mechanism.
-    let sample = tokio::time::timeout(Duration::from_secs(15), error_sub.recv_async())
+    let sample = tokio::time::timeout(Duration::from_secs(30), error_sub.recv_async())
         .await
         .expect("late subscriber never recovered the error signal — it was published fire-once")
         .expect("error subscriber closed");

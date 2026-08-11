@@ -200,6 +200,7 @@ async fn test_multiple_exports() {
     assert!(response.starts_with(b"count:"));
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test multiple imports from different services.
@@ -248,6 +249,7 @@ async fn test_multiple_imports() {
     assert!(resp2.starts_with(b"count:"));
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test three exports simultaneously (echo, counter, reverse).
@@ -310,6 +312,7 @@ async fn test_mixed_export_import() {
     assert_eq!(resp, b"DCBA");
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test that different services are isolated — messages don't cross.
@@ -395,4 +398,5 @@ async fn test_service_isolation() {
         .expect("Reverse task panicked");
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
