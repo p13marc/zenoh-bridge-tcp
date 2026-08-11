@@ -690,6 +690,19 @@ pub struct ScoutDomain {
     port: u16,
 }
 
+/// The one per-process directory that holds every domain's `--zenoh-config`
+/// file. Created exactly once (via `OnceLock`) so concurrent `config_file()`
+/// calls never race `create_dir_all` against each other.
+fn scout_config_dir() -> &'static std::path::Path {
+    use std::sync::OnceLock;
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("zb-scout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create zenoh config dir");
+        dir
+    })
+}
+
 impl ScoutDomain {
     /// Allocate a fresh, currently-free multicast scouting port.
     ///
@@ -743,8 +756,13 @@ impl ScoutDomain {
     /// Write this domain's config to a temp file and return the path, for
     /// `--zenoh-config`. The file lives for the test process's lifetime.
     pub fn config_file(&self) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("zb-scout-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create zenoh config dir");
+        // The per-process config dir is shared by every domain (its name is keyed
+        // only on the pid), so many tests build configs into it concurrently.
+        // Create it exactly ONCE via a OnceLock — a bare `create_dir_all` racing
+        // itself across threads can surface a non-EEXIST error and panic
+        // (observed as a ~1-in-4 flake). Each domain's file is uniquely named by
+        // its (unique, probe-bound) port, so the writes never collide.
+        let dir = scout_config_dir();
         let path = dir.join(format!("zenoh-{}.json5", self.port));
         std::fs::write(&path, self.json5()).expect("write zenoh config");
         path
