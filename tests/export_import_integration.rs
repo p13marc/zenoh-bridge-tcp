@@ -9,382 +9,155 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 
-/// Test basic export/import communication through the bridge
+/// Basic export/import round trip with hard assertions.
+///
+/// The backend is probe-immune (`common::start_probe_immune_backend`): the
+/// harness's `wait_for_port` probe creates a real zero-byte bridged connection
+/// on a raw listener, which used to consume single-accept backends. Every
+/// outcome here is asserted — the previous version printed a FAILED line and
+/// returned `Ok(())` regardless.
 #[tokio::test]
 async fn test_export_import_basic_communication() -> Result<()> {
-    println!("\n=== Test: Export/Import Basic Communication ===\n");
-
-    // Step 1: Start a backend server (simulates what nc -l would do)
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend server listening on {}", backend_addr);
-
-    let backend_task = tokio::spawn(async move {
-        println!("2. Backend: Waiting for connection...");
-        let (mut stream, addr) = backend_listener.accept().await.unwrap();
-        println!("3. Backend: Accepted connection from {}", addr);
-
-        let mut buffer = vec![0u8; 1024];
-
-        // Read client message
-        match stream.read(&mut buffer).await {
-            Ok(n) if n > 0 => {
-                let msg = String::from_utf8_lossy(&buffer[..n]);
-                println!("4. Backend: Received: '{}'", msg.trim());
-
-                // Send response back
-                let response = b"Hello from backend!\n";
-                stream.write_all(response).await.unwrap();
-                println!("5. Backend: Sent response");
-            }
-            Ok(n) => {
-                println!("4. Backend: Unexpected read of {} bytes", n);
-            }
-            Err(e) => {
-                println!("4. Backend: Read error: {:?}", e);
-            }
+    let (close_tx, mut close_rx) = mpsc::channel::<bool>(4);
+    let (backend_addr, _backend) = common::start_probe_immune_backend(move |mut stream, first| {
+        let close_tx = close_tx.clone();
+        async move {
+            let msg = String::from_utf8_lossy(&first).to_string();
+            assert!(msg.contains("Hello from client"), "backend got: {msg:?}");
+            stream.write_all(b"Hello from backend!\n").await.unwrap();
+            // Then expect a clean FIN from the client.
+            let mut buf = [0u8; 64];
+            let saw_fin = matches!(stream.read(&mut buf).await, Ok(0));
+            let _ = close_tx.send(saw_fin).await;
         }
+    })
+    .await;
 
-        // Wait for close
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    println!("6. Backend: Connection closed properly");
-                    return true;
-                }
-                Ok(n) => {
-                    println!("Backend: Received additional {} bytes", n);
-                }
-                Err(e) => {
-                    println!("Backend: Error: {:?}", e);
-                    return false;
-                }
-            }
-        }
-    });
-
-    // Step 2: Start bridges
     let service = common::unique_service_name("testservice");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
-    let import_addr = pair.import_addr;
 
-    // Step 4: Connect a client to the import bridge
-    println!("11. Client: Connecting to import bridge at {}", import_addr);
-    let mut client = TcpStream::connect(import_addr).await?;
-    println!("12. Client: Connected successfully");
-
-    // Give bridges time to establish Zenoh connection
-    // Liveliness must propagate between two separate OS processes via Zenoh scouting
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Step 5: Send data from client
-    let message = b"Hello from client!\n";
-    println!(
-        "13. Client: Sending message: '{}'",
-        String::from_utf8_lossy(message).trim()
+    let response = common::echo_roundtrip(
+        pair.import_addr,
+        b"Hello from client!\n",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("no response through the bridge");
+    anyhow::ensure!(
+        String::from_utf8_lossy(&response).contains("Hello from backend"),
+        "unexpected response: {response:?}"
     );
-    client.write_all(message).await?;
-    println!("14. Client: Message sent");
 
-    // Step 6: Read response from backend
-    let mut response_buffer = vec![0u8; 1024];
-    let read_result = timeout(Duration::from_secs(5), client.read(&mut response_buffer)).await;
+    // echo_roundtrip closed its connection after reading; the backend must
+    // observe that as a clean FIN.
+    let saw_fin = timeout(Duration::from_secs(10), close_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("backend never reported the close"))?
+        .unwrap();
+    anyhow::ensure!(saw_fin, "backend did not observe a clean FIN");
 
-    match read_result {
-        Ok(Ok(n)) if n > 0 => {
-            let response = String::from_utf8_lossy(&response_buffer[..n]);
-            println!("15. Client: Received response: '{}'", response.trim());
-
-            if response.contains("Hello from backend") {
-                println!("16. ✓ Response matches expected!");
-            } else {
-                println!("16. ✗ Unexpected response!");
-            }
-        }
-        Ok(Ok(_)) => {
-            println!("15. ✗ Connection closed before receiving response");
-        }
-        Ok(Err(e)) => {
-            println!("15. ✗ Read error: {:?}", e);
-        }
-        Err(_) => {
-            println!("15. ✗ Timeout waiting for response");
-        }
-    }
-
-    // Step 7: Close client connection
-    println!("17. Client: Closing connection...");
-    drop(client);
-    println!("18. Client: Connection closed");
-
-    // Step 8: Verify backend detected close
-    match timeout(Duration::from_secs(5), backend_task).await {
-        Ok(Ok(true)) => {
-            println!("19. ✓ Backend detected close properly");
-        }
-        Ok(Ok(false)) => {
-            println!("19. ✗ Backend didn't detect close");
-        }
-        Ok(Err(e)) => {
-            println!("19. ✗ Backend task panicked: {:?}", e);
-        }
-        Err(_) => {
-            println!("19. ✗ Timeout - backend didn't detect close");
-        }
-    }
-
-    // Cleanup
     pair.kill_and_wait().await;
-
     Ok(())
 }
 
-/// Test multiple clients with separate backend connections
+/// Two clients must get two SEPARATE backend connections, each answered with
+/// its own data (echo), independent of dial order (dials are concurrent now,
+/// so accept order is not deterministic).
 #[tokio::test]
 async fn test_multiple_clients_separate_connections() -> Result<()> {
-    println!("\n=== Test: Multiple Clients - Separate Backend Connections ===\n");
+    let (conn_tx, mut conn_rx) = mpsc::channel::<()>(8);
+    let (backend_addr, _backend) = common::start_probe_immune_backend(move |mut stream, first| {
+        let conn_tx = conn_tx.clone();
+        async move {
+            let _ = conn_tx.send(()).await;
+            // Echo the client's own message back, so each client can assert
+            // it was served by ITS connection.
+            let _ = stream.write_all(&first).await;
+        }
+    })
+    .await;
 
-    // Backend that tracks how many connections it receives
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend listening on {}", backend_addr);
-
-    let (conn_tx, mut conn_rx) = mpsc::channel::<usize>(2);
-
-    let backend_task = tokio::spawn(async move {
-        let mut connection_count = 0;
-
-        // Accept first connection
-        println!("2. Backend: Waiting for first connection...");
-        let (mut stream1, addr1) = backend_listener.accept().await.unwrap();
-        connection_count += 1;
-        println!("3. Backend: Connection {} from {}", connection_count, addr1);
-        let _ = conn_tx.send(connection_count).await;
-
-        // Accept second connection
-        println!("4. Backend: Waiting for second connection...");
-        let (mut stream2, addr2) = backend_listener.accept().await.unwrap();
-        connection_count += 1;
-        println!("5. Backend: Connection {} from {}", connection_count, addr2);
-        let _ = conn_tx.send(connection_count).await;
-
-        // Handle both connections
-        let handle1 = tokio::spawn(async move {
-            let mut buf = vec![0u8; 1024];
-            match stream1.read(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    println!("   Conn1: Received {} bytes", n);
-                    let _ = stream1.write_all(b"Response to client 1\n").await;
-                }
-                _ => {}
-            }
-            // Don't wait for close - just exit
-            println!("   Conn1: Finished handling");
-        });
-
-        let handle2 = tokio::spawn(async move {
-            let mut buf = vec![0u8; 1024];
-            match stream2.read(&mut buf).await {
-                Ok(n) if n > 0 => {
-                    println!("   Conn2: Received {} bytes", n);
-                    let _ = stream2.write_all(b"Response to client 2\n").await;
-                }
-                _ => {}
-            }
-            // Don't wait for close - just exit
-            println!("   Conn2: Finished handling");
-        });
-
-        let _ = tokio::join!(handle1, handle2);
-        connection_count
-    });
-
-    // Start bridges
     let service = common::unique_service_name("multitest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
     let import_addr = pair.import_addr;
 
-    // Connect first client
-    println!("8. Client 1: Connecting...");
-    let mut client1 = TcpStream::connect(import_addr).await?;
-    println!("9. Client 1: Connected");
+    let r1 = common::echo_roundtrip(
+        import_addr,
+        b"Message from client 1\n",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("client 1 got no response");
+    anyhow::ensure!(r1 == b"Message from client 1\n", "client 1 got {r1:?}");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let r2 = common::echo_roundtrip(
+        import_addr,
+        b"Message from client 2\n",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("client 2 got no response");
+    anyhow::ensure!(r2 == b"Message from client 2\n", "client 2 got {r2:?}");
 
-    // Connect second client
-    println!("10. Client 2: Connecting...");
-    let mut client2 = TcpStream::connect(import_addr).await?;
-    println!("11. Client 2: Connected");
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Send data from both clients
-    println!("12. Client 1: Sending message...");
-    client1.write_all(b"Message from client 1\n").await?;
-
-    println!("13. Client 2: Sending message...");
-    client2.write_all(b"Message from client 2\n").await?;
-
-    // Read responses
-    let mut buf1 = vec![0u8; 1024];
-    let mut buf2 = vec![0u8; 1024];
-
-    let read1 = timeout(Duration::from_secs(2), client1.read(&mut buf1));
-    let read2 = timeout(Duration::from_secs(2), client2.read(&mut buf2));
-
-    let (result1, result2) = tokio::join!(read1, read2);
-
-    match result1 {
-        Ok(Ok(n)) if n > 0 => {
-            println!("14. Client 1: Received {} bytes", n);
-        }
-        _ => {
-            println!("14. Client 1: No response");
-        }
+    // At least the two data-bearing connections must have reached the backend
+    // (probe phantoms are filtered by the helper; readiness retries may add
+    // legitimate extra served connections, so "exactly 2" would be wrong).
+    let mut served = 0;
+    while let Ok(Some(())) = timeout(Duration::from_millis(500), conn_rx.recv()).await {
+        served += 1;
     }
-
-    match result2 {
-        Ok(Ok(n)) if n > 0 => {
-            println!("15. Client 2: Received {} bytes", n);
-        }
-        _ => {
-            println!("15. Client 2: No response");
-        }
-    }
-
-    // Verify backend received 2 separate connections via channel
-    let mut received_count = 0;
-    while let Ok(Some(_)) = timeout(Duration::from_millis(100), conn_rx.recv()).await {
-        received_count += 1;
-    }
-
-    println!(
-        "17. Backend created {} separate connections",
-        received_count
+    anyhow::ensure!(
+        served >= 2,
+        "expected >=2 backend connections, saw {served}"
     );
-    if received_count == 2 {
-        println!("18. ✓ TEST PASSED: Each client got separate backend connection");
-    } else {
-        println!(
-            "19. ✗ TEST FAILED: Expected 2 connections, got {}",
-            received_count
-        );
-        pair.kill_and_wait().await;
-        let _ = timeout(Duration::from_millis(100), backend_task).await;
-        return Err(anyhow::anyhow!(
-            "Expected 2 connections, got {}",
-            received_count
-        ));
-    }
 
-    // Cleanup
     pair.kill_and_wait().await;
-    let _ = timeout(Duration::from_millis(500), backend_task).await;
-
     Ok(())
 }
 
-/// Test connection close propagation
-/// This test verifies that when a client disconnects, the backend detects the close quickly.
+/// A client's close must propagate to the backend as a clean FIN, promptly.
 #[tokio::test]
 async fn test_connection_close_propagation() -> Result<()> {
-    println!("\n=== Test: Connection Close Propagation ===\n");
-
-    // Backend server that verifies it receives proper close
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend listening on {}", backend_addr);
-
-    let (close_tx, mut close_rx) = mpsc::channel::<bool>(1);
-
-    let backend_task = tokio::spawn(async move {
-        println!("2. Backend: Waiting for connection...");
-        let (mut stream, addr) = backend_listener.accept().await.unwrap();
-        println!("3. Backend: Connection from {}", addr);
-
-        let mut buffer = vec![0u8; 1024];
-
-        // Read one message
-        match stream.read(&mut buffer).await {
-            Ok(n) if n > 0 => {
-                println!("4. Backend: Received {} bytes", n);
+    let (fin_tx, mut fin_rx) = mpsc::channel::<bool>(4);
+    let (backend_addr, _backend) = common::start_probe_immune_backend(move |mut stream, _first| {
+        let fin_tx = fin_tx.clone();
+        async move {
+            // Ack so the client knows it is served, then expect the FIN.
+            if stream.write_all(b"ack").await.is_err() {
+                return;
             }
-            _ => {
-                println!("4. Backend: Unexpected read result");
-            }
+            let mut buf = [0u8; 64];
+            let saw_fin = matches!(
+                tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buf)).await,
+                Ok(Ok(0))
+            );
+            let _ = fin_tx.send(saw_fin).await;
         }
+    })
+    .await;
 
-        // Wait for FIN
-        println!("5. Backend: Waiting for close...");
-        let result = match stream.read(&mut buffer).await {
-            Ok(0) => {
-                println!("6. Backend: ✓ Received FIN (proper close)");
-                true
-            }
-            Ok(n) => {
-                println!("6. Backend: ✗ Received {} more bytes (expected 0)", n);
-                false
-            }
-            Err(e) => {
-                println!("6. Backend: ✗ Error: {:?}", e);
-                false
-            }
-        };
-
-        let _ = close_tx.send(result).await;
-    });
-
-    // Start bridges
     let service = common::unique_service_name("closetest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
-    let import_addr = pair.import_addr;
 
-    // Connect client
-    println!("9. Client: Connecting...");
-    let mut client = TcpStream::connect(import_addr).await?;
-    println!("10. Client: Connected");
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Send one message
-    println!("11. Client: Sending message...");
-    client.write_all(b"Test message\n").await?;
-    println!("12. Client: Message sent");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Close client connection
-    println!("13. Client: Closing connection...");
+    let client = common::connected_raw_client(
+        pair.import_addr,
+        b"one message\n",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("could not establish a served connection");
     drop(client);
-    println!("14. Client: Connection closed");
 
-    // INTENTIONALLY SOFT ASSERTION: Close propagation crosses multiple process
-    // boundaries (client → import bridge → Zenoh → export bridge → backend) and
-    // depends on Zenoh liveliness token cleanup, which is timing-dependent across
-    // separate OS processes. A hard assert here would make the test flaky in CI.
-    // We log the outcome for manual inspection but do not fail the test.
-    match timeout(Duration::from_secs(20), close_rx.recv()).await {
-        Ok(Some(true)) => {
-            println!("15. Backend detected proper close");
-        }
-        Ok(Some(false)) => {
-            println!("15. Backend didn't detect close properly");
-        }
-        Ok(None) => {
-            println!("15. Backend channel closed unexpectedly");
-        }
-        Err(_) => {
-            println!("15. Close did not propagate to backend within 20s");
-            println!("    This can happen when Zenoh session cleanup is slow across processes.");
-        }
-    }
+    let saw_fin = timeout(Duration::from_secs(10), fin_rx.recv())
+        .await
+        .map_err(|_| anyhow::anyhow!("backend never reported on the close"))?
+        .unwrap();
+    anyhow::ensure!(
+        saw_fin,
+        "backend did not receive a clean FIN after client close"
+    );
 
-    // Wait for backend task to complete
-    let _ = backend_task.await;
-
-    // Cleanup
     pair.kill_and_wait().await;
-
     Ok(())
 }
 
@@ -470,106 +243,51 @@ async fn test_connection_basic() -> Result<()> {
     Ok(())
 }
 
-/// Test bidirectional data flow
+/// Three request/response round trips on ONE client connection, all asserted.
+///
+/// The previous version printed a FAILED line and returned `Ok(())` — it
+/// "passed" for releases while delivering zero echoes whenever the harness
+/// probe consumed its single-accept backend.
 #[tokio::test]
 async fn test_bidirectional_data_flow() -> Result<()> {
-    println!("\n=== Test: Bidirectional Data Flow ===\n");
-
-    // Backend that echoes data back
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend echo server listening on {}", backend_addr);
-
-    let backend_task = tokio::spawn(async move {
-        println!("2. Backend: Waiting for connection...");
-        let (mut stream, _) = backend_listener.accept().await.unwrap();
-        println!("3. Backend: Connection accepted");
-
-        let mut buffer = vec![0u8; 1024];
-        let mut messages_echoed = 0;
-
-        loop {
-            match stream.read(&mut buffer).await {
-                Ok(0) => {
-                    println!(
-                        "4. Backend: Connection closed after {} messages",
-                        messages_echoed
-                    );
+    let (backend_addr, _backend) =
+        common::start_probe_immune_backend(|mut stream, first| async move {
+            // Echo the first chunk, then keep echoing.
+            if stream.write_all(&first).await.is_err() {
+                return;
+            }
+            let mut buf = vec![0u8; 1024];
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 || stream.write_all(&buf[..n]).await.is_err() {
                     break;
                 }
-                Ok(n) => {
-                    println!("   Backend: Echoing {} bytes", n);
-                    if stream.write_all(&buffer[..n]).await.is_err() {
-                        break;
-                    }
-                    messages_echoed += 1;
-                }
-                Err(_) => break,
             }
-        }
-        messages_echoed
-    });
+        })
+        .await;
 
-    // Start bridges
     let service = common::unique_service_name("echotest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
-    let import_addr = pair.import_addr;
 
-    // Connect client and test echo
-    println!("7. Client: Connecting...");
-    let mut client = TcpStream::connect(import_addr).await?;
-    println!("8. Client: Connected");
+    let mut client =
+        common::connected_raw_client(pair.import_addr, b"Hello\n", common::BACKEND_READY_TIMEOUT)
+            .await
+            .expect("could not establish a served connection");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // Send multiple messages and verify echoes
-    let messages = ["Hello\n", "World\n", "Test\n"];
-    let mut echoes_received = 0;
-
-    for (i, msg) in messages.iter().enumerate() {
-        println!("9.{} Client: Sending '{}'", i + 1, msg.trim());
-        client.write_all(msg.as_bytes()).await?;
-
-        let mut buf = vec![0u8; 1024];
-        match timeout(Duration::from_secs(2), client.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                let echo = String::from_utf8_lossy(&buf[..n]);
-                println!("10.{} Client: Received echo '{}'", i + 1, echo.trim());
-                if echo.trim() == msg.trim() {
-                    echoes_received += 1;
-                }
-            }
-            _ => {
-                println!("10.{} Client: No echo received", i + 1);
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    println!("11. Client: Closing...");
-    drop(client);
-
-    // Verify all echoes were received
-    if echoes_received == messages.len() {
-        println!(
-            "12. ✓ TEST PASSED: All {} messages echoed correctly",
-            echoes_received
-        );
-    } else {
-        println!(
-            "12. ✗ TEST FAILED: Only {}/{} messages echoed",
-            echoes_received,
-            messages.len()
+    // The helper consumed the first echo. Two more on the same connection.
+    for msg in [b"World\n".as_slice(), b"Test!\n".as_slice()] {
+        client.write_all(msg).await?;
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("no echo for {msg:?}"))??;
+        anyhow::ensure!(
+            &buf[..n] == msg,
+            "echo mismatch: sent {msg:?}, got {:?}",
+            &buf[..n]
         );
     }
 
-    // Wait for backend
-    let _ = timeout(Duration::from_secs(5), backend_task).await;
-
-    // Cleanup
     pair.kill_and_wait().await;
-
     Ok(())
 }
 
@@ -685,322 +403,186 @@ async fn test_backend_unavailable_closes_client() -> Result<()> {
     Ok(())
 }
 
-/// Test rapid connection/disconnection cycles
+/// Ten sequential connect/send/receive/disconnect cycles, every ack asserted.
+///
+/// Previously the backend accepted serially (one at a time), counted raw
+/// accepts (probe phantoms included), tolerated 2 lost cycles, and the final
+/// check printed FAILED without failing.
 #[tokio::test]
 async fn test_rapid_connect_disconnect() -> Result<()> {
-    println!("\n=== Test: Rapid Connect/Disconnect Cycles ===\n");
-
-    // Start backend
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend listening on {}", backend_addr);
-
-    let connection_count = Arc::new(Mutex::new(0));
-    let count_clone = connection_count.clone();
-
-    let backend_task = tokio::spawn(async move {
-        let mut connections = 0;
-        while connections < 10 {
-            if let Ok((mut stream, _)) = backend_listener.accept().await {
-                connections += 1;
-                println!("   Backend: Connection {} accepted", connections);
-                *count_clone.lock().await = connections;
-
-                // Echo one message then close
-                let mut buf = vec![0u8; 1024];
-                if stream.read(&mut buf).await.unwrap_or(0) > 0 {
-                    let _ = stream.write_all(b"ack\n").await;
-                }
-            }
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_be = served.clone();
+    let (backend_addr, _backend) = common::start_probe_immune_backend(move |mut stream, _first| {
+        let served = served_be.clone();
+        async move {
+            served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream.write_all(b"ack\n").await;
         }
-        connections
-    });
+    })
+    .await;
 
-    // Start bridges
     let service = common::unique_service_name("rapidtest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
     let import_addr = pair.import_addr;
 
-    println!("2. Bridges started, beginning rapid connection test...");
+    // Readiness gate: first served round trip.
+    let ack = common::echo_roundtrip(import_addr, b"test 0\n", common::BACKEND_READY_TIMEOUT)
+        .await
+        .expect("bridge never became ready");
+    anyhow::ensure!(ack == b"ack\n", "got {ack:?}");
 
-    // Rapidly connect and disconnect 10 clients
-    for i in 0..10 {
-        println!("3.{} Client {}: Connecting...", i + 1, i + 1);
+    // Nine more rapid cycles, each one asserted — no tolerance budget.
+    for i in 1..10 {
         let mut client = TcpStream::connect(import_addr).await?;
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Send message
-        client.write_all(b"test\n").await?;
-
-        // Read response
-        let mut buf = vec![0u8; 64];
-        let _ = timeout(Duration::from_secs(1), client.read(&mut buf)).await;
-
-        // Immediately disconnect
+        client.write_all(format!("test {i}\n").as_bytes()).await?;
+        let mut buf = [0u8; 16];
+        let n = timeout(Duration::from_secs(10), client.read(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("cycle {i}: no ack"))??;
+        anyhow::ensure!(&buf[..n] == b"ack\n", "cycle {i}: got {:?}", &buf[..n]);
         drop(client);
-        println!("   Client {}: Disconnected", i + 1);
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Verify all connections were handled
-    tokio::time::sleep(Duration::from_secs(1)).await;
-    let final_count = *connection_count.lock().await;
+    anyhow::ensure!(
+        served.load(std::sync::atomic::Ordering::SeqCst) >= 10,
+        "backend served fewer connections than the clients that succeeded"
+    );
 
-    println!("4. Backend handled {} connections", final_count);
-    if final_count >= 8 {
-        // Allow some tolerance for race conditions
-        println!(
-            "5. ✓ TEST PASSED: Handled rapid connections ({}/10)",
-            final_count
-        );
-    } else {
-        println!(
-            "5. ✗ TEST FAILED: Only handled {}/10 connections",
-            final_count
-        );
-    }
-
-    // Cleanup
     pair.kill_and_wait().await;
-    let _ = timeout(Duration::from_millis(500), backend_task).await;
-
     Ok(())
 }
 
-/// Test concurrent connections from multiple clients
+/// Five clients at once; every response asserted and real concurrency proven.
+///
+/// The backend holds each connection ~500ms before answering, so five
+/// successful clients in well under 5x500ms proves the connections were
+/// served concurrently — asserted via both wall-clock and a peak-active
+/// counter (the old version only printed a warning on low concurrency).
 #[tokio::test]
 async fn test_concurrent_connections() -> Result<()> {
-    println!("\n=== Test: Concurrent Connections ===\n");
-
-    // Backend that tracks concurrent connections
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend listening on {}", backend_addr);
-
-    let max_concurrent = Arc::new(Mutex::new(0));
-    let max_clone = max_concurrent.clone();
-
-    let backend_task = tokio::spawn(async move {
-        let mut handles = vec![];
-        let active_count = Arc::new(Mutex::new(0));
-
-        for i in 0..5 {
-            let listener_result = backend_listener.accept().await;
-            if let Ok((mut stream, _)) = listener_result {
-                let active = active_count.clone();
-                let max_tracker = max_clone.clone();
-
-                let handle = tokio::spawn(async move {
-                    // Increment active count
-                    {
-                        let mut count = active.lock().await;
-                        *count += 1;
-                        let mut max = max_tracker.lock().await;
-                        if *count > *max {
-                            *max = *count;
-                        }
-                        println!(
-                            "   Backend: Connection {} active (total active: {})",
-                            i + 1,
-                            *count
-                        );
-                    }
-
-                    // Hold connection for a bit
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                    let mut buf = vec![0u8; 1024];
-                    if stream.read(&mut buf).await.unwrap_or(0) > 0 {
-                        let _ = stream.write_all(b"response\n").await;
-                    }
-
-                    // Decrement active count
-                    {
-                        let mut count = active.lock().await;
-                        *count -= 1;
-                        println!(
-                            "   Backend: Connection {} closed (total active: {})",
-                            i + 1,
-                            *count
-                        );
-                    }
-                });
-
-                handles.push(handle);
-            }
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (active_be, peak_be) = (active.clone(), peak.clone());
+    let (backend_addr, _backend) = common::start_probe_immune_backend(move |mut stream, first| {
+        let active = active_be.clone();
+        let peak = peak_be.clone();
+        async move {
+            let now = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            peak.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let _ = stream.write_all(&first).await;
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
+    })
+    .await;
 
-        for handle in handles {
-            let _ = handle.await;
-        }
-    });
-
-    // Start bridges
     let service = common::unique_service_name("concurrenttest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
     let import_addr = pair.import_addr;
 
-    println!("2. Bridges started, connecting 5 concurrent clients...");
+    // Readiness gate (also counts as one served connection).
+    let r = common::echo_roundtrip(import_addr, b"warm\n", common::BACKEND_READY_TIMEOUT)
+        .await
+        .expect("bridge never became ready");
+    anyhow::ensure!(r == b"warm\n");
 
-    // Connect 5 clients concurrently
-    let mut client_handles = vec![];
-
-    for i in 0..5 {
-        let addr = import_addr;
-        let handle = tokio::spawn(async move {
-            if let Ok(mut client) = TcpStream::connect(addr).await {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                let _ = client.write_all(b"test\n").await;
-                let mut buf = vec![0u8; 64];
-                let _ = timeout(Duration::from_secs(2), client.read(&mut buf)).await;
-                println!("3.{} Client {} completed", i + 1, i + 1);
-            }
-        });
-        client_handles.push(handle);
-
-        // Small delay between connections
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let started = std::time::Instant::now();
+    let mut handles = vec![];
+    for i in 0..5u8 {
+        handles.push(tokio::spawn(async move {
+            let mut client = TcpStream::connect(import_addr).await?;
+            let msg = [b'c', b'0' + i, b'\n'];
+            client.write_all(&msg).await?;
+            let mut buf = [0u8; 8];
+            let n = timeout(Duration::from_secs(15), client.read(&mut buf))
+                .await
+                .map_err(|_| anyhow::anyhow!("client {i}: no response"))??;
+            anyhow::ensure!(buf[..n] == msg, "client {i}: got {:?}", &buf[..n]);
+            Ok::<(), anyhow::Error>(())
+        }));
     }
-
-    // Wait for all clients
-    for handle in client_handles {
-        let _ = handle.await;
+    for (i, h) in handles.into_iter().enumerate() {
+        h.await?.map_err(|e| anyhow::anyhow!("client {i}: {e}"))?;
     }
+    let elapsed = started.elapsed();
 
-    // Check max concurrent
-    let max_concurrent_value = *max_concurrent.lock().await;
-    println!(
-        "4. Max concurrent backend connections: {}",
-        max_concurrent_value
+    anyhow::ensure!(
+        peak.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "peak concurrent backend connections {} < 3",
+        peak.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    anyhow::ensure!(
+        elapsed < Duration::from_millis(2000),
+        "five 500ms-held connections took {elapsed:?} — they were serialized"
     );
 
-    if max_concurrent_value >= 3 {
-        println!(
-            "5. ✓ TEST PASSED: Handled concurrent connections (max: {})",
-            max_concurrent_value
-        );
-    } else {
-        println!(
-            "5. ⚠ TEST WARNING: Low concurrency (max: {})",
-            max_concurrent_value
-        );
-    }
-
-    // Cleanup
     pair.kill_and_wait().await;
-    let _ = timeout(Duration::from_secs(2), backend_task).await;
-
     Ok(())
 }
 
-/// Test large message transfer through bridges
+/// A 1 MiB echo through the bridge must arrive complete and byte-exact —
+/// asserted (the old version warned on partial transfer and passed anyway).
 #[tokio::test]
 async fn test_large_message_transfer() -> Result<()> {
-    println!("\n=== Test: Large Message Transfer ===\n");
-
-    // Backend that receives and echoes large messages
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_addr = backend_listener.local_addr()?;
-    println!("1. Backend listening on {}", backend_addr);
-
-    let backend_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = backend_listener.accept().await {
-            println!("2. Backend: Connection accepted");
-
-            let mut total_received = 0;
+    let (backend_addr, _backend) =
+        common::start_probe_immune_backend(|mut stream, first| async move {
+            if stream.write_all(&first).await.is_err() {
+                return;
+            }
             let mut buffer = vec![0u8; 65536];
-
             while let Ok(n) = stream.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-                total_received += n;
-                println!(
-                    "   Backend: Received {} bytes (total: {})",
-                    n, total_received
-                );
-
-                // Echo back
-                if stream.write_all(&buffer[..n]).await.is_err() {
+                if n == 0 || stream.write_all(&buffer[..n]).await.is_err() {
                     break;
                 }
             }
+        })
+        .await;
 
-            println!("   Backend: Total received {} bytes", total_received);
-            total_received
-        } else {
-            0
-        }
-    });
-
-    // Start bridges
     let service = common::unique_service_name("largetest");
     let mut pair = common::BridgePair::tcp(&service, backend_addr).await;
-    let import_addr = pair.import_addr;
 
-    // Connect client
-    println!("3. Client: Connecting...");
-    let mut client = TcpStream::connect(import_addr).await?;
-    println!("4. Client: Connected");
+    let client =
+        common::connected_raw_client(pair.import_addr, b"ready?\n", common::BACKEND_READY_TIMEOUT)
+            .await
+            .expect("could not establish a served connection");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let message_size = 1024 * 1024;
+    let payload: Vec<u8> = (0..message_size).map(|i| (i % 251) as u8).collect();
 
-    // Send large message (1 MB)
-    let message_size = 1024 * 1024; // 1 MB
-    let large_message = vec![0xAB; message_size];
-    println!("5. Client: Sending {} byte message...", message_size);
+    // Write and read concurrently: a full-duplex echo of 1 MiB would deadlock
+    // if we wrote everything before reading.
+    let (mut rd, mut wr) = client.into_split();
+    let to_send = payload.clone();
+    let writer = tokio::spawn(async move {
+        wr.write_all(&to_send).await?;
+        Ok::<(), std::io::Error>(())
+    });
 
-    client.write_all(&large_message).await?;
-    println!("6. Client: Message sent");
-
-    // Read echo back
-    let mut received = 0;
-    let mut buffer = vec![0u8; 65536];
-    let start = std::time::Instant::now();
-
-    while received < message_size {
-        match timeout(Duration::from_secs(5), client.read(&mut buffer)).await {
-            Ok(Ok(n)) if n > 0 => {
-                received += n;
-                println!(
-                    "   Client: Received {} bytes (total: {}/{})",
-                    n, received, message_size
-                );
-            }
-            Ok(Ok(_)) => {
-                println!("   Client: Connection closed");
-                break;
-            }
-            Ok(Err(e)) => {
-                println!("   Client: Error: {:?}", e);
-                break;
-            }
-            Err(_) => {
-                println!("   Client: Timeout");
-                break;
-            }
-        }
-    }
-
-    let elapsed = start.elapsed();
-    println!("7. Client: Received {} bytes in {:?}", received, elapsed);
-
-    if received == message_size {
-        println!("8. ✓ TEST PASSED: Large message transferred successfully");
-    } else {
-        println!(
-            "8. ⚠ TEST WARNING: Partial transfer ({}/{} bytes)",
-            received, message_size
+    let mut received = Vec::with_capacity(message_size);
+    let mut buf = vec![0u8; 65536];
+    while received.len() < message_size {
+        let n = timeout(Duration::from_secs(20), rd.read(&mut buf))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "stalled at {}/{} echoed bytes",
+                    received.len(),
+                    message_size
+                )
+            })??;
+        anyhow::ensure!(
+            n > 0,
+            "closed at {}/{} echoed bytes",
+            received.len(),
+            message_size
         );
+        received.extend_from_slice(&buf[..n]);
     }
+    writer.await??;
 
-    // Cleanup
-    drop(client);
+    anyhow::ensure!(received == payload, "1 MiB echo was not byte-exact");
+
     pair.kill_and_wait().await;
-    let _ = timeout(Duration::from_millis(500), backend_task).await;
-
     Ok(())
 }
 
@@ -1152,105 +734,50 @@ async fn test_rapid_data_send() -> Result<()> {
     Ok(())
 }
 
-/// Test bridge recovery when backend restarts
+/// A backend that appears AFTER the bridges must start serving: the first
+/// client is refused (backend down), the backend then binds on the same
+/// address, and a retried client must succeed — asserted.
 #[tokio::test]
 async fn test_backend_restart_recovery() -> Result<()> {
-    println!("\n=== Test: Backend Restart Recovery ===\n");
-
-    // Allocate a port for the backend that will start later
     let backend_port = common::PortGuard::new();
     let backend_addr = backend_port.release();
-    println!("1. Using backend address {}", backend_addr);
 
-    // Start bridges WITHOUT backend initially
     let service = common::unique_service_name("restarttest");
-    let export_spec = format!("{}/{}", service, backend_addr);
-    let mut export_bridge = common::bridge_command()
-        .args(["--backend", &export_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
+    let export_spec = format!("{service}/{backend_addr}");
+    let _export = common::BridgeProcess::new(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let import_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let import_addr = import_listener.local_addr()?;
-    drop(import_listener);
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let _import =
+        common::BridgeProcess::new(&["--listen", &format!("{service}/{import_addr},proto=raw")])
+            .await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
 
-    let import_spec = format!("{}/{},proto=raw", service, import_addr);
-    let mut import_bridge = common::bridge_command()
-        .args(["--listen", &import_spec])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    common::wait_for_port(import_addr, Duration::from_secs(10))
-        .await
-        .expect("Import bridge did not start in time");
-
-    println!("2. Bridges started (no backend yet)");
-
-    // First client should fail fast
-    println!("3. Client 1: Connecting (should fail)...");
+    // Phase 1: no backend. The connection must be CLOSED (error signal), not
+    // left hanging.
     let mut client1 = TcpStream::connect(import_addr).await?;
     client1.write_all(b"test1\n").await?;
-
-    let mut buf = vec![0u8; 64];
-    match timeout(Duration::from_secs(2), client1.read(&mut buf)).await {
-        Ok(Ok(0)) => {
-            println!("4. Client 1: Connection closed (expected - no backend)");
-        }
-        _ => {
-            println!("4. Client 1: Unexpected response");
-        }
+    let mut buf = [0u8; 64];
+    match timeout(Duration::from_secs(15), client1.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // closed, as it must be
+        Ok(Ok(n)) => anyhow::bail!("got {n} bytes from a dead backend"),
+        Err(_) => anyhow::bail!("connection not closed while backend is down"),
     }
     drop(client1);
 
-    // Now start backend
-    println!("5. Starting backend...");
-    let backend_listener = TcpListener::bind(backend_addr).await?;
+    // Phase 2: the backend comes up on the SAME address.
+    let _backend =
+        common::start_probe_immune_backend_on(backend_addr, |mut stream, first| async move {
+            let _ = stream.write_all(&first).await;
+        })
+        .await;
 
-    let backend_task = tokio::spawn(async move {
-        if let Ok((mut stream, _)) = backend_listener.accept().await {
-            println!("   Backend: Connection accepted");
-            let mut buf = vec![0u8; 1024];
-            if let Ok(n) = stream.read(&mut buf).await
-                && n > 0
-            {
-                let _ = stream.write_all(b"backend_ok\n").await;
-                return true;
-            }
-        }
-        false
-    });
-
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Second client should succeed
-    println!("6. Client 2: Connecting (should succeed)...");
-    let mut client2 = TcpStream::connect(import_addr).await?;
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    client2.write_all(b"test2\n").await?;
-
-    match timeout(Duration::from_secs(2), client2.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            println!("7. Client 2: Received response (backend is working!)");
-            println!("8. ✓ TEST PASSED: Backend restart recovery works");
-        }
-        _ => {
-            println!("7. Client 2: No response");
-            println!("8. ⚠ TEST WARNING: Recovery may be slow");
-        }
-    }
-
-    // Cleanup
-    drop(client2);
-    let _ = export_bridge.kill().await;
-    let _ = import_bridge.kill().await;
-    let _ = timeout(Duration::from_millis(500), backend_task).await;
-    println!("9. ✓ TEST COMPLETED\n");
+    // A retried client must now be served end-to-end.
+    let echoed = common::echo_roundtrip(import_addr, b"test2\n", common::BACKEND_READY_TIMEOUT)
+        .await
+        .expect("backend restart was never picked up");
+    anyhow::ensure!(echoed == b"test2\n", "got {echoed:?}");
 
     Ok(())
 }
@@ -1290,15 +817,32 @@ async fn test_raw_listener_relays_server_first_banner() {
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Connect and WRITE NOTHING: the banner must arrive anyway.
-    let mut client = TcpStream::connect(import_addr).await.unwrap();
-    let mut banner = vec![0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut banner))
-        .await
-        .expect("banner timed out — raw listener must not wait for client bytes")
-        .unwrap();
+    // Connect and WRITE NOTHING: the banner must arrive anyway. Retry the whole
+    // connect+read until the export side is attached (a fixed sleep raced
+    // discovery under load); the backend accepts multiple connections.
+    let (mut client, mut banner, n) = common::retry_client(
+        || async {
+            let mut client = TcpStream::connect(import_addr).await?;
+            let mut banner = vec![0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut banner))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "no banner yet")
+                })??;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "closed before banner (export not attached yet)",
+                ));
+            }
+            Ok((client, banner, n))
+        },
+        common::BACKEND_READY_TIMEOUT,
+        "server-first banner",
+    )
+    .await
+    .expect("banner never arrived — raw listener must not wait for client bytes");
     assert!(
         banner[..n].starts_with(b"220 "),
         "expected the SMTP-style banner, got {:?}",
@@ -1328,15 +872,19 @@ async fn test_zenoh_endpoint_flags_wire_a_pair() {
     let zenoh_connect = format!("tcp/{zenoh_addr}");
 
     let export_spec = format!("{}/{}", service, backend_addr);
-    let _export =
-        common::BridgeProcess::new(&["--backend", &export_spec, "--zenoh-listen", &zenoh_listen])
-            .await;
+    let _export = common::BridgeProcess::new_raw(&[
+        "--backend",
+        &export_spec,
+        "--zenoh-listen",
+        &zenoh_listen,
+    ])
+    .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
     let listen_spec = format!("{}/{},proto=raw", service, import_addr);
-    let _import = common::BridgeProcess::new(&[
+    let _import = common::BridgeProcess::new_raw(&[
         "--listen",
         &listen_spec,
         "--zenoh-connect",
@@ -1366,7 +914,7 @@ async fn test_zenoh_endpoint_flags_wire_a_pair() {
 /// --zenoh-config with an unreadable file fails fast with a clean error.
 #[tokio::test]
 async fn test_zenoh_config_missing_file_fails_fast() {
-    let out = common::bridge_command()
+    let out = common::bridge_command_raw()
         .args([
             "--listen",
             "svc/127.0.0.1:0,proto=raw",
@@ -1377,4 +925,205 @@ async fn test_zenoh_config_missing_file_fails_fast() {
         .await
         .expect("spawn bridge");
     assert!(!out.status.success(), "missing zenoh config must be fatal");
+}
+
+/// R2 regression: an abrupt import death must NOT stall the export's
+/// liveliness loop for `drain_timeout`.
+///
+/// `handle_client_disconnect` used to hold the connection-map mutex across the
+/// drain await; the drained task's last act locks the same map to self-remove,
+/// so every liveliness `Delete` that hit a still-alive bridge task self-
+/// deadlocked until the 5s drain timeout expired — during which the loop
+/// processed no new client `Put`s. A client arriving just after any abrupt
+/// disconnect waited out the whole stall. Under parallel test load this was a
+/// principal source of "ambient" flakiness.
+///
+/// The choreography forces the racy path deterministically: the first import
+/// bridge is SIGKILLed while its export-side task is alive (established echo
+/// session), so the token `Delete` reaches a live task; a second import bridge
+/// and client then must complete a round-trip well inside the 5s the bug burns.
+#[tokio::test]
+async fn abrupt_import_death_does_not_stall_the_export_loop() -> Result<()> {
+    let (backend_addr, _echo) = common::start_echo_server().await;
+    let service = common::unique_service_name("stallfree");
+
+    let export_spec = format!("{service}/{backend_addr}");
+    // A huge drain budget makes the bug's signature unmistakable: with the
+    // mutex held across the drain, the next client waits ~30s; without it,
+    // seconds even under full-suite load. Wall-clock margins stay wide.
+    let _export =
+        common::BridgeProcess::new(&["--backend", &export_spec, "--drain-timeout", "30"]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Import #1: establish a live end-to-end session (round-trip proves the
+    // export-side bridge task exists), then kill the process abruptly.
+    let port1 = common::PortGuard::new();
+    let addr1 = port1.release();
+    let mut import1 =
+        common::BridgeProcess::new(&["--listen", &format!("{service}/{addr1},proto=raw")]).await;
+    common::wait_for_port(addr1, Duration::from_secs(10)).await?;
+    let echoed = common::echo_roundtrip(addr1, b"warm", common::BACKEND_READY_TIMEOUT)
+        .await
+        .expect("first import never became ready");
+    assert_eq!(echoed, b"warm");
+
+    // Keep a client OPEN through import #1 so the export-side task is
+    // definitely alive when the process dies (no clean EOF is ever sent).
+    let mut held = TcpStream::connect(addr1).await?;
+    held.write_all(b"hold").await?;
+    let mut buf = [0u8; 4];
+    timeout(Duration::from_secs(10), held.read_exact(&mut buf)).await??;
+
+    import1.kill_and_wait().await; // SIGKILL: no drain, token dies with the session
+
+    // Import #2 on the same service: the export loop must process its client
+    // promptly. With the bug, the pending `Delete` stalls the loop for the full
+    // 5s drain timeout before this client's `Put` is even looked at.
+    let port2 = common::PortGuard::new();
+    let addr2 = port2.release();
+    let _import2 =
+        common::BridgeProcess::new(&["--listen", &format!("{service}/{addr2},proto=raw")]).await;
+    common::wait_for_port(addr2, Duration::from_secs(10)).await?;
+
+    let started = std::time::Instant::now();
+    let echoed = common::echo_roundtrip(addr2, b"next", common::BACKEND_READY_TIMEOUT)
+        .await
+        .expect("second import never served");
+    let elapsed = started.elapsed();
+    assert_eq!(echoed, b"next");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "export loop stalled {elapsed:?} before serving the next client — \
+         the disconnect drain is blocking the liveliness loop"
+    );
+    Ok(())
+}
+
+/// A1/R1 regression, run under the race amplifier that made it deterministic.
+///
+/// The export publishes `{service}/error/{client}` the moment its backend dial
+/// fails — sub-milliseconds after it first learned the client exists, i.e. at
+/// the point of maximal interest-propagation skew. As a bare, uncached
+/// `session.put()`, the signal was simply LOST whenever the import's error-
+/// subscriber interest hadn't reached the export's session yet, and the client
+/// hung forever. `RUST_LOG=zenoh_transport=debug` inside the bridge processes
+/// slows session I/O enough to make that loss deterministic (6/6 full-suite
+/// failures during the audit); the fix (cached AdvancedPublisher + history-
+/// recovering subscriber) must hold under exactly that amplifier.
+///
+/// Unlike the older lenient test above, this one accepts only a real close.
+#[tokio::test]
+async fn backend_unavailable_closes_client_under_transport_load() -> Result<()> {
+    let backend_port = common::PortGuard::new();
+    let backend_addr = backend_port.release(); // nothing listens here
+
+    let service = common::unique_service_name("nobackend_amp");
+    let export_spec = format!("{service}/{backend_addr}");
+    let mut export_bridge = common::bridge_command()
+        .args(["--backend", &export_spec])
+        .env("RUST_LOG", "zenoh_transport=debug") // race amplifier
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let import_spec = format!("{service}/{import_addr},proto=raw");
+    let mut import_bridge = common::bridge_command()
+        .args(["--listen", &import_spec])
+        .env("RUST_LOG", "zenoh_transport=debug")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+
+    let mut client = TcpStream::connect(import_addr).await?;
+
+    // The ONLY acceptable outcome is a close: read returns 0 or errors within
+    // the budget (liveliness propagation + 5 dial retries + signal delivery).
+    let mut buf = [0u8; 64];
+    match timeout(Duration::from_secs(15), client.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {} // closed — the error signal arrived
+        Ok(Ok(n)) => panic!("received {n} bytes from a nonexistent backend"),
+        Err(_) => panic!(
+            "client still open 15s after connecting to a service whose backend \
+             cannot be dialed — the error signal was lost"
+        ),
+    }
+
+    let _ = export_bridge.kill().await;
+    let _ = import_bridge.kill().await;
+    Ok(())
+}
+
+/// A1/R1, distilled: the error signal must be RECOVERABLE by a subscriber
+/// whose interest arrives after the signal was published.
+///
+/// This is the race without needing load: the test itself plays the import.
+/// It declares the client liveliness token (so the export dials and fails),
+/// deliberately waits until the export must already have published the error
+/// signal, and only THEN subscribes to the error key — with history, as the
+/// real import now does. A bare `session.put()` is long gone at that point
+/// (this exact shape hung real clients); the cached AdvancedPublisher, held
+/// alive while the client token exists, must deliver it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn error_signal_is_recoverable_by_a_late_subscriber() -> Result<()> {
+    use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig};
+
+    let backend_port = common::PortGuard::new();
+    let backend_addr = backend_port.release(); // nothing listens here
+
+    // One domain shared by the subprocess export AND the in-process probe
+    // session below — they must discover each other.
+    let domain = common::ScoutDomain::new();
+    let service = common::unique_service_name("laterr");
+    let export_spec = format!("{service}/{backend_addr}");
+    let _export = domain.bridge(&["--backend", &export_spec]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let session = Arc::new(zenoh::open(domain.config()).await.unwrap());
+    let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
+
+    // Play the import's liveliness half only — the export will dial its dead
+    // backend (5 fast refusals + backoff, ~3-4s) and publish the error signal.
+    let token = session
+        .liveliness()
+        .declare_token(format!("{service}/clients/{client_id}"))
+        .await
+        .unwrap();
+
+    // Wait until the signal has certainly been published...
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // ...and only now subscribe, with history. The signal predates our
+    // interest; only the publisher's cache can deliver it.
+    let error_sub = session
+        .declare_subscriber(
+            format!("{service}/clients/{client_id}").replace("/clients/", "/error/"),
+        )
+        .history(HistoryConfig::default().detect_late_publishers())
+        .await
+        .unwrap();
+
+    // 15s: the first history query can be delayed under cross-test session
+    // churn, but the error publisher's heartbeat (500ms) makes the subscriber's
+    // late-publisher detection re-query, so recovery is guaranteed to converge —
+    // this bound only has to outlast churn, not define the mechanism.
+    let sample = tokio::time::timeout(Duration::from_secs(30), error_sub.recv_async())
+        .await
+        .expect("late subscriber never recovered the error signal — it was published fire-once")
+        .expect("error subscriber closed");
+    assert_eq!(
+        sample.payload().to_bytes().as_ref(),
+        b"backend_unavailable",
+        "recovered signal must carry the failure reason"
+    );
+
+    drop(token);
+    drop(error_sub);
+    common::shutdown_sessions([session]).await;
+    Ok(())
 }

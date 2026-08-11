@@ -31,6 +31,7 @@ pub(super) struct AcceptLoopCfg {
 /// The handler is invoked inside the spawned task — handshakes and
 /// per-connection errors belong to it; the loop only logs its `Err` and
 /// moves on.
+#[allow(clippy::too_many_arguments)] // internal, named call sites in 5 flavor modules
 pub(super) async fn run_accept_loop<H, Fut>(
     cfg: AcceptLoopCfg,
     session: Arc<Session>,
@@ -38,6 +39,7 @@ pub(super) async fn run_accept_loop<H, Fut>(
     listen_addr: SocketAddr,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
     handler: H,
 ) -> Result<()>
 where
@@ -62,6 +64,13 @@ where
     let listener = TcpListener::bind(listen_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind to {}: {}", listen_addr, e))?;
+
+    // Readiness truth (A5): /readyz must not say 200 before this port can
+    // actually accept. The sender is dropped un-sent on a bind failure, which
+    // main treats as fatal.
+    if let Some(tx) = on_bound {
+        let _ = tx.send(());
+    }
 
     info!(listen_addr = %listen_addr, service = %service_name, mode = mode, "Import bridge ready");
 
@@ -135,6 +144,11 @@ where
                         // Accept failed; release the permit we were holding.
                         drop(permit);
                         error!(error = %e, "Failed to accept connection");
+                        // Back off: EMFILE/ENFILE do not consume the pending
+                        // connection, so accept() fails again immediately — an
+                        // unthrottled loop burned 100% CPU and flooded the log
+                        // exactly when the process was already fd-starved.
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     }
                 }
             }

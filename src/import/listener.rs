@@ -11,6 +11,7 @@ pub(super) async fn run_import_mode_internal(
     http_mode: bool,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let (service_name, listen_addr) = super::parse_import_spec(import_spec)?;
     let mode = if http_mode { "http_import" } else { "import" };
@@ -25,6 +26,7 @@ pub(super) async fn run_import_mode_internal(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         move |session, stream, service, client_id, config| async move {
             super::connection::handle_import_connection(
                 session, stream, &service, &client_id, http_mode, config,

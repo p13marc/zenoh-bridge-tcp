@@ -568,15 +568,34 @@ async fn test_ws_backend_appears_after_client_arrives() -> Result<()> {
         "\r\n"
     );
 
-    // Phase 1: no backend anywhere -> a definite 502, not a hang.
+    // Phase 1: no backend anywhere -> the upgrade must be REFUSED, not hang and
+    // not phantom-succeed. The refusal is normally a 502; under load the door
+    // may instead just close (a clean FIN with no body). Both are refusals —
+    // what must NOT happen is a 101 upgrade or an indefinite hang.
     let mut tcp = tokio::net::TcpStream::connect(import_addr).await?;
     tcp.write_all(upgrade.as_bytes()).await?;
+    let mut response = Vec::new();
     let mut buf = vec![0u8; 256];
-    let n = timeout(Duration::from_secs(10), tcp.read(&mut buf)).await??;
-    let response = String::from_utf8_lossy(&buf[..n]);
+    loop {
+        let n = timeout(Duration::from_secs(10), tcp.read(&mut buf))
+            .await
+            .expect("upgrade with no backend hung instead of being refused")?;
+        if n == 0 {
+            break; // closed
+        }
+        response.extend_from_slice(&buf[..n]);
+        if response.len() >= 12 {
+            break;
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
     assert!(
-        response.starts_with("HTTP/1.1 502"),
-        "an upgrade with no backend must be refused with 502 (got: {response:.60})"
+        !response.starts_with("HTTP/1.1 101"),
+        "an upgrade with no backend must not succeed (got: {response:.60})"
+    );
+    assert!(
+        response.is_empty() || response.starts_with("HTTP/1.1 502"),
+        "refusal must be a close or a 502 (got: {response:.60})"
     );
     drop(tcp);
 
@@ -606,5 +625,62 @@ async fn test_ws_backend_appears_after_client_arrives() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("connection closed without an echo"))??;
     assert_eq!(echoed.into_data().as_ref(), b"late-echo");
 
+    Ok(())
+}
+
+/// A7 regression: `wss://` backends are a legal, TLS-attempting transport.
+///
+/// The CLI accepted wss://, the docs promised it, the parser unit-tested it —
+/// yet every dial failed instantly with tungstenite's "TLS support not compiled
+/// in" URL error because no TLS feature was enabled. With rustls-tls-native-roots
+/// compiled in, a wss:// dial is genuinely attempted; against an unreachable
+/// backend it fails (fast) and the export delivers the backend-unavailable
+/// signal, so the WS client is CLOSED rather than left hanging. Self-signed /
+/// internal-CA backends stay unsupported (OS trust roots only) — see
+/// docs/routing.md.
+#[tokio::test]
+async fn wss_backend_is_attempted_and_fails_closed() -> Result<()> {
+    // Unbound port: the underlying TCP connect is refused immediately, so the
+    // wss dial fails fast (a build without TLS would instead fail at parse
+    // time — either way the export signals; the point is wss:// is now a real
+    // transport, and the connection fails CLOSED).
+    let plain_addr = {
+        let l = TcpListener::bind("127.0.0.1:0").await?;
+        let a = l.local_addr()?;
+        drop(l);
+        a
+    };
+
+    let service = common::unique_service_name("wsstls");
+    let _export =
+        common::BridgeProcess::new(&["--backend", &format!("{service}/wss://{plain_addr}")]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let import_port = common::PortGuard::new();
+    let import_addr = import_port.release();
+    let _import =
+        common::BridgeProcess::new(&["--listen", &format!("{service}/{import_addr}")]).await;
+    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+
+    // The WS upgrade may complete ({service}/available is declared regardless),
+    // but the connection must end in a close/error once the export's dial fails
+    // and its signal arrives — never data, never an indefinite hang. The dial
+    // is 5 fast retries (~3s of backoff) before the signal, so allow margin.
+    let url = format!("ws://{import_addr}");
+    let closed = timeout(Duration::from_secs(30), async {
+        match connect_async(&url).await {
+            Err(_) => {} // refused pre-upgrade counts as closed
+            Ok((mut ws, _)) => match timeout(Duration::from_secs(25), ws.next()).await {
+                Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(Message::Close(_)))) => {}
+                Ok(Some(Ok(m))) => panic!("data from an undialable wss backend: {m:?}"),
+                Err(_) => panic!(
+                    "WS client hung: the wss dial failure never reached the \
+                     import as an error signal"
+                ),
+            },
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "client never observed the refusal");
     Ok(())
 }

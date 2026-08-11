@@ -1,5 +1,71 @@
 # Changelog
 
+## [0.9.0] - 2026-08-11
+
+A deep-audit release: correctness and lifecycle hardening across the export and
+import data planes, a new HA capability, and a test suite that is now
+deterministic under `--retries 0`.
+
+### Added
+
+- **Active/standby exporter election.** Two `--backend` bridges announcing the
+  same service are now an HA pair: one is elected active (oldest claim wins),
+  the others stand by and take over on its death. Previously both served every
+  client, interleaving responses and double-executing requests. See
+  `docs/routing.md`.
+- **`wss://` backends actually work.** `tokio-tungstenite` is built with
+  `rustls-tls-native-roots`; a `--backend 's/wss://host'` now validates against
+  the system trust roots. Previously every `wss://` dial failed with "TLS
+  support not compiled in", despite being CLI-accepted and documented.
+- **A configurable per-attempt backend dial timeout** (`connect_timeout`, 10s):
+  a blackholed backend no longer runs each dial to the OS SYN timeout.
+
+### Fixed
+
+- **The backend-unavailable signal is now recoverable.** It was a fire-once,
+  uncached `session.put()` raced by its own trigger, so under interest-
+  propagation skew (WAN, load) it was lost and the client hung forever. It is
+  now a cached AdvancedPublisher held until the client token disappears, with a
+  history-recovering subscriber. It also fires on EVERY export failure path
+  (dial, Zenoh setup, mid-connection reset, backend read error), not just dial.
+- **The export liveliness loop no longer stalls.** `handle_client_disconnect`
+  held the connection-map mutex across the drain await (self-deadlock vs the
+  task's own self-removal), so every abrupt disconnect froze the loop for
+  `drain_timeout`; the dial ran inline, so one slow/blackholed backend deafened
+  the whole exporter. Dials moved into the per-client task; the disconnect path
+  cancels without waiting; duplicate client `Put`s are ignored.
+- **Truncated streams are no longer reported as clean completions.** A backend
+  (or client) read error used to publish the clean-EOF half-close marker, so
+  the peer saw a well-formed FIN on a truncated body; it now resets.
+- **Import door hardening.** Auto-detect re-peeks until the classifier decides
+  (a short first segment no longer silently misroutes a TLS/HTTP client to the
+  default backend); TLS-terminating and WebSocket handshakes are bounded
+  (an idle client could pin a task+fd+permit forever); the h2c timeout-fallback
+  probes for a backend before relaying (no-backend now closes fast); every
+  connection's Zenoh setup phase is time-bounded (a stalled declare no longer
+  hangs a task holding a connection-limit permit); the accept-error path backs
+  off instead of spinning at 100% CPU under fd exhaustion.
+- **Truthful readiness and orderly shutdown.** `/readyz` reports 200 only after
+  every listener has bound (a bind failure now fails the process instead of
+  running partially deaf with readiness green), answers 503 during the drain
+  window instead of connection-refused, and the process exits through `main` so
+  buffered file-log lines flush.
+- **Logging robustness.** An empty-but-set `RUST_LOG` no longer silences the
+  process; a malformed one warns and falls back; an unwritable `file=` sink is a
+  clean startup error instead of a panic.
+- `--read-timeout 0` and (0.8.1) `--max-response-size` overshoot fixes carried
+  forward.
+
+### Changed
+
+- **The test suite is deterministic with zero retries.** Every test runs on a
+  private Zenoh multicast scouting domain (`common::ScoutDomain`), removing the
+  cross-test contention that made discovery slow and flaky; `.config/nextest.toml`
+  now sets `retries = 0`. Added a three-bridge topology suite (fan-out, relay
+  node, late joiner) and an HA suite, and replaced several vacuous tests (which
+  printed a failure and returned success) with hard assertions.
+- Dead `src/error.rs` removed; relay hot paths no longer copy each chunk.
+
 ## [0.8.1] - 2026-08-10
 
 Bug-fix and consolidation release. No new features, no CLI additions.

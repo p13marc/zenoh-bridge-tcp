@@ -17,6 +17,7 @@ pub(super) async fn run_ws_import_mode(
     import_spec: &str,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let (service_name, listen_addr) = super::parse_import_spec(import_spec)?;
 
@@ -30,6 +31,7 @@ pub(super) async fn run_ws_import_mode(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         handle_ws_import_connection,
     )
     .await
@@ -43,9 +45,13 @@ async fn handle_ws_import_connection(
     client_id: String,
     config: Arc<BridgeConfig>,
 ) -> Result<()> {
-    let ws_stream = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| anyhow::anyhow!("WebSocket handshake failed: {}", e))?;
+    // F4: bound the upgrade handshake — an idle client must not pin a task,
+    // an fd and a connection-limit permit forever.
+    let ws_stream =
+        tokio::time::timeout(config.read_timeout, tokio_tungstenite::accept_async(stream))
+            .await
+            .map_err(|_| anyhow::anyhow!("WebSocket handshake timed out"))?
+            .map_err(|e| anyhow::anyhow!("WebSocket handshake failed: {}", e))?;
 
     let (ws_sender, ws_receiver) = ws_stream.split();
     let reader = crate::transport::WsReader::new(ws_receiver);

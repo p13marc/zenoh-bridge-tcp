@@ -21,6 +21,7 @@ pub(super) async fn run_https_terminate_import_mode(
     tls_config: Arc<rustls::ServerConfig>,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     use tokio_rustls::TlsAcceptor;
 
@@ -38,13 +39,19 @@ pub(super) async fn run_https_terminate_import_mode(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         move |session, tcp_stream, service, client_id, config| {
             let tls_acceptor = tls_acceptor.clone();
             async move {
-                let tls_stream = tls_acceptor
-                    .accept(tcp_stream)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
+                // F4: bound the handshake. Unbounded, a client that connects
+                // and sends nothing (or half a ClientHello) pins a task, an fd
+                // AND a max_connections permit forever — 1024 idle sockets
+                // took the listener down permanently.
+                let tls_stream =
+                    tokio::time::timeout(config.read_timeout, tls_acceptor.accept(tcp_stream))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?
+                        .map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
                 handle_tls_terminated_connection(session, tls_stream, &service, &client_id, config)
                     .await
             }

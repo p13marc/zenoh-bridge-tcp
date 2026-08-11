@@ -96,6 +96,16 @@ pub struct BridgeConfig {
     /// a field so tests can shrink it.
     pub response_idle_timeout: Duration,
 
+    /// Per-attempt bound on dialing a backend (TCP connect / WebSocket
+    /// handshake; default: 10 seconds).
+    ///
+    /// The dial retry policy (backon) bounds the number of attempts and the
+    /// delay *between* them — not the duration of one attempt. Without this, a
+    /// blackholed address runs each attempt to the OS SYN timeout (~2 minutes
+    /// on Linux) and five retries kept the export deaf for ~13 minutes.
+    /// Config-only, like `response_idle_timeout`: a safety net, not a knob.
+    pub connect_timeout: Duration,
+
     /// Per-connection Zenoh reception buffer depth in samples (default: 256).
     ///
     /// Each client's response subscriber is drained into a bounded channel of
@@ -120,6 +130,7 @@ impl Default for BridgeConfig {
             drain_timeout: Duration::from_secs(5),
             max_response_size: 10 * 1024 * 1024, // 10 MiB
             response_idle_timeout: Duration::from_secs(30),
+            connect_timeout: Duration::from_secs(10),
             rx_channel_capacity: 256,
         }
     }

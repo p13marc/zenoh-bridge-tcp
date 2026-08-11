@@ -18,6 +18,7 @@ pub(super) async fn run_auto_import_mode(
     import_spec: &str,
     config: Arc<BridgeConfig>,
     shutdown_token: CancellationToken,
+    on_bound: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     let (service_name, listen_addr) = super::parse_import_spec(import_spec)?;
 
@@ -31,6 +32,7 @@ pub(super) async fn run_auto_import_mode(
         listen_addr,
         config,
         shutdown_token,
+        on_bound,
         |session, stream, service, client_id, config| async move {
             handle_auto_import_connection(session, stream, &service, &client_id, config).await
         },
@@ -55,30 +57,45 @@ async fn handle_auto_import_connection(
     // line) decides from its first segment. Bound the wait so an idle client
     // cannot pin a task+fd forever (F4).
     let mut peek_buf = vec![0u8; 64];
-    let peek_len = match tokio::time::timeout(config.read_timeout, stream.peek(&mut peek_buf)).await
-    {
-        Ok(Ok(n)) => n,
-        Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to peek connection: {}", e)),
-        Err(_) => {
-            return Err(anyhow::anyhow!(
-                "Client sent no data within the read timeout"
-            ));
+    let deadline = tokio::time::Instant::now() + config.read_timeout;
+    let mut backoff = std::time::Duration::from_millis(1);
+    let (protocol, undecided) = loop {
+        let peek_len = match tokio::time::timeout_at(deadline, stream.peek(&mut peek_buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(anyhow::anyhow!("Failed to peek connection: {}", e)),
+            Err(_) => {
+                return Err(anyhow::anyhow!(
+                    "Client sent no data within the read timeout"
+                ));
+            }
+        };
+        if peek_len == 0 {
+            return Err(anyhow::anyhow!("Connection closed before sending any data"));
         }
-    };
 
-    if peek_len == 0 {
-        return Err(anyhow::anyhow!("Connection closed before sending any data"));
-    }
-
-    // `NeedMore` (a sub-signature fragment) falls back to opaque relay, matching
-    // the previous "unknown protocol -> raw TCP" behavior.
-    let protocol = match classify_first_bytes(&peek_buf[..peek_len]) {
-        Classify::Decided(p) => p,
-        _ => WireProtocol::Raw,
+        match classify_first_bytes(&peek_buf[..peek_len]) {
+            Classify::Decided(p) => break (p, false),
+            // A sub-signature fragment (e.g. a TLS record header split across
+            // segments: classify needs >=6 bytes to call it TLS). Deciding
+            // `Raw` on it would SILENTLY route a TLS or HTTP client past its
+            // host key to the default backend — misrouting, not an error.
+            // Re-peek until the classifier can decide or the deadline passes;
+            // only a client that genuinely stalls mid-signature falls back.
+            _ => {
+                if tokio::time::Instant::now() >= deadline || peek_len == peek_buf.len() {
+                    break (WireProtocol::Raw, true);
+                }
+                tokio::time::sleep(backoff.min(deadline - tokio::time::Instant::now())).await;
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(10));
+            }
+        }
     };
     info!(
         client_id = %client_id,
         protocol = %protocol,
+        // Distinguish "genuinely opaque bytes" from "gave up undecided" — the
+        // field an operator needs when a connection lands on the wrong backend.
+        undecided = undecided,
         "Auto-classified protocol"
     );
 
@@ -135,35 +152,44 @@ async fn peek_full_http_head(
     config: &BridgeConfig,
 ) -> Option<flowscope::http::RequestHead> {
     let deadline = tokio::time::Instant::now() + config.read_timeout;
-    let mut size = 4096usize;
+    // One buffer for the whole loop, sized to the cap up front. It used to be
+    // reallocated (and zeroed) every 10ms iteration at the current window size
+    // — a dribbling client cost ~3 GB/s of pure memcpy across 1024 connections.
+    let mut buf = vec![0u8; config.max_header_size.max(4096)];
+    let mut last_len = 0usize;
+    let mut backoff = std::time::Duration::from_millis(1);
     loop {
-        let mut buf = vec![0u8; size];
         let n = match tokio::time::timeout_at(deadline, stream.peek(&mut buf)).await {
             Err(_) | Ok(Err(_)) => return None,
             Ok(Ok(0)) => return None,
             Ok(Ok(n)) => n,
         };
-        if let Some(head) = super::connection::peek_http_head(&buf[..n], config) {
-            return Some(head);
-        }
-        if n == size {
-            // The window is full and still no head: widen it, up to the cap.
-            if size >= config.max_header_size {
-                return None;
+        // Only re-run the parser when new bytes actually arrived; peek always
+        // returns from the start of the socket buffer, so an unchanged length
+        // means an unchanged prefix.
+        if n > last_len {
+            last_len = n;
+            backoff = std::time::Duration::from_millis(1);
+            match super::connection::peek_http_head_outcome(&buf[..n], config) {
+                super::connection::PeekOutcome::Head(head) => return Some(head),
+                // Malformed or protocol-switched: no amount of further bytes
+                // will produce a routable head — fail to the consuming reader
+                // NOW instead of polling out the whole deadline.
+                super::connection::PeekOutcome::Refused => return None,
+                super::connection::PeekOutcome::NeedMore => {}
             }
-            size = (size * 2).min(config.max_header_size);
-        } else {
-            // Partial head and nothing new buffered yet — poll again shortly.
-            if tokio::time::timeout_at(
-                deadline,
-                tokio::time::sleep(std::time::Duration::from_millis(10)),
-            )
-            .await
-            .is_err()
-            {
+            if n >= config.max_header_size {
+                // Cap reached without a complete head.
                 return None;
             }
         }
+        // Nothing new buffered yet — back off (1ms -> 10ms) under the deadline.
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        tokio::time::sleep(backoff.min(deadline - now)).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_millis(10));
     }
 }
 
@@ -222,6 +248,17 @@ async fn handle_h2c_connection(
                 consumed = partial.len(),
                 "h2c client sent no request head; falling back to opaque relay"
             );
+            // The opaque fallback still needs a live default backend: without
+            // this probe, a no-backend h2c connection published into the void
+            // and hung, while the parsed path above closed fast. Symmetry.
+            match super::connection::resolve_backend(&session, service_name, None, &config).await? {
+                BackendRoute::Host | BackendRoute::Default => {}
+                BackendRoute::Unavailable => {
+                    return Err(anyhow::anyhow!(
+                        "No default backend available for un-keyed h2c fallback"
+                    ));
+                }
+            }
             (None, partial, false)
         }
     };

@@ -12,7 +12,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 /// Start a simple echo server, returning its address.
@@ -165,8 +164,9 @@ async fn test_multiple_exports() {
     let echo_addr = start_echo_server().await;
     let counter_addr = start_counter_server().await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let svc_echo = unique_service_name("multiexp_echo");
     let svc_counter = unique_service_name("multiexp_count");
@@ -200,6 +200,7 @@ async fn test_multiple_exports() {
     assert!(response.starts_with(b"count:"));
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test multiple imports from different services.
@@ -213,8 +214,9 @@ async fn test_multiple_imports() {
     let echo_addr = start_echo_server().await;
     let counter_addr = start_counter_server().await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let svc1 = unique_service_name("multiimp_svc1");
     let svc2 = unique_service_name("multiimp_svc2");
@@ -247,6 +249,7 @@ async fn test_multiple_imports() {
     assert!(resp2.starts_with(b"count:"));
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test three exports simultaneously (echo, counter, reverse).
@@ -261,8 +264,9 @@ async fn test_mixed_export_import() {
     let counter_addr = start_counter_server().await;
     let reverse_addr = start_reverse_server().await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let svc_echo = unique_service_name("mixed_echo");
     let svc_counter = unique_service_name("mixed_count");
@@ -308,6 +312,7 @@ async fn test_mixed_export_import() {
     assert_eq!(resp, b"DCBA");
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test that different services are isolated — messages don't cross.
@@ -321,8 +326,9 @@ async fn test_service_isolation() {
     let echo_addr = start_echo_server().await;
     let reverse_addr = start_reverse_server().await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let svc_echo = unique_service_name("iso_echo");
     let svc_reverse = unique_service_name("iso_rev");
@@ -392,4 +398,5 @@ async fn test_service_isolation() {
         .expect("Reverse task panicked");
 
     shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }

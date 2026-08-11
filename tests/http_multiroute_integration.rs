@@ -13,7 +13,6 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use zenoh::config::Config;
 use zenoh_bridge_tcp::config::BridgeConfig;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -98,8 +97,9 @@ async fn test_multiroute_single_request() {
     let backend_addr = start_backend("backend-a").await;
 
     // Open Zenoh sessions
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Start HTTP export for host-a.test
     let s1 = session1.clone();
@@ -160,6 +160,7 @@ async fn test_multiroute_single_request() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// #63: a multiroute request moves the per-service byte + connection metrics.
@@ -177,8 +178,9 @@ async fn test_multiroute_byte_metrics() {
     let service = "mr-metrics";
 
     let backend_addr = start_backend("backend-m").await;
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
@@ -244,6 +246,7 @@ async fn test_multiroute_byte_metrics() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test that multiple requests on a persistent connection can route to different backends.
@@ -258,8 +261,9 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     let backend_b_addr = start_backend("backend-b").await;
 
     // Open Zenoh sessions
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-switch";
 
@@ -345,6 +349,7 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     export_a.abort();
     export_b.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test that a request to an unavailable host returns 502 but doesn't kill the connection.
@@ -357,8 +362,9 @@ async fn test_multiroute_unavailable_host_returns_502() {
     // Start one backend only (for host-a)
     let backend_addr = start_backend("backend-a").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Unique per run: nextest runs test binaries in parallel on a shared Zenoh
     // scouting domain, so a literal name lets concurrent tests share a keyspace.
@@ -426,6 +432,7 @@ async fn test_multiroute_unavailable_host_returns_502() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Backend with a GET `/` (so HEAD yields Content-Length + no body) and a POST
@@ -449,10 +456,11 @@ async fn spawn_multiroute(
     dns: &str,
     backend_addr: SocketAddr,
     shutdown_token: &CancellationToken,
-) -> SocketAddr {
+) -> (SocketAddr, [Arc<zenoh::Session>; 2]) {
     let config = Arc::new(BridgeConfig::default());
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     // Unique per call: nextest runs test binaries in parallel on a shared Zenoh
     // scouting domain, and several tests here call this concurrently.
@@ -481,7 +489,7 @@ async fn spawn_multiroute(
             .unwrap();
     });
     sleep(Duration::from_secs(1)).await;
-    import_addr
+    (import_addr, [session1, session2])
 }
 
 /// E1: a POST whose body arrives in a segment after the headers must be
@@ -491,7 +499,8 @@ async fn test_multiroute_post_with_delayed_body() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
     let backend_addr = start_echo_backend().await;
-    let import_addr = spawn_multiroute("echo.test", backend_addr, &shutdown_token).await;
+    let (import_addr, sessions) =
+        spawn_multiroute("echo.test", backend_addr, &shutdown_token).await;
 
     let body = "A".repeat(20_000);
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
@@ -534,6 +543,7 @@ async fn test_multiroute_post_with_delayed_body() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// E3: a HEAD response has Content-Length but no body; the bridge must complete
@@ -543,7 +553,8 @@ async fn test_multiroute_head_completes_promptly() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
     let backend_addr = start_echo_backend().await;
-    let import_addr = spawn_multiroute("head.test", backend_addr, &shutdown_token).await;
+    let (import_addr, sessions) =
+        spawn_multiroute("head.test", backend_addr, &shutdown_token).await;
 
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
     stream
@@ -575,6 +586,7 @@ async fn test_multiroute_head_completes_promptly() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// E2 (#27): two pipelined requests sent in a single write must both be routed
@@ -589,8 +601,9 @@ async fn test_multiroute_pipelined_requests() {
     let backend_a_addr = start_backend("backend-a").await;
     let backend_b_addr = start_backend("backend-b").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-pipeline";
 
@@ -689,6 +702,7 @@ async fn test_multiroute_pipelined_requests() {
     export_a.abort();
     export_b.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// A plain (default) backend serves every Host on a multiroute listener when
@@ -701,8 +715,9 @@ async fn test_multiroute_default_backend() {
 
     let backend_addr = start_backend("backend-default").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-default";
 
@@ -765,6 +780,7 @@ async fn test_multiroute_default_backend() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// `@host` precedence per request on one multiroute connection: the claimed
@@ -778,8 +794,9 @@ async fn test_multiroute_mixed_host_and_default() {
     let backend_a_addr = start_backend("backend-a").await;
     let backend_default_addr = start_backend("backend-default").await;
 
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let service = "mr-mixed";
 
@@ -856,20 +873,7 @@ async fn test_multiroute_mixed_host_and_default() {
     export_a.abort();
     export_default.abort();
     import_task.abort();
-}
-
-/// Count connections the bridge has ever opened for `service`, read straight
-/// out of the in-process metrics registry.
-fn connections_total(service: &str) -> u64 {
-    let rendered = zenoh_bridge_tcp::metrics::metrics().render_prometheus();
-    rendered
-        .lines()
-        .find_map(|l| {
-            let rest = l.strip_prefix("zbridge_connections_total{service=\"")?;
-            let (svc, tail) = rest.split_once('"')?;
-            (svc == service).then(|| tail.rsplit(' ').next()?.trim().parse::<u64>().ok())?
-        })
-        .unwrap_or(0)
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// B3 regression: after a 502, the multiroute door keeps the connection usable
@@ -877,10 +881,11 @@ fn connections_total(service: &str) -> u64 {
 ///
 /// The door deliberately keeps routing on the same connection so a client can
 /// retry a different Host — but it used to answer with `Connection: close`,
-/// which every compliant client obeys. The existing raw-socket test could not
-/// see the contradiction because it ignores the header. This drives a real
-/// `reqwest` client with a connection pool and asserts the bridge saw exactly
-/// ONE connection across both requests, which is the property that was broken.
+/// which every compliant client obeys. This drives ONE socket we own through a
+/// 502 (unroutable Host) and then a 200 (live Host): the follow-up can only be
+/// served on the same connection if the 502 left it open, so it fails hard on a
+/// `Connection: close` regression while staying deterministic under load (no
+/// dependence on a client library's opportunistic connection pooling).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -890,8 +895,9 @@ async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     let service = common::unique_service_name("mr502ka");
 
     let config = Arc::new(BridgeConfig::default());
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
@@ -935,73 +941,45 @@ async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     assert_eq!(resp.status(), 200);
     let _ = resp.bytes().await;
 
-    // Calibrate: how much does the connection counter move for ONE client
-    // connection? It is not 1 — import and export both run in this process and
-    // both count against the same service — so measure it instead of assuming.
-    let base =
-        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await;
-    let fresh = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .build()
-        .unwrap();
-    let resp = fresh
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "host-a.test")
-        .send()
-        .await
-        .expect("calibration request failed");
-    assert_eq!(resp.status(), 200);
-    let _ = resp.bytes().await;
-    let per_connection =
-        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await
-            - base;
-    assert!(per_connection > 0, "calibration must observe a connection");
+    // Deterministic reuse proof: drive BOTH requests over ONE socket we own,
+    // so the result cannot hinge on a client library's opportunistic pooling
+    // (which races under load and is what made the counter-based version flaky).
+    // A compliant client keeps the connection after a 502 only if the 502 did
+    // not say `Connection: close`; then the follow-up 200 to a live Host arrives
+    // on the very same socket. Had the bug regressed, the bridge would close the
+    // socket after the 502 and the second read would return an empty response.
+    let mut conn = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
-    // Now the real measurement: a 502 followed by a 200 on a POOLED client. If
-    // the 502 still said `Connection: close`, the client would retire the
-    // connection and this window would cost two connections instead of one.
-    let before =
-        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await;
-
-    let resp = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "nonexistent.test")
-        .send()
-        .await
-        .expect("502 request failed");
-    assert_eq!(resp.status(), 502, "unroutable Host must be refused");
-    assert_ne!(
-        resp.headers()
-            .get(reqwest::header::CONNECTION)
-            .map(|v| v.as_bytes()),
-        Some(b"close".as_ref()),
-        "the multiroute 502 must not tell the client to hang up"
+    // First request: an unroutable Host must be refused with 502 — and the 502
+    // must NOT carry `Connection: close`.
+    let refused = http_request(&mut conn, "nonexistent.test").await;
+    let refused_head = refused.split("\r\n\r\n").next().unwrap_or("");
+    assert!(
+        refused_head.starts_with("HTTP/1.1 502"),
+        "unroutable Host must be refused with 502, got head: {refused_head:?}"
     );
-    // Drain so the connection can return to the pool.
-    let _ = resp.bytes().await.unwrap();
+    assert!(
+        !refused_head.to_lowercase().contains("connection: close"),
+        "the multiroute 502 must not tell the client to hang up, got head: {refused_head:?}"
+    );
 
-    let resp = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "host-a.test")
-        .send()
-        .await
-        .expect("follow-up request failed");
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
-    assert!(body.contains("backend-a"), "got: {body}");
-
-    let opened = common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5))
-        .await
-        - before;
-    assert_eq!(
-        opened, per_connection,
-        "the 502 must leave the connection reusable: two requests should cost the \
-         same as one connection ({per_connection}), but cost {opened}"
+    // Second request on the SAME connection: a live Host must be served 200,
+    // proving the 502 left the connection genuinely reusable.
+    let served = http_request(&mut conn, "host-a.test").await;
+    assert!(
+        served.starts_with("HTTP/1.1 200"),
+        "the 502 must leave the connection reusable for a follow-up request, \
+         got: {served:?}"
+    );
+    assert!(
+        served.contains("backend-a"),
+        "follow-up request routed to the wrong backend: {served:?}"
     );
 
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Spin up a multiroute pair with a caller-supplied config and a raw TCP backend
@@ -1011,7 +989,7 @@ async fn spawn_multiroute_with<F, Fut>(
     config: BridgeConfig,
     shutdown_token: &CancellationToken,
     serve: F,
-) -> SocketAddr
+) -> (SocketAddr, [Arc<zenoh::Session>; 2])
 where
     F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1028,8 +1006,9 @@ where
 
     let config = Arc::new(config);
     let service = common::unique_service_name("mrcfg");
-    let session1 = Arc::new(zenoh::open(Config::default()).await.unwrap());
-    let session2 = Arc::new(zenoh::open(Config::default()).await.unwrap());
+    let _scout = common::ScoutDomain::new();
+    let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
+    let session2 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
 
     let s1 = session1.clone();
     let t1 = shutdown_token.child_token();
@@ -1052,10 +1031,10 @@ where
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .expect("multiroute listener never bound");
-    // Leak the sessions for the test's lifetime; dropping them would tear the
-    // bridges down underneath it.
-    std::mem::forget((session1, session2));
-    import_addr
+    // Return the sessions so the caller keeps them alive for the test's lifetime
+    // (dropping them would tear the bridges down underneath it) and can close
+    // them cleanly before runtime teardown via `common::shutdown_sessions`.
+    (import_addr, [session1, session2])
 }
 
 /// B2 regression: a response that keeps trickling must NOT be killed just
@@ -1081,7 +1060,7 @@ async fn multiroute_streaming_response_outlives_the_idle_budget() {
         ..BridgeConfig::default()
     };
 
-    let import_addr = spawn_multiroute_with(
+    let (import_addr, sessions) = spawn_multiroute_with(
         "slow.test",
         config,
         &shutdown_token,
@@ -1130,6 +1109,7 @@ async fn multiroute_streaming_response_outlives_the_idle_budget() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// B6 regression: `max_response_size` is enforced BEFORE the excess is written.
@@ -1150,7 +1130,7 @@ async fn multiroute_response_size_cap_is_not_overshot() {
         ..BridgeConfig::default()
     };
 
-    let import_addr =
+    let (import_addr, sessions) =
         spawn_multiroute_with("big.test", config, &shutdown_token, |mut sock| async move {
             let mut buf = vec![0u8; 4096];
             let _ = sock.read(&mut buf).await;
@@ -1207,4 +1187,5 @@ async fn multiroute_response_size_cap_is_not_overshot() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
