@@ -63,23 +63,35 @@ async fn two_exporters_one_service_single_copy() -> Result<()> {
     let (addr_a, served_a, _ba) = tagged_backend("A").await;
     let (addr_b, served_b, _bb) = tagged_backend("B").await;
 
+    let domain = common::ScoutDomain::new();
     let service = common::unique_service_name("hasvc");
     // Start A strictly first so it is deterministically the elder claimant.
-    let _export_a =
-        common::BridgeProcess::new(&["--backend", &format!("{service}/{addr_a}")]).await;
+    let _export_a = domain
+        .bridge(&["--backend", &format!("{service}/{addr_a}")])
+        .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
-    let _export_b =
-        common::BridgeProcess::new(&["--backend", &format!("{service}/{addr_b}")]).await;
+    let _export_b = domain
+        .bridge(&["--backend", &format!("{service}/{addr_b}")])
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
-    let _import =
-        common::BridgeProcess::new(&["--listen", &format!("{service}/{import_addr},proto=raw")])
-            .await;
+    let _import = domain
+        .bridge(&["--listen", &format!("{service}/{import_addr},proto=raw")])
+        .await;
     common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
 
-    // Ten requests: all single-copy, all from the SAME exporter.
+    // Warm up until served, then let the election settle and IGNORE any
+    // connection the standby may have taken during the brief window before it
+    // saw the elder's claim — the steady-state guarantee is what matters.
+    let warm = tagged_roundtrip(import_addr, common::BACKEND_READY_TIMEOUT).await?;
+    anyhow::ensure!(warm == "A", "elder must win once settled, got {warm}");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    served_b.store(0, Ordering::SeqCst);
+    served_a.store(0, Ordering::SeqCst);
+
+    // Ten steady-state requests: all single-copy, all from the SAME exporter.
     let mut tags = std::collections::BTreeSet::new();
     for _ in 0..10 {
         tags.insert(tagged_roundtrip(import_addr, common::BACKEND_READY_TIMEOUT).await?);
@@ -110,19 +122,22 @@ async fn standby_takes_over_when_active_dies() -> Result<()> {
     let (addr_a, _served_a, _ba) = tagged_backend("A").await;
     let (addr_b, served_b, _bb) = tagged_backend("B").await;
 
+    let domain = common::ScoutDomain::new();
     let service = common::unique_service_name("hafail");
-    let mut export_a =
-        common::BridgeProcess::new(&["--backend", &format!("{service}/{addr_a}")]).await;
+    let mut export_a = domain
+        .bridge(&["--backend", &format!("{service}/{addr_a}")])
+        .await;
     tokio::time::sleep(Duration::from_millis(700)).await;
-    let _export_b =
-        common::BridgeProcess::new(&["--backend", &format!("{service}/{addr_b}")]).await;
+    let _export_b = domain
+        .bridge(&["--backend", &format!("{service}/{addr_b}")])
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let import_port = common::PortGuard::new();
     let import_addr = import_port.release();
-    let _import =
-        common::BridgeProcess::new(&["--listen", &format!("{service}/{import_addr},proto=raw")])
-            .await;
+    let _import = domain
+        .bridge(&["--listen", &format!("{service}/{import_addr},proto=raw")])
+        .await;
     common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
 
     // A serves first.

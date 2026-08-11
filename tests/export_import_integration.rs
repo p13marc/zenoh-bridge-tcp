@@ -817,15 +817,32 @@ async fn test_raw_listener_relays_server_first_banner() {
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Connect and WRITE NOTHING: the banner must arrive anyway.
-    let mut client = TcpStream::connect(import_addr).await.unwrap();
-    let mut banner = vec![0u8; 64];
-    let n = tokio::time::timeout(Duration::from_secs(10), client.read(&mut banner))
-        .await
-        .expect("banner timed out — raw listener must not wait for client bytes")
-        .unwrap();
+    // Connect and WRITE NOTHING: the banner must arrive anyway. Retry the whole
+    // connect+read until the export side is attached (a fixed sleep raced
+    // discovery under load); the backend accepts multiple connections.
+    let (mut client, mut banner, n) = common::retry_client(
+        || async {
+            let mut client = TcpStream::connect(import_addr).await?;
+            let mut banner = vec![0u8; 64];
+            let n = tokio::time::timeout(Duration::from_secs(3), client.read(&mut banner))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "no banner yet")
+                })??;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "closed before banner (export not attached yet)",
+                ));
+            }
+            Ok((client, banner, n))
+        },
+        common::BACKEND_READY_TIMEOUT,
+        "server-first banner",
+    )
+    .await
+    .expect("banner never arrived — raw listener must not wait for client bytes");
     assert!(
         banner[..n].starts_with(b"220 "),
         "expected the SMTP-style banner, got {:?}",
