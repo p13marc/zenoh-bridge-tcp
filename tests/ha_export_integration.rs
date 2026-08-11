@@ -80,7 +80,7 @@ async fn two_exporters_one_service_single_copy() -> Result<()> {
     let _import = domain
         .bridge(&["--listen", &format!("{service}/{import_addr},proto=raw")])
         .await;
-    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+    common::wait_for_port(import_addr, Duration::from_secs(45)).await?;
 
     // Warm up until served (proves the path is wired), then let the election
     // settle and IGNORE any connection the standby may have taken during the
@@ -140,7 +140,7 @@ async fn standby_takes_over_when_active_dies() -> Result<()> {
     let _import = domain
         .bridge(&["--listen", &format!("{service}/{import_addr},proto=raw")])
         .await;
-    common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
+    common::wait_for_port(import_addr, Duration::from_secs(45)).await?;
 
     // Wait until the election has settled on the elder (A) as the active
     // exporter — on a slow host the standby can answer a request during the

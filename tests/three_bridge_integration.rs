@@ -12,6 +12,13 @@ use anyhow::Result;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Budget for a bridge subprocess to bind its listener. These topologies spawn
+/// three-plus bridges at once, and on a heavily loaded (cold-start) CI runner a
+/// bridge that normally binds in well under a second can be CPU-starved for many
+/// seconds before its listener comes up — 10s was too tight and flaked. The
+/// bridge does bind; this only widens the wait, so a passing run is unaffected.
+const STARTUP: Duration = Duration::from_secs(45);
+
 /// Send `payload` to a raw import listener and return the echo, retrying the
 /// whole exchange until the multi-hop path is wired.
 async fn echo(addr: std::net::SocketAddr, payload: &[u8]) -> Result<Vec<u8>> {
@@ -53,8 +60,8 @@ async fn two_import_doors_share_one_backend() -> Result<()> {
         .bridge(&["--listen", &format!("{service}/{addr_c},proto=raw")])
         .await;
 
-    common::wait_for_port(addr_b, Duration::from_secs(10)).await?;
-    common::wait_for_port(addr_c, Duration::from_secs(10)).await?;
+    common::wait_for_port(addr_b, STARTUP).await?;
+    common::wait_for_port(addr_c, STARTUP).await?;
 
     // Both doors reach the one backend.
     assert_eq!(echo(addr_b, b"via-B").await?, b"via-B");
@@ -120,8 +127,8 @@ async fn relay_node_bridges_two_services() -> Result<()> {
         .bridge(&["--listen", &format!("{front_svc}/{front_addr},proto=raw")])
         .await;
 
-    common::wait_for_port(relay_addr, Duration::from_secs(10)).await?;
-    common::wait_for_port(front_addr, Duration::from_secs(10)).await?;
+    common::wait_for_port(relay_addr, STARTUP).await?;
+    common::wait_for_port(front_addr, STARTUP).await?;
 
     // A client at the front must reach the backend three hops away, byte-exact.
     assert_eq!(echo(front_addr, b"three-hops").await?, b"three-hops");
@@ -149,7 +156,7 @@ async fn third_bridge_joins_a_live_pair() -> Result<()> {
     let _door1 = domain
         .bridge(&["--listen", &format!("{service}/{addr1},proto=raw")])
         .await;
-    common::wait_for_port(addr1, Duration::from_secs(10)).await?;
+    common::wait_for_port(addr1, STARTUP).await?;
     assert_eq!(echo(addr1, b"first").await?, b"first");
 
     // Now a THIRD bridge joins the live topology.
@@ -158,7 +165,7 @@ async fn third_bridge_joins_a_live_pair() -> Result<()> {
     let _door2 = domain
         .bridge(&["--listen", &format!("{service}/{addr2},proto=raw")])
         .await;
-    common::wait_for_port(addr2, Duration::from_secs(10)).await?;
+    common::wait_for_port(addr2, STARTUP).await?;
 
     assert_eq!(echo(addr2, b"late").await?, b"late");
     // The original door still works too.
