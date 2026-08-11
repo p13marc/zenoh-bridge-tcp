@@ -67,10 +67,13 @@ jobs:
           API_BASE: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
           TOK: ${{ github.token }}
         run: |
-          { echo "== nextest =="; grep -E "FAIL \[|SIGABRT|TIMEOUT|SLOW \[|timed out|leaving behind|thread .* panicked|assertion|error\[|error:" /tmp/nx.txt 2>/dev/null | head -60; echo "== doctests =="; grep -E "FAILED|error\[|error:|panicked|test result: FAILED|---- .* stdout ----" /tmp/doc.txt 2>/dev/null | head -40; } > /tmp/fails.txt || true
+          # Post the TAIL of each step's raw output (summaries + failure blocks),
+          # ANSI stripped — grepping missed the real failure last time.
+          strip() { sed -E 's/\x1b\[[0-9;]*m//g'; }
+          { echo "== nextest tail =="; tail -n 45 /tmp/nx.txt 2>/dev/null | strip; echo; echo "== doctests tail =="; tail -n 45 /tmp/doc.txt 2>/dev/null | strip; } > /tmp/fails.txt || true
           python3 - <<'PY' || true
           import os, json, urllib.request
-          fails = open('/tmp/fails.txt').read()[:6000] or "(no captured failure lines — the step may have failed before producing output)"
+          fails = open('/tmp/fails.txt').read()[-5500:] or "(no output captured — a step may have failed before writing its file)"
           body = "### CI diagnostic — `test` job failures on the runner\n\n```\n" + fails + "\n```"
           pr, base, tok = os.environ["PR_NUMBER"], os.environ["API_BASE"], os.environ["TOK"]
           req = urllib.request.Request(f"{base}/issues/{pr}/comments",
