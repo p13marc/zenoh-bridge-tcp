@@ -50,41 +50,8 @@ jobs:
       - uses: https://github.com/taiki-e/install-action@v2
         with:
           tool: cargo-nextest
-      - name: nextest (all-features)
-        run: |
-          set -o pipefail
-          cargo nextest run --all-features --locked 2>&1 | tee /tmp/nx.txt
-      - name: doctests (all-features)
-        run: |
-          set -o pipefail
-          cargo test --doc --all-features --locked 2>&1 | tee /tmp/doc.txt  # nextest skips doctests
-      # TEMP DIAGNOSTIC: this runner does not persist task logs. Surface failures
-      # via a PR comment (DB-backed). Remove once the failure is identified.
-      - name: report test-job failures
-        if: failure()
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          API_BASE: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
-          TOK: ${{ github.token }}
-        run: |
-          # Post the TAIL of each step's raw output (summaries + failure blocks),
-          # ANSI stripped — grepping missed the real failure last time.
-          strip() { sed -E 's/\x1b\[[0-9;]*m//g'; }
-          { echo "== nextest tail =="; tail -n 45 /tmp/nx.txt 2>/dev/null | strip; echo; echo "== doctests tail =="; tail -n 45 /tmp/doc.txt 2>/dev/null | strip; } > /tmp/fails.txt || true
-          python3 - <<'PY' || true
-          import os, json, urllib.request
-          fails = open('/tmp/fails.txt').read()[-5500:] or "(no output captured — a step may have failed before writing its file)"
-          body = "### CI diagnostic — `test` job failures on the runner\n\n```\n" + fails + "\n```"
-          pr, base, tok = os.environ["PR_NUMBER"], os.environ["API_BASE"], os.environ["TOK"]
-          req = urllib.request.Request(f"{base}/issues/{pr}/comments",
-                                       data=json.dumps({"body": body}).encode(),
-                                       headers={"Authorization": f"token {tok}", "Content-Type": "application/json"},
-                                       method="POST")
-          try:
-              urllib.request.urlopen(req, timeout=25); print("comment posted")
-          except Exception as e:
-              print("comment post failed:", e)
-          PY
+      - run: cargo nextest run --all-features --locked
+      - run: cargo test --doc --all-features --locked  # nextest skips doctests
 
   # The h2/gRPC code is behind `tls-termination`; --all-features never compiles the
   # default build, so exercise it explicitly (clippy + tests, no features).
