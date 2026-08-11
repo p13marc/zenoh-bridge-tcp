@@ -4663,7 +4663,6 @@ dependencies = [
  "serde",
  "serde_json",
  "syslog-tracing",
- "thiserror 2.0.19",
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite 0.30.0",

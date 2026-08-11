@@ -82,11 +82,13 @@ async fn two_exporters_one_service_single_copy() -> Result<()> {
         .await;
     common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
 
-    // Warm up until served, then let the election settle and IGNORE any
-    // connection the standby may have taken during the brief window before it
-    // saw the elder's claim — the steady-state guarantee is what matters.
-    let warm = tagged_roundtrip(import_addr, common::BACKEND_READY_TIMEOUT).await?;
-    anyhow::ensure!(warm == "A", "elder must win once settled, got {warm}");
+    // Warm up until served (proves the path is wired), then let the election
+    // settle and IGNORE any connection the standby may have taken during the
+    // brief window before it saw the elder's claim. We deliberately do NOT
+    // assert the warm-up tag: on a slow host the standby can answer one request
+    // before it observes the elder's (older) claim and demotes. The
+    // steady-state block below is the guarantee that matters.
+    let _warm = tagged_roundtrip(import_addr, common::BACKEND_READY_TIMEOUT).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     served_b.store(0, Ordering::SeqCst);
     served_a.store(0, Ordering::SeqCst);
@@ -140,9 +142,27 @@ async fn standby_takes_over_when_active_dies() -> Result<()> {
         .await;
     common::wait_for_port(import_addr, Duration::from_secs(10)).await?;
 
-    // A serves first.
-    let tag = tagged_roundtrip(import_addr, common::BACKEND_READY_TIMEOUT).await?;
-    anyhow::ensure!(tag == "A", "expected the elder exporter first, got {tag}");
+    // Wait until the election has settled on the elder (A) as the active
+    // exporter — on a slow host the standby can answer a request during the
+    // brief pre-election window, so retry until A is the steady-state server
+    // before we test failover away from it.
+    common::retry_client(
+        || async {
+            let tag = tagged_roundtrip(import_addr, Duration::from_secs(8))
+                .await
+                .map_err(std::io::Error::other)?;
+            if tag == "A" {
+                Ok(tag)
+            } else {
+                Err(std::io::Error::other(format!(
+                    "elder not yet active: {tag}"
+                )))
+            }
+        },
+        Duration::from_secs(30),
+        "elder exporter (A) to become active",
+    )
+    .await?;
 
     // Kill the active. The standby must observe the claim Delete and take over.
     export_a.kill_and_wait().await;

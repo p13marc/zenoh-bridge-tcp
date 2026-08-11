@@ -865,29 +865,16 @@ async fn test_multiroute_mixed_host_and_default() {
     import_task.abort();
 }
 
-/// Count connections the bridge has ever opened for `service`, read straight
-/// out of the in-process metrics registry.
-fn connections_total(service: &str) -> u64 {
-    let rendered = zenoh_bridge_tcp::metrics::metrics().render_prometheus();
-    rendered
-        .lines()
-        .find_map(|l| {
-            let rest = l.strip_prefix("zbridge_connections_total{service=\"")?;
-            let (svc, tail) = rest.split_once('"')?;
-            (svc == service).then(|| tail.rsplit(' ').next()?.trim().parse::<u64>().ok())?
-        })
-        .unwrap_or(0)
-}
-
 /// B3 regression: after a 502, the multiroute door keeps the connection usable
 /// **for a client that honours HTTP semantics**.
 ///
 /// The door deliberately keeps routing on the same connection so a client can
 /// retry a different Host — but it used to answer with `Connection: close`,
-/// which every compliant client obeys. The existing raw-socket test could not
-/// see the contradiction because it ignores the header. This drives a real
-/// `reqwest` client with a connection pool and asserts the bridge saw exactly
-/// ONE connection across both requests, which is the property that was broken.
+/// which every compliant client obeys. This drives ONE socket we own through a
+/// 502 (unroutable Host) and then a 200 (live Host): the follow-up can only be
+/// served on the same connection if the 502 left it open, so it fails hard on a
+/// `Connection: close` regression while staying deterministic under load (no
+/// dependence on a client library's opportunistic connection pooling).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     let _ = tracing_subscriber::fmt::try_init();
@@ -943,68 +930,39 @@ async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     assert_eq!(resp.status(), 200);
     let _ = resp.bytes().await;
 
-    // Calibrate: how much does the connection counter move for ONE client
-    // connection? It is not 1 — import and export both run in this process and
-    // both count against the same service — so measure it instead of assuming.
-    let base =
-        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await;
-    let fresh = reqwest::Client::builder()
-        .pool_max_idle_per_host(0)
-        .build()
-        .unwrap();
-    let resp = fresh
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "host-a.test")
-        .send()
-        .await
-        .expect("calibration request failed");
-    assert_eq!(resp.status(), 200);
-    let _ = resp.bytes().await;
-    let per_connection =
-        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await
-            - base;
-    assert!(per_connection > 0, "calibration must observe a connection");
+    // Deterministic reuse proof: drive BOTH requests over ONE socket we own,
+    // so the result cannot hinge on a client library's opportunistic pooling
+    // (which races under load and is what made the counter-based version flaky).
+    // A compliant client keeps the connection after a 502 only if the 502 did
+    // not say `Connection: close`; then the follow-up 200 to a live Host arrives
+    // on the very same socket. Had the bug regressed, the bridge would close the
+    // socket after the 502 and the second read would return an empty response.
+    let mut conn = tokio::net::TcpStream::connect(import_addr).await.unwrap();
 
-    // Now the real measurement: a 502 followed by a 200 on a POOLED client. If
-    // the 502 still said `Connection: close`, the client would retire the
-    // connection and this window would cost two connections instead of one.
-    let before =
-        common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5)).await;
-
-    let resp = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "nonexistent.test")
-        .send()
-        .await
-        .expect("502 request failed");
-    assert_eq!(resp.status(), 502, "unroutable Host must be refused");
-    assert_ne!(
-        resp.headers()
-            .get(reqwest::header::CONNECTION)
-            .map(|v| v.as_bytes()),
-        Some(b"close".as_ref()),
-        "the multiroute 502 must not tell the client to hang up"
+    // First request: an unroutable Host must be refused with 502 — and the 502
+    // must NOT carry `Connection: close`.
+    let refused = http_request(&mut conn, "nonexistent.test").await;
+    let refused_head = refused.split("\r\n\r\n").next().unwrap_or("");
+    assert!(
+        refused_head.starts_with("HTTP/1.1 502"),
+        "unroutable Host must be refused with 502, got head: {refused_head:?}"
     );
-    // Drain so the connection can return to the pool.
-    let _ = resp.bytes().await.unwrap();
+    assert!(
+        !refused_head.to_lowercase().contains("connection: close"),
+        "the multiroute 502 must not tell the client to hang up, got head: {refused_head:?}"
+    );
 
-    let resp = client
-        .get(format!("http://{}/", import_addr))
-        .header("Host", "host-a.test")
-        .send()
-        .await
-        .expect("follow-up request failed");
-    assert_eq!(resp.status(), 200);
-    let body = resp.text().await.unwrap();
-    assert!(body.contains("backend-a"), "got: {body}");
-
-    let opened = common::wait_for_stable(|| connections_total(&service), Duration::from_secs(5))
-        .await
-        - before;
-    assert_eq!(
-        opened, per_connection,
-        "the 502 must leave the connection reusable: two requests should cost the \
-         same as one connection ({per_connection}), but cost {opened}"
+    // Second request on the SAME connection: a live Host must be served 200,
+    // proving the 502 left the connection genuinely reusable.
+    let served = http_request(&mut conn, "host-a.test").await;
+    assert!(
+        served.starts_with("HTTP/1.1 200"),
+        "the 502 must leave the connection reusable for a follow-up request, \
+         got: {served:?}"
+    );
+    assert!(
+        served.contains("backend-a"),
+        "follow-up request routed to the wrong backend: {served:?}"
     );
 
     shutdown_token.cancel();

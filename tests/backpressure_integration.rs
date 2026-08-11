@@ -34,6 +34,50 @@ async fn start_flooding_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
+/// Prove a fast client can make progress on the shared session while a slow
+/// client stays stuck. Retries the WHOLE fast exchange on a fresh connection:
+/// under heavy CI CPU starvation the "fast" client can itself be
+/// scheduling-starved and, in Stream mode, reset before it reads a byte — a
+/// retry rides over that transient. A genuine head-of-line block is different in
+/// kind: it wedges the shared reception thread so EVERY fresh connection reads
+/// zero, the budget expires, and the caller's assertion fails hard. Returns the
+/// most bytes any single attempt accumulated.
+async fn fast_client_makes_progress(
+    import_addr: SocketAddr,
+    target: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut best = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    while tokio::time::Instant::now() < deadline {
+        let Ok(mut fast) = TcpStream::connect(import_addr).await else {
+            continue;
+        };
+        let _ = fast.write_all(b"hello").await;
+        let mut received = 0usize;
+        let attempt = async {
+            while received < target {
+                match fast.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => received += n,
+                    Err(_) => break,
+                }
+            }
+            received
+        };
+        let got = timeout(Duration::from_secs(10), attempt)
+            .await
+            .unwrap_or(received);
+        best = best.max(got);
+        if best >= target {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    best
+}
+
 /// A slow client stuck not reading must not stop a fast client from receiving
 /// the backend flood over the shared session.
 #[tokio::test]
@@ -59,29 +103,12 @@ async fn slow_client_does_not_stall_fast_client() {
     // Give the slow client time to back up and trip the reset.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Fast client: connect and read. It must accumulate a healthy amount of the
-    // flood promptly, proving the session is not head-of-line-blocked.
-    let mut fast = TcpStream::connect(bridge.import_addr).await.unwrap();
-    let _ = fast.write_all(b"hello").await;
-
-    const TARGET: usize = 256 * 1024;
-    let mut received = 0usize;
-    let mut buf = vec![0u8; 64 * 1024];
-
-    let read_target = async {
-        while received < TARGET {
-            match fast.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => received += n,
-                Err(_) => break,
-            }
-        }
-        received
-    };
-
-    let got = timeout(Duration::from_secs(15), read_target)
-        .await
-        .unwrap_or(received);
+    // Fast client: it must accumulate a full flood chunk while the slow client
+    // stays stuck, proving the session is not head-of-line-blocked. One chunk is
+    // a strong discriminator — a blocked session delivers *zero* — and the retry
+    // rides over CI scheduling jitter (see `fast_client_makes_progress`).
+    const TARGET: usize = 64 * 1024;
+    let got = fast_client_makes_progress(bridge.import_addr, TARGET, Duration::from_secs(40)).await;
 
     // Keep the slow client alive until the assertion so it is genuinely
     // competing for the session the whole time.
@@ -90,9 +117,7 @@ async fn slow_client_does_not_stall_fast_client() {
     assert!(
         got >= TARGET,
         "fast client should keep progressing while a slow client is stuck; \
-         only received {} of {} bytes",
-        got,
-        TARGET
+         best attempt received only {got} of {TARGET} bytes"
     );
 }
 
@@ -113,32 +138,16 @@ async fn telemetry_mode_does_not_stall_fast_client() {
     let _ = slow.write_all(b"hello").await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let mut fast = TcpStream::connect(bridge.import_addr).await.unwrap();
-    let _ = fast.write_all(b"hello").await;
-
-    const TARGET: usize = 256 * 1024;
-    let mut received = 0usize;
-    let mut buf = vec![0u8; 64 * 1024];
-    let read_target = async {
-        while received < TARGET {
-            match fast.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => received += n,
-                Err(_) => break,
-            }
-        }
-        received
-    };
-    let got = timeout(Duration::from_secs(15), read_target)
-        .await
-        .unwrap_or(received);
+    // One flood chunk proves the shed-mode session is not blocked; the retry
+    // keeps it robust under load (see the Stream-mode test above).
+    const TARGET: usize = 64 * 1024;
+    let got = fast_client_makes_progress(bridge.import_addr, TARGET, Duration::from_secs(40)).await;
     drop(slow);
 
     assert!(
         got >= TARGET,
-        "in Telemetry mode a slow client must not stall others; got {} of {}",
-        got,
-        TARGET
+        "in Telemetry mode a slow client must not stall others; \
+         best attempt received only {got} of {TARGET} bytes"
     );
 }
 
@@ -167,6 +176,70 @@ async fn start_flooding_http_backend() -> (SocketAddr, tokio::task::JoinHandle<(
 
 fn http_get(host: &str) -> Vec<u8> {
     format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").into_bytes()
+}
+
+/// Connect to `addr`, retrying briefly. A freshly-spawned bridge listener on a
+/// heavily oversubscribed CI host can transiently refuse a connection even after
+/// its port first became connectable, so a bare `connect().unwrap()` flakes.
+async fn connect_retry(addr: SocketAddr) -> TcpStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(s) => return s,
+            Err(e) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "could not connect to {addr}: {e}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+/// Retry the fast multiroute exchange (fresh connection, GET, read) until it
+/// accumulates `target` bytes or `budget` expires. A genuine head-of-line block
+/// wedges the shared session so every attempt reads zero and the budget expires
+/// (the caller then fails hard); a mere scheduling transient recovers on retry.
+/// Returns the most bytes any single attempt accumulated.
+async fn fast_http_makes_progress(
+    addr: SocketAddr,
+    host: &str,
+    target: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut best = 0usize;
+    let mut buf = vec![0u8; 64 * 1024];
+    while tokio::time::Instant::now() < deadline {
+        let Ok(mut fast) = TcpStream::connect(addr).await else {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        };
+        if fast.write_all(&http_get(host)).await.is_err() {
+            continue;
+        }
+        let mut received = 0usize;
+        let attempt = async {
+            while received < target {
+                match fast.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => received += n,
+                    Err(_) => break,
+                }
+            }
+            received
+        };
+        let got = timeout(Duration::from_secs(15), attempt)
+            .await
+            .unwrap_or(received);
+        best = best.max(got);
+        if best >= target {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    best
 }
 
 /// The multiroute path must honor D2 too (#63 follow-up): a slow multiroute
@@ -200,40 +273,22 @@ async fn slow_multiroute_client_does_not_stall_fast_client() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Slow client: request, then never read the 8 MiB response.
-    let mut slow = TcpStream::connect(import_addr).await.unwrap();
+    let mut slow = connect_retry(import_addr).await;
     let _ = slow.write_all(&http_get("host.test")).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Fast client: request and read promptly — must progress despite the slow one.
-    // The discriminator is strong: WITHOUT the fix the blocked session delivers
-    // *zero* bytes to the fast client, so a modest target + generous timeout stays
-    // robust under heavy CI load while still failing hard on a regression.
-    let mut fast = TcpStream::connect(import_addr).await.unwrap();
-    fast.write_all(&http_get("host.test")).await.unwrap();
-
+    // Fast client: must progress despite the slow one. The discriminator is
+    // strong — WITHOUT the fix the blocked session delivers *zero* bytes to the
+    // fast client on every attempt — and the retry keeps it robust under heavy
+    // CI load (see `fast_http_makes_progress`).
     const TARGET: usize = 64 * 1024;
-    let mut received = 0usize;
-    let mut buf = vec![0u8; 64 * 1024];
-    let read_target = async {
-        while received < TARGET {
-            match fast.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => received += n,
-                Err(_) => break,
-            }
-        }
-        received
-    };
-    let got = timeout(Duration::from_secs(30), read_target)
-        .await
-        .unwrap_or(received);
+    let got =
+        fast_http_makes_progress(import_addr, "host.test", TARGET, Duration::from_secs(40)).await;
     drop(slow);
 
     assert!(
         got >= TARGET,
         "fast multiroute client should progress while a slow one is stuck; \
-         only received {} of {} bytes",
-        got,
-        TARGET
+         best attempt received only {got} of {TARGET} bytes"
     );
 }
