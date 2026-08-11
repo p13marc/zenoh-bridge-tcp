@@ -320,6 +320,16 @@ async fn test_very_long_headers() {
     sleep(Duration::from_secs(2)).await;
     println!("Setup complete");
 
+    // Readiness gate: host-routed discovery can take a moment under load;
+    // retry a GET until it is actually served before the fixed assertions.
+    common::raw_http_until_served(
+        import_addr,
+        b"GET / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\n\r\n",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("bridge never became ready");
+
     // Test 1: Long but valid headers
     println!("\nTest 1: Long but valid headers");
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
@@ -697,6 +707,15 @@ async fn test_connection_lifecycle() {
 
     sleep(Duration::from_secs(2)).await;
     println!("Setup complete");
+
+    // Readiness gate under load (see test_http_methods).
+    common::raw_http_until_served(
+        import_addr,
+        b"GET / HTTP/1.1\r\nHost: test.example.com\r\nConnection: close\r\n\r\n",
+        common::BACKEND_READY_TIMEOUT,
+    )
+    .await
+    .expect("bridge never became ready");
 
     // Test: Rapid sequential connections (using raw TCP with Connection: close)
     println!("\nTest: Rapid sequential connections");

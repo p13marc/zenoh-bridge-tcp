@@ -164,6 +164,43 @@ On the backend side the protocol is a property of the target address:
 composes with either; leaving it off makes the backend the service's default
 (catch-all for opaque traffic and every unclaimed hostname).
 
+## Multi-node topologies
+
+Because routing lives on the Zenoh key space, not in a route table, bridges
+compose by naming the same service — no node's config references another.
+
+- **Fan-out (many doors, one backend).** Any number of `--listen` bridges on
+  one service all reach a single `--backend`. Each accepted connection mints a
+  fresh `client_id`, so the doors have disjoint keyspaces; one door dying does
+  not disturb another's connections.
+- **Relay / chain.** One process may carry both `--listen` and `--backend`. A
+  relay imports service `back` on a local port and re-exports that port onto
+  service `front`, so a client at the `front` door reaches a backend two hops
+  away. Chains extend to any length.
+- **Late join.** A bridge joining a live topology is reachable as soon as it
+  discovers the bus — no restart of the existing nodes.
+
+### Redundant backends (HA) — one active exporter per service
+
+Declaring `{service}/available` from **two** exporters of the same service is an
+active/standby pair, not load balancing. The exporters elect a single **active**
+by an oldest-claim-wins liveliness token; the others stand by and ignore client
+tokens. If the active's session dies, the next-oldest takes over and serves the
+clients that were waiting. Traffic is therefore delivered exactly once, to one
+backend — never split or duplicated across the pair.
+
+Caveats: the election compares wall-clock start times across machines, so a
+large clock skew can elect a newcomer (deterministically — both sides agree on
+the order); after a network partition heals, the younger of two actives demotes
+and drains its connections.
+
+### wss:// backends
+
+`--backend 's/wss://host:port'` connects with TLS validated against the **system
+trust roots**. Self-signed or internal-CA backends are not supported (there is
+no custom-CA option); use a publicly- or OS-trusted certificate, or terminate
+TLS elsewhere.
+
 ## Migrating from 0.6.x
 
 0.7.0 removed the nine per-protocol routing flags in favor of the two-flag

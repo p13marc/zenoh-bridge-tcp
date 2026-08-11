@@ -752,3 +752,34 @@ impl Default for ScoutDomain {
         Self::new()
     }
 }
+
+/// Send one raw HTTP/1.1 request to a host-routed import door and return the
+/// response text, retrying past the startup 502/`no-response` window.
+///
+/// The many `sleep(2s)` + raw-request edge-case tests raced readiness under
+/// CPU load; this gates the first request the way `get_through_bridge` does for
+/// reqwest, without pulling in a client.
+pub async fn raw_http_until_served(
+    addr: SocketAddr,
+    request: &[u8],
+    budget: Duration,
+) -> anyhow::Result<String> {
+    retry_client(
+        || async {
+            let mut stream = TcpStream::connect(addr).await?;
+            stream.write_all(request).await?;
+            stream.flush().await?;
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+                .await
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "no response"))??;
+            if response.contains("502") || response.is_empty() {
+                return Err(std::io::Error::other("no backend yet"));
+            }
+            Ok(response)
+        },
+        budget,
+        "raw HTTP through the bridge",
+    )
+    .await
+}
