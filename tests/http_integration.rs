@@ -84,7 +84,9 @@ async fn start_http_backend() -> SocketAddr {
 
 /// Spawn a TCP export+import pair using the real library functions.
 /// Returns (shutdown_token, import_addr).
-async fn spawn_tcp_bridge_pair(backend_addr: SocketAddr) -> (CancellationToken, SocketAddr) {
+async fn spawn_tcp_bridge_pair(
+    backend_addr: SocketAddr,
+) -> (CancellationToken, SocketAddr, [Arc<zenoh::Session>; 2]) {
     let shutdown_token = CancellationToken::new();
     let config = Arc::new(BridgeConfig::default());
     let service = common::unique_service_name("httpint");
@@ -128,7 +130,12 @@ async fn spawn_tcp_bridge_pair(backend_addr: SocketAddr) -> (CancellationToken, 
     // resolves the backend at connect time (HTTP by Host, TLS by SNI), so a
     // client that beats the export side's availability token gets a 502 or a
     // close. Callers must drive their first client through `common::retry_client`.
-    (shutdown_token, import_addr)
+    //
+    // The sessions are returned so the caller can close them BEFORE the test's
+    // runtime tears down: a `zenoh::Session` dropped during runtime shutdown
+    // races Zenoh's own runtime and can abort the whole binary with SIGABRT
+    // ("RefCell already borrowed"). Close them via `common::shutdown_sessions`.
+    (shutdown_token, import_addr, [session1, session2])
 }
 
 /// TEST 1: HTTP request through the bridge
@@ -137,7 +144,7 @@ async fn test_http_through_bridge() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let backend_addr = start_http_backend().await;
-    let (_shutdown, import_addr) = spawn_tcp_bridge_pair(backend_addr).await;
+    let (shutdown, import_addr, sessions) = spawn_tcp_bridge_pair(backend_addr).await;
 
     // Send HTTP GET / through the bridge
     let client = reqwest::Client::builder()
@@ -170,6 +177,9 @@ async fn test_http_through_bridge() {
     assert_eq!(resp.status(), 200);
     let data: EchoResponse = resp.json().await.unwrap();
     assert_eq!(data.echo, "bridge-test");
+
+    shutdown.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// TEST 2: HTTPS/TLS passthrough — bridge forwards encrypted bytes without decrypting
@@ -210,7 +220,7 @@ async fn test_tls_passthrough() {
     });
     sleep(Duration::from_millis(500)).await;
 
-    let (_shutdown, import_addr) = spawn_tcp_bridge_pair(https_addr).await;
+    let (shutdown, import_addr, sessions) = spawn_tcp_bridge_pair(https_addr).await;
 
     // Connect to the bridge and send a TLS ClientHello — the bridge should forward
     // these opaque bytes to the HTTPS backend without understanding them.
@@ -254,6 +264,9 @@ async fn test_tls_passthrough() {
             // Timeout or connection close is acceptable with an incomplete handshake
         }
     }
+
+    shutdown.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// TEST 3: Multiple sequential HTTP requests through the bridge
@@ -262,7 +275,7 @@ async fn test_multiple_http_requests() {
     let _ = tracing_subscriber::fmt::try_init();
 
     let backend_addr = start_http_backend().await;
-    let (_shutdown, import_addr) = spawn_tcp_bridge_pair(backend_addr).await;
+    let (shutdown, import_addr, sessions) = spawn_tcp_bridge_pair(backend_addr).await;
 
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(0)
@@ -287,4 +300,7 @@ async fn test_multiple_http_requests() {
 
         sleep(Duration::from_millis(100)).await;
     }
+
+    shutdown.cancel();
+    common::shutdown_sessions(sessions).await;
 }

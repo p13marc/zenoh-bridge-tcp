@@ -331,8 +331,8 @@ async fn test_http_routing_multiple_backends() {
     export_api_task.abort();
     export_web_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -439,8 +439,8 @@ async fn test_http_routing_concurrent_clients() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -539,6 +539,6 @@ async fn test_http_routing_backend_becomes_available() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }

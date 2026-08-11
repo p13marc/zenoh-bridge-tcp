@@ -160,6 +160,7 @@ async fn test_multiroute_single_request() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// #63: a multiroute request moves the per-service byte + connection metrics.
@@ -245,6 +246,7 @@ async fn test_multiroute_byte_metrics() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test that multiple requests on a persistent connection can route to different backends.
@@ -347,6 +349,7 @@ async fn test_multiroute_persistent_connection_switches_hosts() {
     export_a.abort();
     export_b.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Test that a request to an unavailable host returns 502 but doesn't kill the connection.
@@ -429,6 +432,7 @@ async fn test_multiroute_unavailable_host_returns_502() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Backend with a GET `/` (so HEAD yields Content-Length + no body) and a POST
@@ -452,7 +456,7 @@ async fn spawn_multiroute(
     dns: &str,
     backend_addr: SocketAddr,
     shutdown_token: &CancellationToken,
-) -> SocketAddr {
+) -> (SocketAddr, [Arc<zenoh::Session>; 2]) {
     let config = Arc::new(BridgeConfig::default());
     let _scout = common::ScoutDomain::new();
     let session1 = Arc::new(zenoh::open(_scout.config()).await.unwrap());
@@ -485,7 +489,7 @@ async fn spawn_multiroute(
             .unwrap();
     });
     sleep(Duration::from_secs(1)).await;
-    import_addr
+    (import_addr, [session1, session2])
 }
 
 /// E1: a POST whose body arrives in a segment after the headers must be
@@ -495,7 +499,8 @@ async fn test_multiroute_post_with_delayed_body() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
     let backend_addr = start_echo_backend().await;
-    let import_addr = spawn_multiroute("echo.test", backend_addr, &shutdown_token).await;
+    let (import_addr, sessions) =
+        spawn_multiroute("echo.test", backend_addr, &shutdown_token).await;
 
     let body = "A".repeat(20_000);
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
@@ -538,6 +543,7 @@ async fn test_multiroute_post_with_delayed_body() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// E3: a HEAD response has Content-Length but no body; the bridge must complete
@@ -547,7 +553,8 @@ async fn test_multiroute_head_completes_promptly() {
     let _ = tracing_subscriber::fmt::try_init();
     let shutdown_token = CancellationToken::new();
     let backend_addr = start_echo_backend().await;
-    let import_addr = spawn_multiroute("head.test", backend_addr, &shutdown_token).await;
+    let (import_addr, sessions) =
+        spawn_multiroute("head.test", backend_addr, &shutdown_token).await;
 
     let mut stream = tokio::net::TcpStream::connect(import_addr).await.unwrap();
     stream
@@ -579,6 +586,7 @@ async fn test_multiroute_head_completes_promptly() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// E2 (#27): two pipelined requests sent in a single write must both be routed
@@ -694,6 +702,7 @@ async fn test_multiroute_pipelined_requests() {
     export_a.abort();
     export_b.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// A plain (default) backend serves every Host on a multiroute listener when
@@ -771,6 +780,7 @@ async fn test_multiroute_default_backend() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// `@host` precedence per request on one multiroute connection: the claimed
@@ -863,6 +873,7 @@ async fn test_multiroute_mixed_host_and_default() {
     export_a.abort();
     export_default.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// B3 regression: after a 502, the multiroute door keeps the connection usable
@@ -968,6 +979,7 @@ async fn multiroute_502_keeps_connection_reusable_for_a_real_client() {
     shutdown_token.cancel();
     export_task.abort();
     import_task.abort();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// Spin up a multiroute pair with a caller-supplied config and a raw TCP backend
@@ -977,7 +989,7 @@ async fn spawn_multiroute_with<F, Fut>(
     config: BridgeConfig,
     shutdown_token: &CancellationToken,
     serve: F,
-) -> SocketAddr
+) -> (SocketAddr, [Arc<zenoh::Session>; 2])
 where
     F: Fn(tokio::net::TcpStream) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
@@ -1019,10 +1031,10 @@ where
     common::wait_for_port(import_addr, Duration::from_secs(10))
         .await
         .expect("multiroute listener never bound");
-    // Leak the sessions for the test's lifetime; dropping them would tear the
-    // bridges down underneath it.
-    std::mem::forget((session1, session2));
-    import_addr
+    // Return the sessions so the caller keeps them alive for the test's lifetime
+    // (dropping them would tear the bridges down underneath it) and can close
+    // them cleanly before runtime teardown via `common::shutdown_sessions`.
+    (import_addr, [session1, session2])
 }
 
 /// B2 regression: a response that keeps trickling must NOT be killed just
@@ -1048,7 +1060,7 @@ async fn multiroute_streaming_response_outlives_the_idle_budget() {
         ..BridgeConfig::default()
     };
 
-    let import_addr = spawn_multiroute_with(
+    let (import_addr, sessions) = spawn_multiroute_with(
         "slow.test",
         config,
         &shutdown_token,
@@ -1097,6 +1109,7 @@ async fn multiroute_streaming_response_outlives_the_idle_budget() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }
 
 /// B6 regression: `max_response_size` is enforced BEFORE the excess is written.
@@ -1117,7 +1130,7 @@ async fn multiroute_response_size_cap_is_not_overshot() {
         ..BridgeConfig::default()
     };
 
-    let import_addr =
+    let (import_addr, sessions) =
         spawn_multiroute_with("big.test", config, &shutdown_token, |mut sock| async move {
             let mut buf = vec![0u8; 4096];
             let _ = sock.read(&mut buf).await;
@@ -1174,4 +1187,5 @@ async fn multiroute_response_size_cap_is_not_overshot() {
     );
 
     shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
 }

@@ -157,8 +157,7 @@ async fn test_missing_host_header() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -260,8 +259,7 @@ async fn test_malformed_http_requests() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -384,8 +382,7 @@ async fn test_very_long_headers() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -501,8 +498,7 @@ async fn test_special_characters_in_hostname() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -648,8 +644,7 @@ async fn test_http_methods() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -749,6 +744,5 @@ async fn test_connection_lifecycle() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    common::shutdown_sessions([session1, session2]).await;
 }

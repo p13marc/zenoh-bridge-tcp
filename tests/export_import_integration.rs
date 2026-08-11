@@ -1084,7 +1084,7 @@ async fn error_signal_is_recoverable_by_a_late_subscriber() -> Result<()> {
     let _export = domain.bridge(&["--backend", &export_spec]).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let session = zenoh::open(domain.config()).await.unwrap();
+    let session = Arc::new(zenoh::open(domain.config()).await.unwrap());
     let client_id = format!("client_{}", uuid::Uuid::new_v4().as_simple());
 
     // Play the import's liveliness half only — the export will dial its dead
@@ -1123,5 +1123,7 @@ async fn error_signal_is_recoverable_by_a_late_subscriber() -> Result<()> {
     );
 
     drop(token);
+    drop(error_sub);
+    common::shutdown_sessions([session]).await;
     Ok(())
 }

@@ -180,6 +180,11 @@ async fn test_plain_backend_declares_default_token() {
 
     shutdown_token.cancel();
     join_export(export_task).await;
+
+    // Close the in-process sessions before the runtime tears down (a
+    // `zenoh::Session` dropped during shutdown can abort the binary with
+    // SIGABRT — "RefCell already borrowed").
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// The exact scenario from the field report: a plain `--backend web/…`, an

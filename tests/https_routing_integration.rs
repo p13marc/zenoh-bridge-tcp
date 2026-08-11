@@ -329,8 +329,8 @@ async fn test_https_routing_multiple_backends() {
     export_api_task.abort();
     export_web_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -443,8 +443,8 @@ async fn test_https_routing_concurrent_clients() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -555,8 +555,8 @@ async fn test_https_backend_becomes_available() {
     // Cleanup
     export_task.abort();
     import_task.abort();
-    drop(session1);
-    drop(session2);
+    shutdown_token.cancel();
+    common::shutdown_sessions([session1, session2]).await;
 }
 
 /// The SNI door must REFUSE a connection whose host has no backend — and refuse
@@ -633,4 +633,5 @@ async fn test_sni_connection_refused_before_backend_exists() {
 
     shutdown_token.cancel();
     import_task.abort();
+    common::shutdown_sessions([session]).await;
 }
