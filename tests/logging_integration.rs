@@ -393,43 +393,59 @@ fn tempdir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A6 regression: an unwritable log directory must be a clean startup error.
+/// A6 regression: an unwritable log path must be a clean startup error.
 ///
 /// tracing-appender `.expect()`s while constructing the rolling appender, so
-/// without the preflight probe this case PANICKED (exit 101 + backtrace),
+/// without the preflight the bad-path case PANICKED (exit 101 + backtrace),
 /// contradicting init's documented no-panic contract.
+///
+/// The path is made unwritable by TYPE, not by permission bits: a regular file
+/// stands where the log directory's parent must be, so creating the log
+/// directory fails with `ENOTDIR` for EVERY uid. A permission-bit setup (a
+/// `0o555` dir) is silently writable by root — which CI runs as — so the bridge
+/// would start normally and this test would hang until the 180s nextest kill.
 #[tokio::test]
 async fn unwritable_log_dir_fails_cleanly_not_panic() {
-    use std::os::unix::fs::PermissionsExt;
+    // `base` is a regular file; using it as a path *component* makes every
+    // attempt to create `base/sub` (the log directory) fail with ENOTDIR.
+    let base = std::env::temp_dir().join(format!("zb-ro-{}", uuid::Uuid::new_v4().as_simple()));
+    std::fs::write(&base, b"not a directory").unwrap();
+    let log_path = base.join("sub").join("bridge.log");
 
-    let dir = std::env::temp_dir().join(format!("zb-ro-{}", uuid::Uuid::new_v4().as_simple()));
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Bound the wait: an unwritable log path must make the bridge exit at
+    // startup. If it ever starts and runs instead, fail fast here rather than
+    // wedging the whole suite on the slow-timeout.
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        common::bridge_command()
+            .args([
+                "--backend",
+                "logrofail/127.0.0.1:1",
+                "--log-target",
+                &format!("file={}", log_path.display()),
+            ])
+            .output(),
+    )
+    .await
+    .expect("an unwritable log path must fail startup, but the bridge kept running")
+    .expect("spawn");
 
-    let out = common::bridge_command()
-        .args([
-            "--backend",
-            "logrofail/127.0.0.1:1",
-            "--log-target",
-            &format!("file={}/bridge.log", dir.display()),
-        ])
-        .output()
-        .await
-        .expect("spawn");
-
-    // Restore permissions so temp cleanup can remove it.
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&base);
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "must fail: {stderr}");
+    assert!(
+        !out.status.success(),
+        "must fail on an unwritable log path: {stderr}"
+    );
     assert_ne!(
         out.status.code(),
         Some(101),
-        "an unwritable log dir must be a clean error, not a panic: {stderr}"
+        "an unwritable log path must be a clean error, not a panic: {stderr}"
     );
     assert!(
-        stderr.contains("not writable"),
-        "the error must name the problem, got: {stderr}"
+        stderr.contains("log directory")
+            || stderr.contains("not writable")
+            || stderr.to_lowercase().contains("not a directory"),
+        "the error must name the log-path problem, got: {stderr}"
     );
 }
