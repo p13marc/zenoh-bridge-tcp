@@ -13,8 +13,10 @@ WORKDIR /usr/src/zenoh-bridge-tcp
 # Copy manifests
 COPY Cargo.toml Cargo.lock ./
 
-# Copy source code
+# Copy source code (benches too: Cargo.toml declares them, and cargo
+# refuses to parse the manifest when a declared bench path is missing)
 COPY src ./src
+COPY benches ./benches
 
 # Build with tls-termination so the image can terminate TLS (a --listen with
 # cert=/key=; HTTPS / terminated h2/gRPC). rustls uses the ring backend — no
