@@ -70,6 +70,14 @@ Notes on the branches:
   rules language (path matching, header predicates). The hostname is the key;
   the key space is the routing table.
 
+  ⚠️ **Browser connection coalescing** (RFC 9113 §9.1.1): a browser reuses one
+  h2 connection for every authority covered by the server certificate. On a
+  terminating listener with a wildcard/multi-SAN cert (or plain h2c), streams
+  for a *second* hostname arrive on the first hostname's connection and reach
+  the first hostname's backend. If you route different `@host` backends behind
+  one listener, give each hostname its own certificate (no shared SANs), or
+  accept connection-level routing.
+
 The remaining listener options cover only the decisions the wire cannot
 answer:
 
@@ -124,10 +132,15 @@ The lifecycle, from both sides:
   subscribe to that client's `tx/`, publish backend bytes to `rx/`. Tear down
   when the token disappears.
 
-Hostnames are normalized before becoming key segments: lowercased, default
-ports 80/443 stripped, and the character set restricted so no Zenoh key-expr
-metacharacter (`*`, `?`, `$`, …) can enter the key space from the wire or the
-CLI.
+Hostnames are normalized before becoming key segments — the routing key is
+**host-only**: lowercased, any `:port` stripped (a browser puts the listener's
+port into `Host`; SNI structurally never carries one), IPv6 brackets stripped
+(`[::1]` and `::1` are the same key), and the character set restricted
+(alphanumerics, `-`, `_`, `.`, and `:` for bare IPv6 literals) so no Zenoh
+key-expr metacharacter (`*`, `?`, `$`, `/`, …) can enter the key space from
+the wire or the CLI. A request whose Host/SNI/`:authority` fails validation is
+refused (HTTP answers 400; TLS/h2c close). Because keys are host-only,
+`--backend 'svc@host:port/…'` is rejected: write the bare `@host`.
 
 ## Reliability on the bus
 
@@ -146,7 +159,11 @@ detection, heartbeat, and recovery — instead of raw put/subscribe.
 Each connection's subscriber is drained through a bounded per-connection
 channel with a non-blocking callback, so one slow client saturates its own
 buffer (`--rx-channel-capacity`) and is reset or shed — it can never
-head-of-line-block other clients sharing the Zenoh session.
+head-of-line-block other clients sharing the Zenoh session. Note the capacity
+counts **samples, not bytes**: with the default 256-sample depth and 64 KiB
+publisher chunks, one slow connection can buffer up to ~16 MiB before the
+reset trips — size `--rx-channel-capacity`/`--buffer-size` down if per-connection
+memory matters more than burst absorption.
 
 ## Protocol support matrix
 

@@ -1,5 +1,103 @@
 # Changelog
 
+## [0.10.0] - 2026-08-31
+
+A pre-release bug-fix sweep triggered by a field report: a browser on
+`http://api.local:8080` got a 502 while `curl -H 'Host: api.local'` worked.
+The root cause (routing keys kept non-default ports) and a deep audit of the
+data planes produced one breaking change and a set of correctness fixes.
+
+### BREAKING: routing keys are host-only
+
+- **Any `:port` is stripped from the routing key**, not just 80/443. A browser
+  always puts a non-default listener port into `Host` (`api.local:8080`), the
+  backend registers the bare `@api.local`, and SNI structurally cannot carry a
+  port — so the port-bearing key could never match and HTTP on a non-default
+  port 502'd while HTTPS worked. Keys are now the bare host everywhere
+  (Host, h2 `:authority`, SNI, `--backend @host`, `--http-export`).
+- **`--backend 'svc@host:port/…'` is rejected** with an actionable error
+  (silently stripping would merge `@a:8443` and `@a:9443` behind the
+  operator's back). Drop the port from the spec.
+- **IPv6 hosts are now routable**: brackets are stripped during normalization
+  (`Host: [::1]:8080`, h2 `[::1]:8080`, and `--backend 'svc@[::1]/…'` or
+  `@::1` all produce the key `::1`). Previously the import side minted
+  bracket/portful keys the export side could not even register.
+- **Client-supplied hostnames are validated** before touching Zenoh key
+  expressions (alphanumerics, `-`, `_`, `.`, `:`): `Host: *` no longer steers
+  a wildcard liveliness probe across the whole service namespace, and
+  `Host: a/b` no longer injects key segments. Invalid hosts answer 400 (or
+  close where no HTTP is expressible).
+- **Duplicate `--backend` scopes are rejected**: two backends with the same
+  (service, host) in one process share a Zenoh session, so the HA election
+  could elect both (identical claims) and interleave responses. Run HA pairs
+  as separate processes.
+
+### Fixed
+
+- **Chunked request bodies through `route=request` completed instead of
+  504ing**: the chunked terminator (`0\r\n\r\n`, surfaced by flowscope as a
+  Trailers event) was dropped, so the backend waited for the end of the body
+  until the response idle timeout. Request trailers are now forwarded.
+- **A backend response carrying `Connection: close` (or bare HTTP/1.0, or
+  until-close framing) ends the `route=request` client connection** after the
+  response. Previously the next request on that connection stalled 30s and
+  got a 504 because the parser's response direction was closed for good.
+- **Import drain actually drains**: on shutdown, connections that outlive
+  `--drain-timeout` are now cancelled through their data plane's own token
+  (EOF markers, undeclares, access logs all run), with a 1s grace before the
+  abort fallback. Previously `abort_all()` killed only coordinator tasks and
+  orphaned the relay halves, which kept moving bytes until the session closed.
+- **Export drain no longer always times out**: the per-connection watchdog and
+  the drain loop shared the same budget, so the outer timer always lost and
+  then *detached* the task instead of aborting it.
+- **Same-process HA election claims are unique** (per-claim UUID): previously
+  two same-scope backends starting in the same millisecond both elected
+  themselves.
+- **The normal end of a connection no longer leaks a 60s error-signal
+  publisher per connection** (per *request* in `route=request` mode): the
+  holder now probes the client's liveliness token and releases immediately
+  when it is already gone (the EOF-vs-undeclare race at every normal close).
+- **TLS-terminating listeners answer 400/502 over the established session**
+  (h1) instead of closing silently — a browser now sees a 502 page, not
+  `ERR_CONNECTION_CLOSED`; h2 and passthrough still close (nothing else is
+  expressible), now with a clean close_notify.
+- **A TLS ClientHello without SNI falls back to the service default backend**
+  (mirroring h2c) instead of being dropped — IP-addressed and legacy clients
+  reach a catch-all backend when one exists.
+- **`--metrics-addr` bind failure is fatal**, like a data-port bind failure.
+  Previously the error was logged in a detached task and the process kept
+  running "ready" with the health port connection-refused.
+- **Multiroute metrics tell the truth**: a 504, a D2 overflow reset, and an
+  oversized-response truncation are now recorded as failed/reset, not
+  `completed`.
+- **Pipelined-request bytes survive exchange boundaries** in `route=request`
+  mode: a backpressured tail belonging to the next request was dropped on
+  most exchange exits, poisoning a valid pipeline with a spurious 400.
+- **Error responses are FIN'd, not RST'd**: sockets are shut down for writing
+  after 400/502/504 writes, so unread request bytes no longer make the kernel
+  destroy the queued response.
+- **400 bodies name the actual reason** (malformed framing, unroutable host,
+  timeout) instead of always claiming "Missing Host header".
+- **Head readers keep the parser's refused tail** across reads (latent
+  desync if `--max-header-size` is configured past the parser's refusal
+  window); the metrics accept loop backs off on EMFILE like the data-plane
+  loop; the D2 Stream-overflow warning fires once per connection instead of
+  per sample; listeners log the actually-bound address (relevant for port 0).
+
+### Known limitations
+
+- ALPN on terminating listeners always offers `h2` first and cannot be
+  restricted to `http/1.1`; an h2-negotiated connection relays h2 frames to
+  the plaintext backend, which must speak h2c.
+- h2 is a single-authority relay; browser connection coalescing across SANs
+  routes second authorities to the first authority's backend (documented with
+  mitigations in `docs/routing.md`).
+- `--rx-channel-capacity` bounds samples, not bytes (see `docs/routing.md`).
+
+## [0.9.1] - 2026-08-12
+
+- Docker image build fix: `COPY benches` so the 0.9.0 image builds again (#13).
+
 ## [0.9.0] - 2026-08-11
 
 A deep-audit release: correctness and lifecycle hardening across the export and
