@@ -22,11 +22,11 @@
 /// 3. Strips any `:port` (routing keys are host-only)
 ///
 /// Examples:
-/// - "Example.COM" -> "example.com"
-/// - "example.com:80" -> "example.com"
-/// - "example.com:8080" -> "example.com"
-/// - "[2001:db8::1]:9090" -> "2001:db8::1"
-/// - "2001:db8::1" -> "2001:db8::1"
+/// - `"Example.COM"` -> `"example.com"`
+/// - `"example.com:80"` -> `"example.com"`
+/// - `"example.com:8080"` -> `"example.com"`
+/// - `"[2001:db8::1]:9090"` -> `"2001:db8::1"`
+/// - `"2001:db8::1"` -> `"2001:db8::1"`
 pub fn normalize_dns(host: &str) -> String {
     let host = host.to_lowercase();
 
