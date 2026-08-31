@@ -31,8 +31,18 @@ pub fn normalize_dns(host: &str) -> String {
     let host = host.to_lowercase();
 
     // Bracketed IPv6 (`[v6]` or `[v6]:port`): the key is the bare literal.
+    // Only the well-formed shape is unwrapped — the inner part must look like
+    // an IPv6 literal (contains ':') and the tail must be empty or a valid
+    // `:port`. Anything else (`[::1]garbage`, `[::1]:99999`, `[not.v6]`) is
+    // returned as-is so the validators reject the '[' instead of this
+    // function silently stripping what it does not understand.
     if let Some(rest) = host.strip_prefix('[')
-        && let Some((inner, _port)) = rest.split_once(']')
+        && let Some((inner, tail)) = rest.split_once(']')
+        && inner.contains(':')
+        && (tail.is_empty()
+            || tail
+                .strip_prefix(':')
+                .is_some_and(|p| p.parse::<u16>().is_ok()))
     {
         return inner.to_string();
     }
@@ -93,6 +103,15 @@ pub fn routing_key(host: &str) -> anyhow::Result<String> {
     if dns.is_empty() {
         return Err(anyhow::anyhow!("empty host"));
     }
+    // A single colon surviving normalization is a port normalize_dns could
+    // not parse (`host:99999`, trailing `host:`) — no hostname contains ':'
+    // and every IPv6 literal has at least two. Without this check such tails
+    // minted colon-bearing keys nothing could ever register.
+    if dns.chars().filter(|&c| c == ':').count() == 1 {
+        return Err(anyhow::anyhow!(
+            "host carries an unparseable port or stray ':'"
+        ));
+    }
     if let Some(c) = dns.chars().find(|&c| !is_valid_key_char(c)) {
         return Err(anyhow::anyhow!(
             "host contains an invalid character {c:?} \
@@ -100,6 +119,25 @@ pub fn routing_key(host: &str) -> anyhow::Result<String> {
         ));
     }
     Ok(dns)
+}
+
+/// Normalize and validate an **operator-written** host (`--backend '@host'`,
+/// `--http-export 'svc/dns/…'`) into the key it registers.
+///
+/// Same rules as [`routing_key`] plus one difference: a client's explicit
+/// `:port` is silently *stripped* (a browser puts the listener port into
+/// `Host`), while an operator's is *rejected* with an actionable error —
+/// silently stripping would merge `@a:8443` and `@a:9443` behind their back.
+/// The single shared implementation is what keeps registration and matching
+/// identical; the spec parsers must not roll their own.
+pub fn spec_host_key(host: &str) -> anyhow::Result<String> {
+    if has_explicit_port(host) {
+        return Err(anyhow::anyhow!(
+            "host '{host}' carries a port — routing keys are host-only \
+             (a client's 'Host: {host}' routes by the bare name); drop the port"
+        ));
+    }
+    routing_key(host)
 }
 
 #[cfg(test)]
@@ -222,6 +260,37 @@ mod tests {
             routing_key("my-api_v2.example.com").unwrap(),
             "my-api_v2.example.com"
         );
+    }
+
+    #[test]
+    fn test_unparseable_ports_do_not_escape_validation() {
+        // A ':' tail that fails u16 parse must not survive into a key —
+        // 'host:99999' would mint a colon-bearing key nothing can register.
+        assert!(routing_key("api.local:99999").is_err());
+        assert!(routing_key("api.local:").is_err());
+        assert!(routing_key("api.local:80o0").is_err());
+        // Malformed bracket forms keep their '[' through normalize and are
+        // rejected by the charset, never silently stripped to the inner part.
+        assert_eq!(normalize_dns("[::1]:99999"), "[::1]:99999");
+        assert_eq!(normalize_dns("[::1]garbage"), "[::1]garbage");
+        assert_eq!(normalize_dns("[api.internal]"), "[api.internal]");
+        assert!(routing_key("[::1]:99999").is_err());
+        assert!(routing_key("[api.internal]").is_err());
+        // Operator side: valid port -> the actionable "drop the port" error;
+        // garbage port -> still an error, never a silently-registered key.
+        assert!(
+            spec_host_key("a.local:8443")
+                .unwrap_err()
+                .to_string()
+                .contains("drop the port")
+        );
+        assert!(spec_host_key("a.local:99999").is_err());
+        assert!(spec_host_key("[::1]:80o0").is_err());
+        assert!(spec_host_key("").is_err());
+        // The happy paths are unchanged.
+        assert_eq!(spec_host_key("API.Local").unwrap(), "api.local");
+        assert_eq!(spec_host_key("[::1]").unwrap(), "::1");
+        assert_eq!(spec_host_key("2001:db8::1").unwrap(), "2001:db8::1");
     }
 
     #[test]

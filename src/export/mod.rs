@@ -23,7 +23,6 @@ mod ws;
 mod tests;
 
 use crate::config::BridgeConfig;
-use crate::dns::normalize_dns;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -107,24 +106,11 @@ pub fn parse_http_export_spec(export_spec: &str) -> Result<(String, String, Sock
 
     let service_name = parts[0].to_string();
     crate::config::validate_service_name(&service_name)?;
-    // Same host-only + charset rules as `--backend '@host'` (spec.rs): the DNS
-    // label becomes a Zenoh key segment.
-    if crate::dns::has_explicit_port(parts[1]) {
-        return Err(anyhow::anyhow!(
-            "invalid HTTP export spec '{export_spec}': DNS '{}' carries a port — \
-             routing keys are host-only; drop the port",
-            parts[1]
-        ));
-    }
-    let dns = normalize_dns(parts[1]);
-    for c in dns.chars() {
-        if !crate::dns::is_valid_key_char(c) {
-            return Err(anyhow::anyhow!(
-                "export DNS '{dns}' contains an invalid character {c:?} \
-                 (allowed: alphanumerics, '-', '_', '.', ':')"
-            ));
-        }
-    }
+    // Same rules as `--backend '@host'`, via the one shared implementation
+    // (reject an explicit port, normalize, reject empty, keyexpr-safe
+    // charset): the DNS label becomes a Zenoh key segment.
+    let dns = crate::dns::spec_host_key(parts[1])
+        .map_err(|e| anyhow::anyhow!("invalid HTTP export spec '{export_spec}': {e}"))?;
     let backend_addr: SocketAddr = parts[2]
         .parse()
         .map_err(|e| anyhow::anyhow!("Invalid backend address: {}", e))?;

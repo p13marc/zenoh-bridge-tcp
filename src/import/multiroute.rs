@@ -75,6 +75,10 @@ enum ExchangeEnd {
     Truncated,
     /// Framing violation mid-exchange.
     Poisoned,
+    /// The backend's response channel closed mid-exchange (session teardown).
+    BackendGone,
+    /// The listener's drain deadline cut the exchange (external teardown).
+    Drained,
 }
 
 /// How obtaining the next request head ended.
@@ -82,9 +86,11 @@ enum NextRequest {
     Head(Box<flowscope::http::RequestHead>),
     /// No more requests — the client half closed cleanly between requests.
     CleanEnd,
-    /// The request framing was malformed; `client_fault` picks 400 vs 502.
+    /// The request could not be framed; `client_fault` picks 400 vs 502 and
+    /// `reason` lands in the 400 body (a timeout is not "malformed framing").
     Malformed {
         client_fault: bool,
+        reason: String,
     },
 }
 
@@ -162,11 +168,12 @@ async fn handle_multiroute_connection(
         {
             NextRequest::Head(h) => h,
             NextRequest::CleanEnd => break,
-            NextRequest::Malformed { client_fault } => {
+            NextRequest::Malformed {
+                client_fault,
+                reason,
+            } => {
                 if client_fault {
-                    let _ = stream
-                        .write_all(&http_400_response("malformed request framing"))
-                        .await;
+                    let _ = stream.write_all(&http_400_response(&reason)).await;
                     let _ = stream.shutdown().await;
                 }
                 warn!("Refusing malformed request");
@@ -228,6 +235,7 @@ async fn handle_multiroute_connection(
                     &mut client_pending,
                     &mut client_eof,
                     &config,
+                    &shutdown,
                 )
                 .await;
                 continue;
@@ -279,10 +287,10 @@ async fn handle_multiroute_connection(
                 // recorded outcome is that of the connection's last exchange.
                 match end {
                     ExchangeEnd::Ok => {}
-                    ExchangeEnd::Timeout | ExchangeEnd::Truncated => {
+                    ExchangeEnd::Timeout | ExchangeEnd::Truncated | ExchangeEnd::BackendGone => {
                         outcome = crate::metrics::ConnOutcome::Failed;
                     }
-                    ExchangeEnd::Overflow | ExchangeEnd::Poisoned => {
+                    ExchangeEnd::Overflow | ExchangeEnd::Poisoned | ExchangeEnd::Drained => {
                         outcome = crate::metrics::ConnOutcome::Reset;
                     }
                 }
@@ -296,6 +304,10 @@ async fn handle_multiroute_connection(
         }
     }
 
+    // A graceful FIN on every exit path: dropping a socket with unread client
+    // bytes queued (pipelined request, in-flight body) sends RST and can
+    // destroy whatever response bytes are still queued.
+    let _ = stream.shutdown().await;
     conn_metrics.finish(outcome);
     Ok(())
 }
@@ -343,6 +355,7 @@ async fn next_request_head(
         if parser.is_tunnelled() {
             return NextRequest::Malformed {
                 client_fault: false,
+                reason: "connection switched protocols before a routable request head".into(),
             };
         }
 
@@ -353,6 +366,7 @@ async fn next_request_head(
             if let Some(reason) = parser.poison() {
                 return NextRequest::Malformed {
                     client_fault: reason.implies_client_fault().unwrap_or(true),
+                    reason: reason.as_str().to_string(),
                 };
             }
             continue;
@@ -365,7 +379,10 @@ async fn next_request_head(
                     // A read error or idle timeout ends the connection. Only the very
                     // first request treats it as a client fault worth a 400.
                     return if first {
-                        NextRequest::Malformed { client_fault: true }
+                        NextRequest::Malformed {
+                            client_fault: true,
+                            reason: "timeout or error reading the request".into(),
+                        }
                     } else {
                         NextRequest::CleanEnd
                     };
@@ -387,6 +404,7 @@ async fn next_request_head(
         if let Some(reason) = parser.poison() {
             return NextRequest::Malformed {
                 client_fault: reason.implies_client_fault().unwrap_or(true),
+                reason: reason.as_str().to_string(),
             };
         }
     }
@@ -402,6 +420,7 @@ async fn consume_request_body(
     leftover: &mut Bytes,
     client_eof: &mut bool,
     config: &BridgeConfig,
+    shutdown: &CancellationToken,
 ) {
     let mut tmp = vec![0u8; config.buffer_size];
     loop {
@@ -441,9 +460,15 @@ async fn consume_request_body(
             continue;
         }
 
-        let n = match tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) | Err(_) => return,
+        let n = tokio::select! {
+            r = tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)) => match r {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) | Err(_) => return,
+            },
+            // Listener drain: the per-read timeout resets on every byte, so a
+            // slow-drip client could otherwise park this task past the drain
+            // deadline and force the abort_all fallback.
+            _ = shutdown.cancelled() => return,
         };
         if n == 0 {
             *client_eof = true;
@@ -732,6 +757,9 @@ async fn run_exchange(
                     http_502_response(dns)
                 };
                 let _ = stream.write_all(&resp).await;
+                // FIN, not RST: unread client bytes (a pipelined request)
+                // would otherwise destroy the queued error response.
+                let _ = stream.shutdown().await;
             }
             keep_alive = false;
             end = ExchangeEnd::Poisoned;
@@ -772,11 +800,25 @@ async fn run_exchange(
                             drain_events(parser, events);
                         }
                     }
-                    Ok(None) => break, // subscriber closed
+                    Ok(None) => {
+                        // Subscriber closed mid-exchange (only reachable
+                        // before the response completes): a truncation, not a
+                        // completion — tell the client and the metrics so.
+                        warn!("Response channel closed mid-exchange");
+                        if bytes_written == 0 {
+                            let _ = stream.write_all(&http_502_response(dns)).await;
+                            let _ = stream.shutdown().await;
+                        }
+                        keep_alive = false;
+                        end = ExchangeEnd::BackendGone;
+                        break;
+                    }
                     Err(_) => {
                         warn!("Response timeout");
                         if bytes_written == 0 {
                             let _ = stream.write_all(&crate::http_util::http_504_response()).await;
+                            // FIN, not RST (see the poison path above).
+                            let _ = stream.shutdown().await;
                         }
                         keep_alive = false;
                         end = ExchangeEnd::Timeout;
@@ -797,6 +839,7 @@ async fn run_exchange(
                 // below (EOF marker, undeclares) so the export side is released.
                 info!("Listener draining; ending multiroute exchange");
                 keep_alive = false;
+                end = ExchangeEnd::Drained;
                 break;
             }
         }

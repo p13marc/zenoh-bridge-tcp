@@ -212,7 +212,10 @@ async fn publish_error_signal_inner(
             let alive_probe = async {
                 match holder_session.liveliness().get(&clients_key).await {
                     Ok(replies) => replies.recv_async().await.is_ok(),
-                    Err(_) => false,
+                    // A failed dispatch says nothing about the token — and it
+                    // happens precisely when the session is congested, i.e.
+                    // when this signal matters most. Treat as alive and hold.
+                    Err(_) => true,
                 }
             };
             // On Ok(true) — alive — or Err — the probe itself stalled

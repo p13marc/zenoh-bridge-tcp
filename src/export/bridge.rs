@@ -260,12 +260,16 @@ async fn drain_all_clients(
         debug!(client_id = %client_id, "Sent shutdown to client bridge");
     }
 
-    // +1s over the per-connection watchdog, which waits exactly drain_timeout
-    // after the cancel before aborting its relay halves: with EQUAL budgets
-    // this outer timer always fired first (the nesting bug main.rs documents
-    // for its own outer budget), so every watchdog-needing connection was
-    // logged as a drain timeout and then silently detached.
-    let deadline = tokio::time::Instant::now() + drain_timeout + std::time::Duration::from_secs(1);
+    // The margin over the per-connection watchdog (which waits exactly
+    // drain_timeout after the cancel before aborting its relay halves) must
+    // also cover the coordinator's teardown AFTER that abort: the undeclares
+    // plus publish_error_signal's own budget (max(availability_timeout,1s)*3,
+    // 3s at defaults). With EQUAL budgets this outer timer always fired first
+    // (the nesting bug main.rs documents for its own outer budget) and
+    // detached the task; with a margin covering only the abort instant it
+    // aborted the coordinator mid-teardown on the HA-demotion path, losing
+    // the reset signal a still-live import client was waiting for.
+    let deadline = tokio::time::Instant::now() + drain_timeout + std::time::Duration::from_secs(5);
     for (client_id, (_, handle)) in entries {
         let abort = handle.abort_handle();
         match tokio::time::timeout_at(deadline, handle).await {

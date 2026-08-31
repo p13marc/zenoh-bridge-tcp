@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 use zenoh::Session;
 
 /// Run auto-detecting import mode for a single service.
@@ -316,7 +316,22 @@ async fn handle_auto_http_connection(
         // expressible. A Zenoh liveliness failure is an error, not a routing
         // decision: falling back on it could silently deliver a host-routed
         // client to the wrong backend during a transient bus hiccup.
-        let dns_req = super::connection::routing_key_from_head(&head).ok();
+        // An invalid Host (wildcard, '/', duplicate Host, non-ASCII) must
+        // answer 400 like every sibling door — swallowing the error with
+        // `.ok()` silently bridged the upgrade to the default backend,
+        // bypassing the routing-key validation.
+        let dns_req = match super::connection::routing_key_from_head(&head) {
+            Ok(dns) => Some(dns),
+            Err(e) => {
+                use tokio::io::AsyncWriteExt;
+                warn!(client_id = %client_id, error = %e, "Unroutable WebSocket upgrade");
+                let _ = stream
+                    .write_all(&crate::http_util::http_400_response(&e.to_string()))
+                    .await;
+                let _ = stream.shutdown().await;
+                return Err(anyhow::anyhow!("unroutable WebSocket upgrade: {e}"));
+            }
+        };
         let dns = match super::connection::resolve_backend(
             &session,
             service_name,

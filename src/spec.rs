@@ -26,7 +26,6 @@
 //! the first) but not `,` — a comma in a certificate path is not supported.
 
 use crate::config::validate_service_name;
-use crate::dns::normalize_dns;
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -278,33 +277,15 @@ impl FromStr for BackendSpec {
                         "invalid --backend spec '{spec}': '@' with an empty host"
                     ));
                 }
-                // Routing keys are host-only (0.10): a client's
-                // `Host: api.local:8080` routes to '@api.local'. Reject an
-                // explicit port instead of silently stripping it — otherwise
-                // '@a.local:8443' and '@a.local:9443' would merge into one
-                // backend behind the operator's back.
-                if crate::dns::has_explicit_port(host) {
-                    return Err(anyhow::anyhow!(
-                        "invalid --backend spec '{spec}': host '{host}' carries a port — \
-                         routing keys are host-only (a client's 'Host: {host}' routes by \
-                         the bare name); drop the port"
-                    ));
-                }
-                let host = normalize_dns(host);
-                // The host becomes a Zenoh key segment ({service}/{host}/…):
-                // without a charset check, '@*/…' would register a live
-                // wildcard capturing the whole service's routing, and other
-                // keyexpr metacharacters would fail late and confusingly.
-                // Same predicate as the client side's `dns::routing_key` —
-                // the two must stay identical.
-                for c in host.chars() {
-                    if !crate::dns::is_valid_key_char(c) {
-                        return Err(anyhow::anyhow!(
-                            "backend host '{host}' contains an invalid character {c:?} \
-                             (allowed: alphanumerics, '-', '_', '.', ':')"
-                        ));
-                    }
-                }
+                // The host becomes a Zenoh key segment ({service}/{host}/…).
+                // Routing keys are host-only (0.10) and must match what the
+                // client side mints, so parsing is delegated to the one shared
+                // implementation: rejects an explicit port with an actionable
+                // error, normalizes, and enforces the keyexpr-safe charset
+                // ('@*/…' would register a live wildcard capturing the whole
+                // service's routing).
+                let host = crate::dns::spec_host_key(host)
+                    .map_err(|e| anyhow::anyhow!("invalid --backend spec '{spec}': {e}"))?;
                 (service, Some(host))
             }
             None => (head, None),
