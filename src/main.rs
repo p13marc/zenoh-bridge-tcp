@@ -110,17 +110,24 @@ async fn main() -> Result<()> {
     // 503 (drain in progress) rather than connection-refused, or a load
     // balancer keeps routing to a port that no longer answers.
     let metrics_token = CancellationToken::new();
-    let metrics_task = args.metrics_addr.map(|metrics_addr| {
+    let mut metrics_task = None;
+    if let Some(metrics_addr) = args.metrics_addr {
+        // Bind here, fatally: a taken metrics port must fail startup the way a
+        // taken data port does — not leave the process "ready" with its health
+        // endpoint connection-refused.
+        let listener = metrics::bind(metrics_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to bind --metrics-addr {metrics_addr}: {e}"))?;
         let token = metrics_token.clone();
         // Same budget the data-plane head readers use, so an idle client cannot
         // pin a task+fd on the observability port either.
         let read_timeout = std::time::Duration::from_secs(args.read_timeout);
-        tokio::spawn(async move {
-            if let Err(e) = metrics::serve(metrics_addr, read_timeout, token).await {
-                tracing::error!(addr = %metrics_addr, error = %e, "Metrics server failed to bind");
+        metrics_task = Some(tokio::spawn(async move {
+            if let Err(e) = metrics::serve_on(listener, read_timeout, token).await {
+                tracing::error!(addr = %metrics_addr, error = %e, "Metrics server failed");
             }
-        })
-    });
+        }));
+    }
 
     // Spawn signal handler (tracked so it is aborted on exit).
     let signal_token = shutdown_token.clone();

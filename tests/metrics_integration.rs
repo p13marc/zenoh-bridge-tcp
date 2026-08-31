@@ -427,3 +427,37 @@ async fn readyz_serves_503_during_drain() {
 
     let _ = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
 }
+
+/// A taken --metrics-addr must be fatal, exactly like a taken data port:
+/// before 0.10 the bind error was logged inside a detached task and the
+/// process kept running "ready" with its health endpoint connection-refused —
+/// the one failure mode a health port exists to prevent.
+#[tokio::test]
+async fn metrics_bind_failure_is_fatal() {
+    let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taken = blocker.local_addr().unwrap();
+    let good_port = common::PortGuard::new();
+    let good = good_port.release();
+
+    let mut child = common::bridge_command()
+        .args([
+            "--listen",
+            &format!("metricsbind/{good},proto=raw"),
+            "--metrics-addr",
+            &taken.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn");
+
+    let status = tokio::time::timeout(Duration::from_secs(40), child.wait())
+        .await
+        .expect("bridge lingered after a metrics bind failure — it must exit")
+        .expect("wait failed");
+    assert!(
+        !status.success(),
+        "a metrics bind failure must produce a nonzero exit, got {status:?}"
+    );
+}

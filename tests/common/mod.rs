@@ -373,6 +373,26 @@ impl BridgeProcess {
         let _ = self.child.kill().await;
     }
 
+    /// Request a graceful shutdown (SIGTERM), without killing.
+    #[cfg(unix)]
+    pub fn signal_term(&self) {
+        if let Some(pid) = self.child.id() {
+            // SAFETY: plain kill(2) on our own child's pid.
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
+        }
+    }
+
+    /// Wait for the process to exit on its own. Returns the exit status, or
+    /// None if it did not exit within `timeout`.
+    pub async fn wait_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        tokio::time::timeout(timeout, self.child.wait())
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
     /// Kill and wait for the process to fully exit (up to 2s).
     pub async fn kill_and_wait(&mut self) {
         let _ = self.child.kill().await;

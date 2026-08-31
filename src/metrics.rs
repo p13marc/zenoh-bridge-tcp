@@ -384,8 +384,26 @@ pub async fn serve(
     request_timeout: Duration,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
+    let listener = bind(addr).await?;
+    serve_on(listener, request_timeout, shutdown).await
+}
+
+/// Bind the metrics/health port. Split from [`serve`] so main can treat a bind
+/// failure as fatal (same posture as a data-plane listener: `--metrics-addr`
+/// on a taken port must not leave the process running "ready" while the
+/// health port is connection-refused).
+pub async fn bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "Metrics/health server listening (/healthz /readyz /metrics)");
+    Ok(listener)
+}
+
+/// [`serve`] on an already-bound listener.
+pub async fn serve_on(
+    listener: TcpListener,
+    request_timeout: Duration,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
     let limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
     loop {
         tokio::select! {
@@ -407,7 +425,15 @@ pub async fn serve(
                             }
                         }
                     }
-                    Err(e) => error!(error = %e, "metrics server accept failed"),
+                    Err(e) => {
+                        error!(error = %e, "metrics server accept failed");
+                        // Back off: EMFILE/ENFILE do not consume the pending
+                        // connection, so accept() fails again immediately — an
+                        // unthrottled loop burns a core and floods the log
+                        // exactly when the process is already fd-starved
+                        // (same fix as the data-plane accept loop).
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }

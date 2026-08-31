@@ -260,14 +260,25 @@ async fn drain_all_clients(
         debug!(client_id = %client_id, "Sent shutdown to client bridge");
     }
 
-    let deadline = tokio::time::Instant::now() + drain_timeout;
+    // +1s over the per-connection watchdog, which waits exactly drain_timeout
+    // after the cancel before aborting its relay halves: with EQUAL budgets
+    // this outer timer always fired first (the nesting bug main.rs documents
+    // for its own outer budget), so every watchdog-needing connection was
+    // logged as a drain timeout and then silently detached.
+    let deadline = tokio::time::Instant::now() + drain_timeout + std::time::Duration::from_secs(1);
     for (client_id, (_, handle)) in entries {
+        let abort = handle.abort_handle();
         match tokio::time::timeout_at(deadline, handle).await {
             Ok(Ok(())) => debug!(client_id = %client_id, "Client bridge drained"),
             Ok(Err(e)) => {
                 warn!(client_id = %client_id, error = %e, "Client bridge task error during drain")
             }
-            Err(_) => warn!(client_id = %client_id, "Client bridge drain timeout"),
+            Err(_) => {
+                // Do not detach: a bridge that outlived even the watchdog's
+                // abort window is stuck — abort the coordinator itself.
+                warn!(client_id = %client_id, "Client bridge drain timeout; aborting");
+                abort.abort();
+            }
         }
     }
 }
@@ -492,6 +503,12 @@ where
     .await
     {
         Ok(ConnectionOutcome::Completed) => true,
+        // Reset still signals: it covers unrecoverable sample-miss and D2
+        // overflow, where the import-side client is alive and needs the error
+        // signal to reset. The benign case — the import's own liveliness
+        // Delete racing the EOF marker at normal close — is de-fanged inside
+        // `publish_error_signal`, whose holder probes the client token first
+        // and releases immediately when it is already gone.
         Ok(outcome) => {
             warn!(?outcome, "Client bridge ended non-cleanly");
             false

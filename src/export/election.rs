@@ -9,12 +9,13 @@
 //! The election is deliberately minimal:
 //!
 //! - Each exporter declares a liveliness claim
-//!   `{scope}/exporter-claim/{start_ts:020}-{zid}` and subscribes (with
+//!   `{scope}/exporter-claim/{start_ts:020}-{zid}-{uuid}` and subscribes (with
 //!   history) to `{scope}/exporter-claim/*`.
 //! - The claimant with the **lexicographically smallest** segment is active.
 //!   The zero-padded millisecond timestamp makes that "oldest wins" (sticky:
-//!   a newcomer never preempts an established active), with the session id as
-//!   a total-order tiebreak for simultaneous starts.
+//!   a newcomer never preempts an established active), with the session id and
+//!   a per-claim UUID as a total-order tiebreak — the UUID matters inside one
+//!   process, where every claimant shares the session's zid.
 //! - Everyone else stands by, ignoring client tokens. When the active's claim
 //!   disappears (its process/session died), the next-smallest claimant takes
 //!   over and replays the existing-clients query, so clients that were
@@ -62,7 +63,16 @@ impl Claim {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
-        let own = format!("{ts:020}-{}", session.zid());
+        // A per-claim UUID after the zid: every backend in a process shares
+        // one session (hence one zid), so two same-scope claims minted in the
+        // same millisecond would otherwise be IDENTICAL — both inserted into
+        // their own claim set, both electing themselves, reproducing exactly
+        // the double-serving corruption this module exists to prevent.
+        let own = format!(
+            "{ts:020}-{}-{}",
+            session.zid(),
+            uuid::Uuid::new_v4().as_simple()
+        );
 
         let subscriber = session
             .liveliness()
@@ -189,6 +199,24 @@ mod tests {
         let claims = set(&[a, b]);
         assert!(elect(&claims, a));
         assert!(!elect(&claims, b));
+    }
+
+    #[test]
+    fn same_session_same_millisecond_claims_elect_exactly_one() {
+        // Two backends in one process share a session (one zid) and can start
+        // in the same millisecond; the per-claim UUID must still produce two
+        // distinct claims with exactly one winner.
+        let ts = 1754800000000u128;
+        let zid = "samezid";
+        let a = format!("{ts:020}-{zid}-{}", uuid::Uuid::new_v4().as_simple());
+        let b = format!("{ts:020}-{zid}-{}", uuid::Uuid::new_v4().as_simple());
+        assert_ne!(a, b, "claims from one session must never collide");
+        let claims: BTreeSet<String> = [a.clone(), b.clone()].into_iter().collect();
+        let winners = [&a, &b].iter().filter(|c| elect(&claims, c)).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one same-ms same-zid claimant may serve"
+        );
     }
 
     #[test]

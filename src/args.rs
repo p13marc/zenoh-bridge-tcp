@@ -172,7 +172,26 @@ impl Args {
     pub fn validate(&self) -> anyhow::Result<()> {
         // Parse specs early for clear startup errors.
         let listens = self.listen_specs()?;
-        let _backends = self.backend_specs()?;
+        let backends = self.backend_specs()?;
+
+        // Two backends with the same (service, @host) scope in one process
+        // share a Zenoh session — the HA election cannot separate them (their
+        // claims share the zid and can share the millisecond), so both would
+        // serve and interleave responses. HA needs separate processes.
+        let mut scopes = std::collections::HashSet::new();
+        for b in &backends {
+            if !scopes.insert((b.service.clone(), b.host.clone())) {
+                let scope = match &b.host {
+                    Some(h) => format!("{}@{}", b.service, h),
+                    None => b.service.clone(),
+                };
+                return Err(anyhow::anyhow!(
+                    "duplicate --backend scope '{scope}': two backends serving the same \
+                     service/host in one process would interleave responses. For \
+                     active/standby HA, run each backend in its own process."
+                ));
+            }
+        }
 
         if self.listen.is_empty() && self.backend.is_empty() {
             return Err(anyhow::anyhow!(
@@ -353,6 +372,38 @@ mod tests {
             backend: vec![
                 "svc1@api.example.com/127.0.0.1:9001".into(),
                 "chat/ws://127.0.0.1:9000".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(args.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_duplicate_backend_scope() {
+        // Same (service, host) twice in one process: the shared session makes
+        // the HA election unable to separate them — both would serve.
+        let args = Args {
+            backend: vec!["svc/127.0.0.1:8001".into(), "svc/127.0.0.1:8002".into()],
+            ..Default::default()
+        };
+        let err = args.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate --backend scope"), "{err}");
+
+        let args = Args {
+            backend: vec![
+                "svc@a.example/127.0.0.1:8001".into(),
+                "svc@a.example/127.0.0.1:8002".into(),
+            ],
+            ..Default::default()
+        };
+        assert!(args.validate().is_err());
+
+        // Distinct hosts under one service remain fine.
+        let args = Args {
+            backend: vec![
+                "svc@a.example/127.0.0.1:8001".into(),
+                "svc@b.example/127.0.0.1:8002".into(),
+                "svc/127.0.0.1:8003".into(),
             ],
             ..Default::default()
         };

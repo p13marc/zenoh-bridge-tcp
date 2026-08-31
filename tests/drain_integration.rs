@@ -296,3 +296,49 @@ async fn test_drain_timeout_enforced() -> Result<()> {
 
     Ok(())
 }
+
+/// SIGTERM with a live, actively-relaying raw connection: the import must
+/// drain (cancel the connection's data plane, not just abort coordinator
+/// tasks) and exit gracefully within drain_timeout + grace, and the client
+/// must observe its socket closing — not hang on a half-dead relay.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_sigterm_drains_active_connection_and_exits() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let service = common::unique_service_name("draindsig");
+
+    let (backend_addr, _echo) = common::start_echo_server().await;
+    let mut pair =
+        common::BridgePair::tcp_with_args(&service, backend_addr, &[], &["--drain-timeout", "2"])
+            .await;
+
+    // A proven-served raw connection (first echo already consumed).
+    let mut client =
+        common::connected_raw_client(pair.import_addr, b"drain-probe", Duration::from_secs(30))
+            .await?;
+
+    // Graceful shutdown request while the connection is open and idle-relaying.
+    pair.import.signal_term();
+
+    // Voluntary window (2s) + cancel grace (1s) + main outer margin (2s) + slack.
+    let status = pair
+        .import
+        .wait_exit(Duration::from_secs(10))
+        .await
+        .expect("import bridge must exit after SIGTERM with an active connection");
+    assert!(
+        status.success(),
+        "graceful shutdown must exit 0: {status:?}"
+    );
+
+    // The drained connection must actually close from the client's view.
+    let mut buf = [0u8; 64];
+    let n = timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("client socket must close after the bridge drains")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "expected EOF on the drained client connection");
+
+    pair.export.kill_and_wait().await;
+    Ok(())
+}

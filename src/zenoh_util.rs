@@ -201,12 +201,33 @@ async fn publish_error_signal_inner(
                     return;
                 }
             };
+            // Fast path: a token that is ALREADY gone will never produce a
+            // Delete for the subscriber above, so the hold would ride out the
+            // full cap — and this is the dominant case at normal teardown,
+            // where the import undeclares its token back-to-back with the EOF
+            // marker (once per REQUEST in route=request mode: a 60s publisher
+            //+ task leak each). A completed liveliness query with no reply
+            // says the token is gone; the subscriber (declared first) covers
+            // the alive->Delete race from here on.
+            let alive_probe = async {
+                match holder_session.liveliness().get(&clients_key).await {
+                    Ok(replies) => replies.recv_async().await.is_ok(),
+                    Err(_) => false,
+                }
+            };
+            // On Ok(true) — alive — or Err — the probe itself stalled
+            // (congestion) — hold on and wait for the Delete as before:
+            // releasing early on an unanswered probe would re-open the race
+            // this publisher exists to close.
+            if let Ok(false) = tokio::time::timeout(availability_timeout, alive_probe).await {
+                debug!(key = %clients_key, "client token already gone; releasing early");
+                return;
+            }
             // Hold until a Delete is observed (history replays a live token as
-            // a Put first). If the token was already gone we may see nothing at
-            // all — the outer cap bounds that case. Deliberately no short
-            // aliveness heuristic: under load the history replay can arrive
-            // late, and dropping the cache early re-opens the very race this
-            // publisher exists to close.
+            // a Put first). Deliberately no short aliveness heuristic beyond
+            // the completed probe above: under load the history replay can
+            // arrive late, and dropping the cache early re-opens the very race
+            // this publisher exists to close.
             loop {
                 match sub.recv_async().await {
                     Ok(s) if s.kind() == SampleKind::Delete => break,

@@ -57,11 +57,16 @@ pub(crate) fn rx_channel<T: Send + 'static>(
                 ReliabilityMode::Stream => {
                     // Byte-exact: we must not drop. Reset this one connection so
                     // it stops backing up; every other client keeps flowing.
-                    warn!(
-                        client_id = %client_id,
-                        "reception buffer full — resetting slow connection (D2)"
-                    );
-                    conn_cancel.cancel();
+                    // Warn only on the first trip: samples keep arriving until
+                    // the subscriber is torn down, and cancel() is idempotent —
+                    // repeating the line per sample flooded the log in a burst.
+                    if !conn_cancel.is_cancelled() {
+                        warn!(
+                            client_id = %client_id,
+                            "reception buffer full — resetting slow connection (D2)"
+                        );
+                        conn_cancel.cancel();
+                    }
                 }
                 ReliabilityMode::Telemetry => {
                     // Loss-tolerant: shed the sample. Log on power-of-two counts
