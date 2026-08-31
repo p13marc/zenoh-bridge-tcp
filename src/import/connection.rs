@@ -1,5 +1,5 @@
 use crate::config::BridgeConfig;
-use crate::dns::normalize_dns;
+use crate::dns::routing_key;
 use crate::http_util::{http_400_response, http_502_response};
 use anyhow::Result;
 use bytes::Bytes;
@@ -34,6 +34,7 @@ pub(super) async fn handle_import_connection(
     client_id: &str,
     http_mode: bool,
     config: Arc<BridgeConfig>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     // Parse HTTP/HTTPS request if in HTTP mode to extract DNS
     let (dns, initial_buffer) = if http_mode {
@@ -61,7 +62,7 @@ pub(super) async fn handle_import_connection(
             // terminated; the ClientHello is forwarded verbatim).
             info!(proto = "tls", "Detected TLS/HTTPS connection");
             match read_tls_sni(&mut stream, &config).await {
-                Ok((dns, buffer)) => {
+                Ok((Some(dns), buffer)) => {
                     // Record the routed host on the connection span so every
                     // later line in this connection carries it for free.
                     tracing::Span::current().record("dns", dns.as_str());
@@ -80,6 +81,25 @@ pub(super) async fn handle_import_connection(
                             warn!(dns = %dns, "No backend available");
                             // For TLS, we can't send an HTTP error, just close the connection
                             return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
+                        }
+                    }
+                }
+                Ok((None, buffer)) => {
+                    // No SNI (an IP-addressed client, or an old stack): the
+                    // default backend is exactly "traffic no @host backend
+                    // claims", so fall through to it — mirroring the h2c
+                    // fallback — instead of failing closed.
+                    info!(
+                        routed_by = "default",
+                        "TLS ClientHello has no SNI; trying the service default backend"
+                    );
+                    match resolve_backend(&session, service_name, None, &config).await? {
+                        BackendRoute::Host | BackendRoute::Default => (None, Some(buffer)),
+                        BackendRoute::Unavailable => {
+                            warn!("No default backend for an SNI-less TLS connection");
+                            return Err(anyhow::anyhow!(
+                                "TLS ClientHello has no SNI and no default backend is available"
+                            ));
                         }
                     }
                 }
@@ -108,16 +128,23 @@ pub(super) async fn handle_import_connection(
                         }
                         BackendRoute::Unavailable => {
                             warn!(dns = %dns, "No backend available");
-                            // Send HTTP 502 Bad Gateway
+                            // Send HTTP 502 Bad Gateway. Shut the socket down
+                            // for writing before dropping it: unread request
+                            // bytes (a POST body) would otherwise turn the
+                            // close into an RST that destroys the queued
+                            // response before the client reads it.
                             let _ = stream.write_all(&http_502_response(&dns)).await;
+                            let _ = stream.shutdown().await;
                             return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
                         }
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to parse HTTP request");
-                    // Send HTTP 400 Bad Request
-                    let _ = stream.write_all(&http_400_response()).await;
+                    // Send HTTP 400 Bad Request (FIN'd for the same reason as
+                    // the 502 above).
+                    let _ = stream.write_all(&http_400_response(&e.to_string())).await;
+                    let _ = stream.shutdown().await;
                     return Err(anyhow::anyhow!("{}", e));
                 }
             }
@@ -140,6 +167,7 @@ pub(super) async fn handle_import_connection(
         initial_buffer,
         config,
         None,
+        shutdown,
     )
     .await
 }
@@ -218,8 +246,9 @@ where
 ///
 /// TLS is *not* terminated here: the returned buffer is every byte read from the
 /// socket so far, forwarded verbatim to the backend as the connection's initial
-/// payload. Returns the normalized SNI plus those raw bytes.
-async fn read_tls_sni<R>(stream: &mut R, config: &BridgeConfig) -> Result<(String, Vec<u8>)>
+/// payload. Returns the validated routing key (`None` when the ClientHello
+/// carries no SNI extension) plus those raw bytes.
+async fn read_tls_sni<R>(stream: &mut R, config: &BridgeConfig) -> Result<(Option<String>, Vec<u8>)>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -247,9 +276,13 @@ where
                         "TLS ClientHello ALPN offer"
                     );
                 }
+                // No SNI is not an error: the caller decides whether the
+                // default backend can take an un-keyed TLS connection.
                 return match ch.sni() {
-                    Some(sni) => Ok(Some(normalize_dns(sni))),
-                    None => Err(anyhow::anyhow!("TLS ClientHello has no SNI extension")),
+                    Some(sni) => routing_key(sni)
+                        .map(|key| Some(Some(key)))
+                        .map_err(|e| anyhow::anyhow!("unroutable TLS SNI: {e}")),
+                    None => Ok(Some(None)),
                 };
             }
         }
@@ -271,21 +304,16 @@ where
 /// flowscope's [`RequestHead::authority`] applies RFC 9112 §3.2 rules — an
 /// absolute-form request-target beats the `Host` header, a duplicate `Host` is
 /// rejected, and the host is ASCII-folded (rejecting non-ASCII authorities that
-/// could otherwise desync routing, F3). We then run it through [`normalize_dns`]
-/// so the default 80/443 ports collapse exactly as on the export side.
+/// could otherwise desync routing, F3). The port flowscope split off is
+/// deliberately discarded: routing keys are host-only (a browser sends
+/// `Host: api.local:8080` on a non-default-port listener, while the backend
+/// registered the bare `api.local`), and [`routing_key`] rejects any character
+/// that could steer Zenoh keyexpr machinery.
 pub(super) fn routing_key_from_head(head: &RequestHead) -> Result<String> {
     let authority = head
         .authority()
         .map_err(|p| anyhow::anyhow!("unroutable request target: {}", p.as_str()))?;
-    let with_port = match authority.port {
-        Some(port) => format!("{}:{}", authority.host, port),
-        None => authority.host,
-    };
-    let dns = normalize_dns(&with_port);
-    if dns.is_empty() {
-        return Err(anyhow::anyhow!("request has no Host/authority"));
-    }
-    Ok(dns)
+    routing_key(&authority.host).map_err(|e| anyhow::anyhow!("unroutable Host/authority: {e}"))
 }
 
 /// Read an HTTP/1.x request head from `stream` and resolve its DNS routing key.
@@ -306,6 +334,19 @@ pub(super) fn http_head_parser(config: &BridgeConfig) -> HttpProxyParser {
     )
 }
 
+/// Prepend a parser-refused tail to freshly read bytes (no copy when the tail
+/// is empty — the common case, since heads fit one refusal window).
+fn concat_pending(pending: &Bytes, chunk: &[u8]) -> Bytes {
+    if pending.is_empty() {
+        Bytes::copy_from_slice(chunk)
+    } else {
+        let mut joined = Vec::with_capacity(pending.len() + chunk.len());
+        joined.extend_from_slice(pending);
+        joined.extend_from_slice(chunk);
+        Bytes::from(joined)
+    }
+}
+
 pub(super) async fn read_http_head<R>(
     stream: &mut R,
     config: &BridgeConfig,
@@ -314,11 +355,13 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut parser = http_head_parser(config);
+    // Bytes the parser refused (its backpressure signal) survive here across
+    // reads: dropping the tail per-chunk would hand the parser a stream with a
+    // silent gap whenever `--max-header-size` is configured past the parser's
+    // refusal window.
+    let mut pending = Bytes::new();
     let outcome = read_until(stream, config, "HTTP request head", |chunk| {
-        // Offer the new bytes to the parser, re-offering the tail on a short
-        // count (the backpressure signal). The head fits well within the
-        // parser's buffer, so this converges before any RequestHead.
-        let mut pending = Bytes::copy_from_slice(chunk);
+        pending = concat_pending(&pending, chunk);
         while !pending.is_empty() {
             let accepted = parser.push(FlowSide::Initiator, &pending);
             pending = pending.slice(accepted..);
@@ -363,17 +406,14 @@ where
 
 /// Resolve the DNS routing key from an HTTP/2 request head's `:authority`.
 ///
-/// `:authority` is the h2 equivalent of the `Host` header (RFC 9113 §8.3.1);
-/// [`normalize_dns`] collapses default 80/443 ports so keys match the export side.
+/// `:authority` is the h2 equivalent of the `Host` header (RFC 9113 §8.3.1).
+/// Unlike the h1 path it arrives whole — possibly `[v6]:port` — so
+/// [`routing_key`] does the port/bracket stripping as well as the validation.
 fn h2_routing_key(head: &StreamHead) -> Result<String> {
     let authority = head
         .authority()
         .ok_or_else(|| anyhow::anyhow!("HTTP/2 request has no :authority"))?;
-    let dns = normalize_dns(authority);
-    if dns.is_empty() {
-        return Err(anyhow::anyhow!("HTTP/2 request has an empty :authority"));
-    }
-    Ok(dns)
+    routing_key(authority).map_err(|e| anyhow::anyhow!("unroutable HTTP/2 :authority: {e}"))
 }
 
 /// Read an HTTP/2 connection's first request head and resolve its DNS routing
@@ -406,10 +446,11 @@ where
 {
     let mut parser =
         Http2Parser::with_config(Http2Config::default().with_require_preface(require_preface));
+    // Refused-tail buffer persists across reads, mirroring the HTTP/1.1 head
+    // reader: a short count is backpressure, not permission to drop bytes.
+    let mut pending = Bytes::new();
     read_until(stream, config, "HTTP/2 head", |chunk| {
-        // Offer new bytes to the parser, re-offering the tail on a short count
-        // (the backpressure signal), mirroring the HTTP/1.1 head reader.
-        let mut pending = Bytes::copy_from_slice(chunk);
+        pending = concat_pending(&pending, chunk);
         while !pending.is_empty() {
             let accepted = parser.push(FlowSide::Initiator, &pending);
             pending = pending.slice(accepted..);
@@ -857,7 +898,7 @@ mod tests {
         let mut reader = ChunkedReader::new(vec![hello.clone()]);
         let cfg = BridgeConfig::default();
         let (dns, buffer) = read_tls_sni(&mut reader, &cfg).await.unwrap();
-        assert_eq!(dns, "example.com");
+        assert_eq!(dns.as_deref(), Some("example.com"));
         // The ClientHello is forwarded verbatim.
         assert_eq!(buffer, hello);
     }
@@ -875,7 +916,7 @@ mod tests {
         let mut reader = ChunkedReader::new(vec![first, second]);
         let cfg = BridgeConfig::default();
         let (dns, buffer) = read_tls_sni(&mut reader, &cfg).await.unwrap();
-        assert_eq!(dns, "split.example.com");
+        assert_eq!(dns.as_deref(), Some("split.example.com"));
         assert_eq!(buffer, hello);
     }
 
@@ -887,13 +928,14 @@ mod tests {
         let mut reader = ChunkedReader::new(chunks);
         let cfg = BridgeConfig::default();
         let (dns, _buffer) = read_tls_sni(&mut reader, &cfg).await.unwrap();
-        assert_eq!(dns, "bytewise.example.com");
+        assert_eq!(dns.as_deref(), Some("bytewise.example.com"));
     }
 
     #[tokio::test]
-    async fn read_tls_sni_missing_sni_errors() {
-        // A ClientHello with no extensions -> no SNI -> error (not a panic, and
-        // not a silent empty route).
+    async fn read_tls_sni_missing_sni_is_not_an_error() {
+        // A ClientHello with no extensions -> no SNI -> Ok(None): the caller
+        // may still route it to the service's default backend (0.10; it used
+        // to be a hard error that dropped SNI-less clients entirely).
         let body: Vec<u8> = [
             &[0x03, 0x03],     // TLS 1.2
             &[0x00u8; 32][..], // Random
@@ -917,9 +959,11 @@ mod tests {
         record.extend_from_slice(&(record_len as u16).to_be_bytes());
         record.extend_from_slice(&handshake);
 
-        let mut reader = ChunkedReader::new(vec![record]);
+        let mut reader = ChunkedReader::new(vec![record.clone()]);
         let cfg = BridgeConfig::default();
-        assert!(read_tls_sni(&mut reader, &cfg).await.is_err());
+        let (dns, buffer) = read_tls_sni(&mut reader, &cfg).await.unwrap();
+        assert_eq!(dns, None);
+        assert_eq!(buffer, record);
     }
 
     // --- HTTP/2 head reading (Phase C, #50) ---
@@ -991,13 +1035,15 @@ mod tests {
         else {
             panic!("expected a parsed head")
         };
-        assert_eq!(dns, "grpc.internal:8443");
+        // Routing keys are host-only: the port a gRPC client puts in
+        // :authority is stripped, matching the export side's bare '@host'.
+        assert_eq!(dns, "grpc.internal");
         assert_eq!(buffer, req);
     }
 
     #[tokio::test]
     async fn read_h2_head_default_port_normalized() {
-        // :443 collapses just like the Host path, so keys match the export side.
+        // Any port collapses just like the Host path, so keys match the export side.
         let req = build_h2_request("svc.example:443", "/svc/m", None);
         let mut reader = ChunkedReader::new(vec![req]);
         let cfg = BridgeConfig::default();

@@ -44,6 +44,7 @@ async fn handle_ws_import_connection(
     service_name: String,
     client_id: String,
     config: Arc<BridgeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     // F4: bound the upgrade handshake — an idle client must not pin a task,
     // an fd and a connection-limit permit forever.
@@ -67,6 +68,7 @@ async fn handle_ws_import_connection(
         None,
         config,
         None,
+        shutdown,
     )
     .await
 }

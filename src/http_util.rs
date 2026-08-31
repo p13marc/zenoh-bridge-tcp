@@ -5,8 +5,13 @@
 //! the request/response parsers so they survive the flowscope adoption.
 
 /// Generate an HTTP 400 Bad Request response.
-pub fn http_400_response() -> Vec<u8> {
-    let body = "400 Bad Request: Missing Host header";
+///
+/// `reason` lands in the body: this response is emitted for read timeouts,
+/// mid-head EOF, oversized heads, framing poison AND a missing Host — a body
+/// hard-coded to "Missing Host header" misled whoever read it in a browser or
+/// an operator log for every other cause.
+pub fn http_400_response(reason: &str) -> Vec<u8> {
+    let body = format!("400 Bad Request: {reason}");
     format!(
         "HTTP/1.1 400 Bad Request\r\n\
          Content-Type: text/plain\r\n\
@@ -84,10 +89,10 @@ mod tests {
 
     #[test]
     fn test_http_400_response() {
-        let response = http_400_response();
+        let response = http_400_response("missing Host header");
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.contains("400 Bad Request"));
-        assert!(response_str.contains("Missing Host header"));
+        assert!(response_str.contains("missing Host header"));
 
         // Verify proper HTTP formatting: no leading spaces in headers
         let parts: Vec<&str> = response_str.split("\r\n").collect();

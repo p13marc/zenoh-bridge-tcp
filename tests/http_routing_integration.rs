@@ -322,7 +322,12 @@ async fn test_http_routing_multiple_backends() {
     tcp_stream.read_to_string(&mut response).await.unwrap();
 
     assert!(response.contains("400 Bad Request"));
-    assert!(response.contains("Missing Host header"));
+    // The 400 body names the actual reason since 0.10; it must still point
+    // at the Host/authority, whatever the exact phrasing.
+    assert!(
+        response.to_lowercase().contains("host"),
+        "400 body should mention the Host problem: {response}"
+    );
     println!("   Missing Host header returned 400 Bad Request");
 
     println!("\nAll HTTP routing tests passed!");

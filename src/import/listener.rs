@@ -27,9 +27,9 @@ pub(super) async fn run_import_mode_internal(
         config,
         shutdown_token,
         on_bound,
-        move |session, stream, service, client_id, config| async move {
+        move |session, stream, service, client_id, config, shutdown| async move {
             super::connection::handle_import_connection(
-                session, stream, &service, &client_id, http_mode, config,
+                session, stream, &service, &client_id, http_mode, config, shutdown,
             )
             .await
         },

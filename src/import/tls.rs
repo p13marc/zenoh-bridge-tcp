@@ -40,7 +40,7 @@ pub(super) async fn run_https_terminate_import_mode(
         config,
         shutdown_token,
         on_bound,
-        move |session, tcp_stream, service, client_id, config| {
+        move |session, tcp_stream, service, client_id, config, shutdown| {
             let tls_acceptor = tls_acceptor.clone();
             async move {
                 // F4: bound the handshake. Unbounded, a client that connects
@@ -52,8 +52,10 @@ pub(super) async fn run_https_terminate_import_mode(
                         .await
                         .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?
                         .map_err(|e| anyhow::anyhow!("TLS handshake failed: {}", e))?;
-                handle_tls_terminated_connection(session, tls_stream, &service, &client_id, config)
-                    .await
+                handle_tls_terminated_connection(
+                    session, tls_stream, &service, &client_id, config, shutdown,
+                )
+                .await
             }
         },
     )
@@ -72,7 +74,9 @@ async fn handle_tls_terminated_connection(
     service_name: &str,
     client_id: &str,
     config: Arc<BridgeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
     // Read the ALPN-negotiated protocol before the stream is split.
     let is_h2 = tls_stream
         .get_ref()
@@ -80,7 +84,7 @@ async fn handle_tls_terminated_connection(
         .alpn_protocol()
         .is_some_and(|p| p == b"h2");
 
-    let (mut tls_reader, tls_writer) = tokio::io::split(tls_stream);
+    let (mut tls_reader, mut tls_writer) = tokio::io::split(tls_stream);
 
     // Resolve the routing key from the decrypted head: for h2 the first request
     // stream's `:authority`, otherwise the HTTP/1.1 `Host`. The bytes read are
@@ -106,11 +110,22 @@ async fn handle_tls_terminated_connection(
             }
         }
     } else {
-        super::connection::read_http_head(&mut tls_reader, &config)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to parse HTTP request after TLS termination: {}", e)
-            })?
+        match super::connection::read_http_head(&mut tls_reader, &config).await {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // TLS is terminated here, so a plaintext HTTP error IS
+                // expressible (unlike the passthrough path): without it the
+                // browser reports a bare connection close instead of a 400.
+                let _ = tls_writer
+                    .write_all(&crate::http_util::http_400_response(&e.to_string()))
+                    .await;
+                let _ = tls_writer.shutdown().await;
+                return Err(anyhow::anyhow!(
+                    "Failed to parse HTTP request after TLS termination: {}",
+                    e
+                ));
+            }
+        }
     };
 
     // Record the routed host on the connection span so every later line in this
@@ -138,6 +153,15 @@ async fn handle_tls_terminated_connection(
             }
             super::connection::BackendRoute::Unavailable => {
                 warn!(dns = %dns, "No backend available");
+                // h1 gets a proper 502 page; for h2 no HTTP-level error is
+                // expressible without becoming an h2 endpoint, but the
+                // shutdown still sends a clean TLS close_notify.
+                if !is_h2 {
+                    let _ = tls_writer
+                        .write_all(&crate::http_util::http_502_response(&dns))
+                        .await;
+                }
+                let _ = tls_writer.shutdown().await;
                 return Err(anyhow::anyhow!("No backend available for DNS: {}", dns));
             }
         };
@@ -164,6 +188,7 @@ async fn handle_tls_terminated_connection(
         Some(buffer),
         config,
         response_tap,
+        shutdown,
     )
     .await
 }

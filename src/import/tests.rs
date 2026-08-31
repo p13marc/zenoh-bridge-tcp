@@ -135,7 +135,8 @@ fn test_parse_import_spec_slash_only() {
 #[tokio::test]
 async fn test_drain_tasks_empty_set() {
     let mut tasks = JoinSet::new();
-    drain_tasks(&mut tasks, "test-svc", Duration::from_secs(1)).await;
+    let token = tokio_util::sync::CancellationToken::new();
+    drain_tasks(&mut tasks, &token, "test-svc", Duration::from_secs(1)).await;
     assert!(tasks.is_empty());
 }
 
@@ -144,19 +145,28 @@ async fn test_drain_tasks_all_complete() {
     let mut tasks = JoinSet::new();
     tasks.spawn(async {});
     tasks.spawn(async {});
-    drain_tasks(&mut tasks, "test-svc", Duration::from_secs(1)).await;
+    let token = tokio_util::sync::CancellationToken::new();
+    drain_tasks(&mut tasks, &token, "test-svc", Duration::from_secs(1)).await;
     assert!(tasks.is_empty());
 }
 
 #[tokio::test]
-async fn test_drain_tasks_timeout_aborts() {
+async fn test_drain_tasks_timeout_cancels_then_aborts() {
     let mut tasks = JoinSet::new();
+    let token = tokio_util::sync::CancellationToken::new();
+    // A cooperative task: exits promptly once the drain cancels the token.
+    let child = token.child_token();
+    tasks.spawn(async move { child.cancelled().await });
+    // A stuck task: ignores the token, must be aborted by the fallback.
     tasks.spawn(async {
-        // Task that never completes on its own
         tokio::time::sleep(Duration::from_secs(60)).await;
     });
     // Very short timeout
-    drain_tasks(&mut tasks, "test-svc", Duration::from_millis(50)).await;
+    drain_tasks(&mut tasks, &token, "test-svc", Duration::from_millis(50)).await;
+    assert!(
+        token.is_cancelled(),
+        "drain must cancel the connection token"
+    );
     // After abort_all, we need to reap the aborted tasks
     while tasks.join_next().await.is_some() {}
     assert!(tasks.is_empty());

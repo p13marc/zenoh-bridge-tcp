@@ -46,6 +46,7 @@ pub(super) async fn bridge_import_connection<R, W>(
     initial_buffer: Option<Vec<u8>>,
     config: Arc<BridgeConfig>,
     mut response_tap: Option<ResponseTap>,
+    shutdown: CancellationToken,
 ) -> Result<()>
 where
     R: crate::transport::TransportReader,
@@ -76,8 +77,9 @@ where
         // Single abort token for the whole connection. A clean directional EOF ends
         // only its own direction (a half-close); a hard error, external teardown, an
         // unrecoverable sample miss, or reception backpressure (D2) trips this token
-        // to reset both directions.
-        let conn_cancel = CancellationToken::new();
+        // to reset both directions. A child of the listener's shutdown token, so a
+        // drain deadline tears the data plane down through the same paths.
+        let conn_cancel = shutdown.child_token();
 
         // D2: drain the client's RX subscriber through a bounded, non-blocking channel
         // so a slow client TCP writer cannot fill the default FIFO handler and block

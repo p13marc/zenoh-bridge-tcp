@@ -43,7 +43,7 @@ pub(super) async fn run_accept_loop<H, Fut>(
     handler: H,
 ) -> Result<()>
 where
-    H: Fn(Arc<Session>, TcpStream, String, String, Arc<BridgeConfig>) -> Fut
+    H: Fn(Arc<Session>, TcpStream, String, String, Arc<BridgeConfig>, CancellationToken) -> Fut
         + Clone
         + Send
         + Sync
@@ -72,9 +72,18 @@ where
         let _ = tx.send(());
     }
 
-    info!(listen_addr = %listen_addr, service = %service_name, mode = mode, "Import bridge ready");
+    // The requested and the bound address differ when the spec says port 0;
+    // log the real one so an ephemeral port is discoverable.
+    let bound_addr = listener.local_addr().unwrap_or(listen_addr);
+    info!(listen_addr = %bound_addr, service = %service_name, mode = mode, "Import bridge ready");
 
     let mut tasks = JoinSet::new();
+
+    // Cancelled by the drain when its voluntary window expires: every
+    // connection handler receives a child of this token, so a drain can tear
+    // data planes down cleanly (EOF markers, undeclares, access logs) instead
+    // of aborting coordinator tasks and orphaning their relay spawns.
+    let conn_shutdown = CancellationToken::new();
 
     // Cap concurrent connections: hold a permit before accepting so the loop
     // applies backpressure at the limit instead of spawning without bound (D3).
@@ -108,6 +117,7 @@ where
                         let service_name = service_name.clone();
                         let config = config.clone();
                         let handler = handler.clone();
+                        let conn_token = conn_shutdown.child_token();
 
                         // `dns` is empty until the handler resolves a routing
                         // key; recording it on the span means every later line
@@ -128,7 +138,8 @@ where
                                 // dropping it on completion frees a slot.
                                 let _permit = permit;
                                 if let Err(e) =
-                                    handler(session, stream, service_name, client_id, config).await
+                                    handler(session, stream, service_name, client_id, config, conn_token)
+                                        .await
                                 {
                                     error!(error = %e, "Connection error");
                                 }
@@ -172,7 +183,13 @@ where
         while tasks.try_join_next().is_some() {}
     }
 
-    super::drain_tasks(&mut tasks, &service_name, config.drain_timeout).await;
+    super::drain_tasks(
+        &mut tasks,
+        &conn_shutdown,
+        &service_name,
+        config.drain_timeout,
+    )
+    .await;
 
     info!(service = %service_name, mode = mode, "Import bridge stopped");
     Ok(())

@@ -43,8 +43,9 @@ pub(super) async fn run_http_multiroute_import_mode(
         config,
         shutdown_token,
         on_bound,
-        |session, stream, service, client_id, config| async move {
-            handle_multiroute_connection(session, stream, &service, &client_id, config).await
+        |session, stream, service, client_id, config, shutdown| async move {
+            handle_multiroute_connection(session, stream, &service, &client_id, config, shutdown)
+                .await
         },
     )
     .await
@@ -52,12 +53,28 @@ pub(super) async fn run_http_multiroute_import_mode(
 
 /// Outcome of one client request/response exchange.
 enum ExchangeOutcome {
-    /// The response completed; `keep_alive` says whether the connection may
-    /// carry another request.
-    Completed { keep_alive: bool },
+    /// The exchange ended without a protocol switch; `keep_alive` says whether
+    /// the connection may carry another request, `end` how it actually ended —
+    /// a 504 or a forced reset must not be recorded as "completed".
+    Completed { keep_alive: bool, end: ExchangeEnd },
     /// The connection switched protocols (WebSocket / CONNECT) and was spliced
     /// opaquely to completion.
     Switched,
+}
+
+/// How a non-switched exchange ended, for the outcome metric / access log.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExchangeEnd {
+    /// Response fully delivered.
+    Ok,
+    /// Backend response idle timeout (the client saw a 504, or a truncated body).
+    Timeout,
+    /// D2 reception overflow — the exchange was reset to protect the session.
+    Overflow,
+    /// Response exceeded `max_response_size` and was cut off.
+    Truncated,
+    /// Framing violation mid-exchange.
+    Poisoned,
 }
 
 /// How obtaining the next request head ended.
@@ -107,6 +124,7 @@ async fn handle_multiroute_connection(
     service_name: &str,
     client_id: &str,
     config: Arc<BridgeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     // Metrics (G7): the guard counts the connection and decrements the active
     // gauge on every exit path; `svc` is its per-service counters, into which
@@ -120,6 +138,11 @@ async fn handle_multiroute_connection(
 
     let mut parser = super::connection::http_head_parser(&config);
     let mut events: VecDeque<HttpEvent> = VecDeque::new();
+    // Client bytes the parser refused (its backpressure signal) live here,
+    // shared across exchanges: a tail belonging to the NEXT pipelined request
+    // must survive the current exchange's exit, or the parser sees a gap in
+    // the client byte stream and poisons a perfectly valid request.
+    let mut client_pending = Bytes::new();
     let mut client_eof = false;
     let mut request_num = 0u64;
 
@@ -129,9 +152,11 @@ async fn handle_multiroute_connection(
             &mut parser,
             &mut stream,
             &mut events,
+            &mut client_pending,
             &mut client_eof,
             request_num == 0,
             &config,
+            &shutdown,
         )
         .await
         {
@@ -139,7 +164,10 @@ async fn handle_multiroute_connection(
             NextRequest::CleanEnd => break,
             NextRequest::Malformed { client_fault } => {
                 if client_fault {
-                    let _ = stream.write_all(&http_400_response()).await;
+                    let _ = stream
+                        .write_all(&http_400_response("malformed request framing"))
+                        .await;
+                    let _ = stream.shutdown().await;
                 }
                 warn!("Refusing malformed request");
                 outcome = crate::metrics::ConnOutcome::Reset;
@@ -155,7 +183,8 @@ async fn handle_multiroute_connection(
             Ok(d) => d,
             Err(e) => {
                 warn!(request_id = %request_id, error = %e, "Unroutable request");
-                let _ = stream.write_all(&http_400_response()).await;
+                let _ = stream.write_all(&http_400_response(&e.to_string())).await;
+                let _ = stream.shutdown().await;
                 outcome = crate::metrics::ConnOutcome::Reset;
                 break;
             }
@@ -196,6 +225,7 @@ async fn handle_multiroute_connection(
                     &mut parser,
                     &mut stream,
                     &mut events,
+                    &mut client_pending,
                     &mut client_eof,
                     &config,
                 )
@@ -219,7 +249,9 @@ async fn handle_multiroute_connection(
             &mut parser,
             &mut stream,
             &mut events,
+            &mut client_pending,
             &mut client_eof,
+            &shutdown,
             &head,
             &dns,
             route_dns,
@@ -242,7 +274,18 @@ async fn handle_multiroute_connection(
         };
 
         match exchange {
-            ExchangeOutcome::Completed { keep_alive } => {
+            ExchangeOutcome::Completed { keep_alive, end } => {
+                // A degraded end always comes with keep_alive == false, so the
+                // recorded outcome is that of the connection's last exchange.
+                match end {
+                    ExchangeEnd::Ok => {}
+                    ExchangeEnd::Timeout | ExchangeEnd::Truncated => {
+                        outcome = crate::metrics::ConnOutcome::Failed;
+                    }
+                    ExchangeEnd::Overflow | ExchangeEnd::Poisoned => {
+                        outcome = crate::metrics::ConnOutcome::Reset;
+                    }
+                }
                 if !keep_alive || parser.is_done() {
                     debug!(request_id = %request_id, "Closing persistent connection");
                     break;
@@ -260,15 +303,17 @@ async fn handle_multiroute_connection(
 /// Pull the next [`RequestHead`](flowscope::http::RequestHead) out of the parser,
 /// reading and pushing client bytes until one is framed (or the client goes away
 /// / the framing is refused).
+#[allow(clippy::too_many_arguments)]
 async fn next_request_head(
     parser: &mut HttpProxyParser,
     stream: &mut TcpStream,
     events: &mut VecDeque<HttpEvent>,
+    leftover: &mut Bytes,
     client_eof: &mut bool,
     first: bool,
     config: &BridgeConfig,
+    shutdown: &CancellationToken,
 ) -> NextRequest {
-    let mut leftover = Bytes::new();
     // Hoisted out of the loop: this is 64 KiB by default, and reallocating it
     // on every read was pure churn on the request path.
     let mut tmp = vec![0u8; config.buffer_size];
@@ -303,7 +348,7 @@ async fn next_request_head(
 
         // Re-offer any backpressured tail before reading more.
         if !leftover.is_empty() {
-            leftover = push_bytes(parser, FlowSide::Initiator, &leftover);
+            *leftover = push_bytes(parser, FlowSide::Initiator, leftover);
             drain_events(parser, events);
             if let Some(reason) = parser.poison() {
                 return NextRequest::Malformed {
@@ -313,17 +358,21 @@ async fn next_request_head(
             continue;
         }
 
-        let n = match tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(_)) | Err(_) => {
-                // A read error or idle timeout ends the connection. Only the very
-                // first request treats it as a client fault worth a 400.
-                return if first {
-                    NextRequest::Malformed { client_fault: true }
-                } else {
-                    NextRequest::CleanEnd
-                };
-            }
+        let n = tokio::select! {
+            r = tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)) => match r {
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) | Err(_) => {
+                    // A read error or idle timeout ends the connection. Only the very
+                    // first request treats it as a client fault worth a 400.
+                    return if first {
+                        NextRequest::Malformed { client_fault: true }
+                    } else {
+                        NextRequest::CleanEnd
+                    };
+                }
+            },
+            // Listener drain: no request in flight, close cleanly.
+            _ = shutdown.cancelled() => return NextRequest::CleanEnd,
         };
 
         if n == 0 {
@@ -333,7 +382,7 @@ async fn next_request_head(
             continue;
         }
 
-        leftover = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
+        *leftover = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
         drain_events(parser, events);
         if let Some(reason) = parser.poison() {
             return NextRequest::Malformed {
@@ -350,11 +399,21 @@ async fn consume_request_body(
     parser: &mut HttpProxyParser,
     stream: &mut TcpStream,
     events: &mut VecDeque<HttpEvent>,
+    leftover: &mut Bytes,
     client_eof: &mut bool,
     config: &BridgeConfig,
 ) {
     let mut tmp = vec![0u8; config.buffer_size];
     loop {
+        // Re-offer any backpressured tail before reading more (same contract
+        // as `next_request_head`: a refused tail is never dropped).
+        if !leftover.is_empty() {
+            *leftover = push_bytes(parser, FlowSide::Initiator, leftover);
+            drain_events(parser, events);
+            if parser.poison().is_some() || parser.is_tunnelled() {
+                return;
+            }
+        }
         while let Some(front) = events.pop_front() {
             match front {
                 HttpEvent::End {
@@ -375,6 +434,13 @@ async fn consume_request_body(
             return;
         }
 
+        // A still-refused tail means the parser is backpressured: re-offer it
+        // (top of the loop) before reading anything new, or the read would
+        // overwrite it.
+        if !leftover.is_empty() {
+            continue;
+        }
+
         let n = match tokio::time::timeout(config.read_timeout, stream.read(&mut tmp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) | Err(_) => return,
@@ -385,7 +451,7 @@ async fn consume_request_body(
             drain_events(parser, events);
             continue;
         }
-        let _ = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
+        *leftover = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
         drain_events(parser, events);
         if parser.poison().is_some() || parser.is_tunnelled() {
             return;
@@ -407,7 +473,9 @@ async fn run_exchange(
     parser: &mut HttpProxyParser,
     stream: &mut TcpStream,
     events: &mut VecDeque<HttpEvent>,
+    client_pending: &mut Bytes,
     client_eof: &mut bool,
+    shutdown: &CancellationToken,
     head: &flowscope::http::RequestHead,
     dns: &str,
     route_dns: Option<&str>,
@@ -499,8 +567,8 @@ async fn run_exchange(
     let mut response_done = false;
     let mut switched = false;
     let mut keep_alive = true;
+    let mut end = ExchangeEnd::Ok;
     let mut bytes_written = 0usize;
-    let mut client_pending = Bytes::new();
     let mut resp_pending = Bytes::new();
 
     // IDLE budget, not a total-duration cap. This used to be computed once and
@@ -517,7 +585,7 @@ async fn run_exchange(
     'exchange: loop {
         // Re-offer any backpressured tails.
         if !client_pending.is_empty() {
-            client_pending = push_bytes(parser, FlowSide::Initiator, &client_pending);
+            *client_pending = push_bytes(parser, FlowSide::Initiator, client_pending);
             drain_events(parser, events);
         }
         if !resp_pending.is_empty() {
@@ -545,6 +613,21 @@ async fn run_exchange(
                         .map_err(|e| anyhow::anyhow!("Failed to publish request body: {}", e))?;
                     svc.add_up(raw.len());
                 }
+                // The chunked terminator: flowscope emits `Trailers` for EVERY
+                // chunked message (fields or not), with the `0\r\n…\r\n` bytes
+                // in `raw`. Letting this fall into the deferred-events
+                // catch-all discarded it, so a chunked request's backend never
+                // saw the end of the body and the exchange 504'd.
+                HttpEvent::Trailers {
+                    dir: FlowSide::Initiator,
+                    raw,
+                    ..
+                } if !request_done => {
+                    tx_publisher.put(&raw[..]).await.map_err(|e| {
+                        anyhow::anyhow!("Failed to publish request trailers: {}", e)
+                    })?;
+                    svc.add_up(raw.len());
+                }
                 HttpEvent::End {
                     dir: FlowSide::Initiator,
                 } if !request_done => {
@@ -556,6 +639,16 @@ async fn run_exchange(
                     request_done = true;
                 }
                 HttpEvent::ResponseHead(rh) => {
+                    // A backend announcing it will close (Connection: close,
+                    // bare HTTP/1.0, until-close framing) ends this client
+                    // connection after the response: flowscope closes only its
+                    // responder direction, so a further request would frame
+                    // fine while its response bytes land in a Closed direction
+                    // and never become events (a 30s stall, then 504).
+                    if !rh.interim && response_wants_close(&rh) {
+                        debug!("Backend response asks to close the connection");
+                        keep_alive = false;
+                    }
                     stream.write_all(&rh.raw).await?;
                     bytes_written += rh.raw.len();
                     svc.add_down(rh.raw.len());
@@ -575,6 +668,7 @@ async fn run_exchange(
                             "Response exceeded max size; truncating and closing"
                         );
                         keep_alive = false;
+                        end = ExchangeEnd::Truncated;
                         stop_exchange = true;
                         break;
                     }
@@ -594,6 +688,7 @@ async fn run_exchange(
                             "Response trailers exceeded max size; truncating and closing"
                         );
                         keep_alive = false;
+                        end = ExchangeEnd::Truncated;
                         stop_exchange = true;
                         break;
                     }
@@ -632,20 +727,24 @@ async fn run_exchange(
             warn!(reason = %reason.as_str(), "Framing violation");
             if bytes_written == 0 {
                 let resp = if reason.implies_client_fault().unwrap_or(true) {
-                    http_400_response()
+                    http_400_response(reason.as_str())
                 } else {
                     http_502_response(dns)
                 };
                 let _ = stream.write_all(&resp).await;
             }
             keep_alive = false;
+            end = ExchangeEnd::Poisoned;
             break;
         }
 
         // Need more bytes. Read the client (until its request is done) and the
         // backend response concurrently.
         tokio::select! {
-            r = stream.read(&mut tmp), if !request_done && !*client_eof => {
+            // `client_pending.is_empty()`: while a refused tail is pending the
+            // next iteration's re-offer must run before any new read, or the
+            // read would overwrite the tail.
+            r = stream.read(&mut tmp), if !request_done && !*client_eof && client_pending.is_empty() => {
                 match r {
                     Ok(0) => {
                         *client_eof = true;
@@ -653,7 +752,7 @@ async fn run_exchange(
                         drain_events(parser, events);
                     }
                     Ok(n) => {
-                        client_pending = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
+                        *client_pending = push_bytes(parser, FlowSide::Initiator, &tmp[..n]);
                         drain_events(parser, events);
                     }
                     Err(e) => return Err(anyhow::anyhow!("client read error: {}", e)),
@@ -680,6 +779,7 @@ async fn run_exchange(
                             let _ = stream.write_all(&crate::http_util::http_504_response()).await;
                         }
                         keep_alive = false;
+                        end = ExchangeEnd::Timeout;
                         break;
                     }
                 }
@@ -688,6 +788,14 @@ async fn run_exchange(
                 // D2 overflow (Stream mode): this client is too slow to drain its
                 // response — reset the exchange rather than block the session.
                 warn!("Reception buffer full, resetting slow multiroute exchange");
+                keep_alive = false;
+                end = ExchangeEnd::Overflow;
+                break;
+            }
+            _ = shutdown.cancelled() => {
+                // Listener drain deadline: stop mid-exchange, run the teardown
+                // below (EOF marker, undeclares) so the export side is released.
+                info!("Listener draining; ending multiroute exchange");
                 keep_alive = false;
                 break;
             }
@@ -705,7 +813,7 @@ async fn run_exchange(
         // and any tail the tunnelled parser refused back into our pendings.
         let up_first = [
             parser.take_tunnel_residue(FlowSide::Initiator),
-            std::mem::take(&mut client_pending),
+            std::mem::take(client_pending),
         ];
         for chunk in up_first.iter().filter(|c| !c.is_empty()) {
             tx_publisher
@@ -751,6 +859,7 @@ async fn run_exchange(
                     }
                 }
                 _ = rx_cancel.cancelled() => break,
+                _ = shutdown.cancelled() => break,
             }
         }
     }
@@ -766,5 +875,92 @@ async fn run_exchange(
     }
 
     let keep_alive = keep_alive && response_done && !*client_eof;
-    Ok(ExchangeOutcome::Completed { keep_alive })
+    Ok(ExchangeOutcome::Completed { keep_alive, end })
+}
+
+/// Whether a response head announces the backend will close the connection
+/// after this message (RFC 9112 §9.3/§9.6): a `Connection` header naming
+/// `close`, bare HTTP/1.0 without `keep-alive`, or until-close body framing.
+///
+/// flowscope tracks this internally but only closes its *responder* direction,
+/// and `HttpProxyParser::is_done()` requires BOTH directions closed — so the
+/// keep-alive decision must be derived from the head's public fields here.
+fn response_wants_close(rh: &flowscope::http::ResponseHead) -> bool {
+    use flowscope::http::{BodyFraming, HttpVersion};
+    if rh.framing == BodyFraming::UntilClose {
+        return true;
+    }
+    let mut close = false;
+    let mut keep = false;
+    for value in rh.headers_all("connection") {
+        if let Ok(value) = std::str::from_utf8(value) {
+            for token in value.split(',') {
+                let token = token.trim();
+                close |= token.eq_ignore_ascii_case("close");
+                keep |= token.eq_ignore_ascii_case("keep-alive");
+            }
+        }
+    }
+    close || (rh.version == HttpVersion::Http1_0 && !keep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Frame a response head through a real parser (`ResponseHead` is
+    /// `#[non_exhaustive]`, so it cannot be constructed literally).
+    fn response_head_of(response: &str) -> flowscope::http::ResponseHead {
+        let mut parser = HttpProxyParser::default();
+        let req = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n");
+        parser.push(FlowSide::Initiator, &req);
+        while parser.next_event().is_some() {}
+        parser.push(
+            FlowSide::Responder,
+            &Bytes::copy_from_slice(response.as_bytes()),
+        );
+        loop {
+            match parser.next_event() {
+                Some(HttpEvent::ResponseHead(rh)) => return rh,
+                Some(_) => {}
+                None => panic!("no response head framed from {response:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn response_close_token_detected() {
+        assert!(response_wants_close(&response_head_of(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )));
+        // Comma list, mixed case.
+        assert!(response_wants_close(&response_head_of(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: Upgrade, Close\r\n\r\n"
+        )));
+    }
+
+    #[test]
+    fn response_keep_alive_default_http11() {
+        assert!(!response_wants_close(&response_head_of(
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+        )));
+    }
+
+    #[test]
+    fn response_http10_closes_unless_keep_alive() {
+        assert!(response_wants_close(&response_head_of(
+            "HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+        )));
+        assert!(!response_wants_close(&response_head_of(
+            "HTTP/1.0 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+        )));
+    }
+
+    #[test]
+    fn response_until_close_framing_closes() {
+        // No Content-Length, no Transfer-Encoding: body runs to EOF.
+        assert!(response_wants_close(&response_head_of(
+            "HTTP/1.1 200 OK\r\n\r\n"
+        )));
+    }
 }

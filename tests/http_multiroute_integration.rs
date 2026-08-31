@@ -1189,3 +1189,115 @@ async fn multiroute_response_size_cap_is_not_overshot() {
     shutdown_token.cancel();
     common::shutdown_sessions(sessions).await;
 }
+
+/// A chunked request body must reach the backend WITH its terminator
+/// (`0\r\n\r\n`). flowscope surfaces the terminator as a `Trailers` event;
+/// dropping it left the backend waiting for the end of the body until the
+/// response idle timeout (504). Regression for the 0.10 fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_chunked_request_body() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+
+    let backend_addr = start_echo_backend().await;
+    let (import_addr, sessions) =
+        spawn_multiroute("chunky.test", backend_addr, &shutdown_token).await;
+
+    let body = "hello chunked world";
+    // Two chunks + terminator.
+    let (a, b) = body.split_at(5);
+    let request = format!(
+        "POST /echo HTTP/1.1\r\nHost: chunky.test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n\
+         {:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+        a.len(),
+        a,
+        b.len(),
+        b
+    );
+
+    let response = common::retry_client(
+        || async {
+            let mut stream = tokio::net::TcpStream::connect(import_addr).await?;
+            stream.write_all(request.as_bytes()).await?;
+            let mut response = String::new();
+            // Bounded well below the 30s response idle timeout: the bug's
+            // symptom was precisely a stall-then-504.
+            tokio::time::timeout(Duration::from_secs(8), stream.read_to_string(&mut response))
+                .await
+                .map_err(|_| anyhow::anyhow!("response stalled — chunked terminator lost?"))??;
+            if !response.contains("200 OK") {
+                anyhow::bail!("not served yet: {response}");
+            }
+            Ok::<_, anyhow::Error>(response)
+        },
+        Duration::from_secs(30),
+        "chunked POST through multiroute",
+    )
+    .await
+    .expect("chunked request must complete");
+    assert!(
+        response.contains(body),
+        "echoed body missing from:\n{response}"
+    );
+
+    shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
+}
+
+/// A backend response carrying `Connection: close` must end the client
+/// connection after that response. flowscope closes only its responder
+/// direction, so before the 0.10 fix a second request on the same client
+/// socket stalled for the response idle timeout and got a 504.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_multiroute_backend_close_ends_client_connection() {
+    let _ = tracing_subscriber::fmt::try_init();
+    let shutdown_token = CancellationToken::new();
+
+    // Raw backend that always answers with Connection: close and closes.
+    let (backend_addr, _backend) = common::start_probe_immune_backend(
+        |mut stream: tokio::net::TcpStream, _first: Vec<u8>| async move {
+            let response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        },
+    )
+    .await;
+
+    let (import_addr, sessions) =
+        spawn_multiroute("closer.test", backend_addr, &shutdown_token).await;
+
+    let request = b"GET / HTTP/1.1\r\nHost: closer.test\r\n\r\n";
+    let started = std::time::Instant::now();
+    let response = common::retry_client(
+        || async {
+            let mut stream = tokio::net::TcpStream::connect(import_addr).await?;
+            stream.write_all(request).await?;
+            // read_to_string returns only once the bridge closes the
+            // connection — which, with Connection: close honored, must happen
+            // right after the response instead of after a 30s idle timeout.
+            let mut response = String::new();
+            tokio::time::timeout(Duration::from_secs(8), stream.read_to_string(&mut response))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("connection not closed after Connection: close response")
+                })??;
+            if !response.contains("200 OK") {
+                anyhow::bail!("not served yet: {response}");
+            }
+            Ok::<_, anyhow::Error>(response)
+        },
+        Duration::from_secs(30),
+        "Connection: close through multiroute",
+    )
+    .await
+    .expect("close-announcing response must be relayed and the connection closed");
+    assert!(response.contains("hello"), "body missing:\n{response}");
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
+        "took {:?} — looks like the pre-fix 30s stall",
+        started.elapsed()
+    );
+
+    shutdown_token.cancel();
+    common::shutdown_sessions(sessions).await;
+}

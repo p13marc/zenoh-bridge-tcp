@@ -33,8 +33,9 @@ pub(super) async fn run_auto_import_mode(
         config,
         shutdown_token,
         on_bound,
-        |session, stream, service, client_id, config| async move {
-            handle_auto_import_connection(session, stream, &service, &client_id, config).await
+        |session, stream, service, client_id, config, shutdown| async move {
+            handle_auto_import_connection(session, stream, &service, &client_id, config, shutdown)
+                .await
         },
     )
     .await
@@ -47,6 +48,7 @@ async fn handle_auto_import_connection(
     service_name: &str,
     client_id: &str,
     config: Arc<BridgeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     use flowscope::classify::{Classify, WireProtocol, classify_first_bytes};
 
@@ -109,19 +111,21 @@ async fn handle_auto_import_connection(
                 client_id,
                 true,
                 config,
+                shutdown,
             )
             .await
         }
         WireProtocol::Http1 => {
             // Could be regular HTTP or a WebSocket upgrade.
-            handle_auto_http_connection(session, stream, service_name, client_id, config).await
+            handle_auto_http_connection(session, stream, service_name, client_id, config, shutdown)
+                .await
         }
         WireProtocol::Http2Preface => {
             // Prior-knowledge HTTP/2 (h2c — plaintext gRPC's wire form): route
             // by the first stream's :authority, then relay the multiplexed
             // streams opaquely (#74). Same single-authority semantics as the
             // terminated-h2 path.
-            handle_h2c_connection(session, stream, service_name, client_id, config).await
+            handle_h2c_connection(session, stream, service_name, client_id, config, shutdown).await
         }
         // SSH, raw, or an unrecognized first-byte class -> opaque passthrough,
         // no DNS routing.
@@ -133,6 +137,7 @@ async fn handle_auto_import_connection(
                 client_id,
                 false,
                 config,
+                shutdown,
             )
             .await
         }
@@ -210,6 +215,7 @@ async fn handle_h2c_connection(
     service_name: &str,
     client_id: &str,
     config: Arc<BridgeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     use super::connection::{BackendRoute, ReadHeadOutcome};
 
@@ -282,6 +288,7 @@ async fn handle_h2c_connection(
         Some(buffer),
         config,
         response_tap,
+        shutdown,
     )
     .await
 }
@@ -293,6 +300,7 @@ async fn handle_auto_http_connection(
     service_name: &str,
     client_id: &str,
     config: Arc<BridgeConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     // Peek until the request head is complete (a WS handshake split across
     // TCP segments must not be misrouted to the plain-HTTP path, #77), bounded
@@ -333,6 +341,7 @@ async fn handle_auto_http_connection(
                 let _ = stream
                     .write_all(&crate::http_util::http_502_response(host))
                     .await;
+                let _ = stream.shutdown().await;
                 return Err(anyhow::anyhow!("No backend available for DNS: {}", host));
             }
         };
@@ -357,6 +366,7 @@ async fn handle_auto_http_connection(
                     None,
                     config,
                     None,
+                    shutdown,
                 )
                 .await;
             }
@@ -374,6 +384,7 @@ async fn handle_auto_http_connection(
         client_id,
         true,
         config,
+        shutdown,
     )
     .await
 }

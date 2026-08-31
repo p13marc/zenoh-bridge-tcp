@@ -15,8 +15,11 @@
 //!   connection only; other connections are unaffected.
 //! - **Multiroute mode**: response buffering is bounded by `config.max_response_size`; oversized
 //!   responses get HTTP 502 (or connection close if data was already streamed).
-//! - **Shutdown**: each task direction has a `CancellationToken`; the outer select cancels the
-//!   peer token and waits up to `drain_timeout` before a final `.abort()` fallback.
+//! - **Shutdown**: the accept loop stops taking connections; active ones get up to
+//!   `drain_timeout` to finish naturally, then the listener's shared connection token is
+//!   cancelled — each data plane's own `CancellationToken` is a child of it, so relays,
+//!   watchdogs and teardown (EOF markers, undeclares, access logs) all run — with a short
+//!   grace before a final `abort_all()` fallback.
 
 mod accept;
 mod auto;
@@ -138,8 +141,19 @@ pub fn parse_import_spec(import_spec: &str) -> Result<(String, SocketAddr)> {
 
 /// Drain active connection tasks on shutdown.
 ///
-/// Waits up to `drain_timeout` for all tasks to complete, then aborts any remaining.
-async fn drain_tasks(tasks: &mut JoinSet<()>, service_name: &str, drain_timeout: Duration) {
+/// Waits up to `drain_timeout` for tasks to complete naturally, then cancels
+/// `conn_shutdown` — every connection handler holds a child of it, so data
+/// planes tear down cleanly (EOF markers to the export side, undeclares,
+/// access-log records) — and gives them a short grace before the `abort_all()`
+/// fallback. Aborting first was worse than it looked: it killed only the
+/// coordinator tasks, orphaning their spawned relay halves, which kept moving
+/// bytes until the Zenoh session itself closed.
+async fn drain_tasks(
+    tasks: &mut JoinSet<()>,
+    conn_shutdown: &CancellationToken,
+    service_name: &str,
+    drain_timeout: Duration,
+) {
     if tasks.is_empty() {
         return;
     }
@@ -153,8 +167,30 @@ async fn drain_tasks(tasks: &mut JoinSet<()>, service_name: &str, drain_timeout:
             }
             Ok(None) => break,
             Err(_) => {
-                warn!(service = %service_name, remaining = tasks.len(), "Drain timeout, aborting remaining connections");
-                tasks.abort_all();
+                warn!(
+                    service = %service_name,
+                    remaining = tasks.len(),
+                    "Drain timeout, cancelling remaining connections"
+                );
+                conn_shutdown.cancel();
+                // main's outer budget is drain_timeout + 2s; this grace must
+                // stay inside it so the cancel path wins over the hard exit.
+                let grace = tokio::time::Instant::now() + Duration::from_secs(1);
+                while !tasks.is_empty() {
+                    match tokio::time::timeout_at(grace, tasks.join_next()).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(_) => {
+                            warn!(
+                                service = %service_name,
+                                remaining = tasks.len(),
+                                "Cancel grace expired, aborting remaining connection tasks"
+                            );
+                            tasks.abort_all();
+                            break;
+                        }
+                    }
+                }
                 break;
             }
         }
