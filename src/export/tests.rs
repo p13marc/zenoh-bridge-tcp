@@ -39,11 +39,11 @@ fn test_parse_http_export_spec_valid() {
 
 #[test]
 fn test_parse_http_export_spec_dns_normalization() {
-    let result = parse_http_export_spec("http-service/Example.COM:80/127.0.0.1:8080");
+    let result = parse_http_export_spec("http-service/Example.COM/127.0.0.1:8080");
     assert!(result.is_ok());
     let (service, dns, addr) = result.unwrap();
     assert_eq!(service, "http-service");
-    assert_eq!(dns, "example.com"); // Normalized: lowercase + port 80 stripped
+    assert_eq!(dns, "example.com"); // Normalized: lowercase
     assert_eq!(addr.to_string(), "127.0.0.1:8080");
 }
 
@@ -144,19 +144,16 @@ fn test_parse_export_spec_with_wildcards() {
 }
 
 #[test]
-fn test_parse_http_export_spec_dns_port_443_stripped() {
-    let result = parse_http_export_spec("svc/example.com:443/127.0.0.1:8080");
-    assert!(result.is_ok());
-    let (_, dns, _) = result.unwrap();
-    assert_eq!(dns, "example.com", "Port 443 should be stripped from DNS");
-}
-
-#[test]
-fn test_parse_http_export_spec_dns_custom_port_kept() {
-    let result = parse_http_export_spec("svc/example.com:8443/127.0.0.1:8080");
-    assert!(result.is_ok());
-    let (_, dns, _) = result.unwrap();
-    assert_eq!(dns, "example.com:8443", "Non-standard ports should be kept");
+fn test_parse_http_export_spec_dns_port_rejected() {
+    // Routing keys are host-only (0.10): an explicit port in the DNS label
+    // is rejected loudly instead of silently stripped.
+    for spec in [
+        "svc/example.com:443/127.0.0.1:8080",
+        "svc/example.com:8443/127.0.0.1:8080",
+    ] {
+        let err = parse_http_export_spec(spec).unwrap_err().to_string();
+        assert!(err.contains("carries a port"), "{spec}: {err}");
+    }
 }
 
 #[test]

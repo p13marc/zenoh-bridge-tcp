@@ -278,13 +278,27 @@ impl FromStr for BackendSpec {
                         "invalid --backend spec '{spec}': '@' with an empty host"
                     ));
                 }
+                // Routing keys are host-only (0.10): a client's
+                // `Host: api.local:8080` routes to '@api.local'. Reject an
+                // explicit port instead of silently stripping it — otherwise
+                // '@a.local:8443' and '@a.local:9443' would merge into one
+                // backend behind the operator's back.
+                if crate::dns::has_explicit_port(host) {
+                    return Err(anyhow::anyhow!(
+                        "invalid --backend spec '{spec}': host '{host}' carries a port — \
+                         routing keys are host-only (a client's 'Host: {host}' routes by \
+                         the bare name); drop the port"
+                    ));
+                }
                 let host = normalize_dns(host);
                 // The host becomes a Zenoh key segment ({service}/{host}/…):
                 // without a charset check, '@*/…' would register a live
                 // wildcard capturing the whole service's routing, and other
                 // keyexpr metacharacters would fail late and confusingly.
+                // Same predicate as the client side's `dns::routing_key` —
+                // the two must stay identical.
                 for c in host.chars() {
-                    if !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')) {
+                    if !crate::dns::is_valid_key_char(c) {
                         return Err(anyhow::anyhow!(
                             "backend host '{host}' contains an invalid character {c:?} \
                              (allowed: alphanumerics, '-', '_', '.', ':')"
@@ -560,9 +574,35 @@ mod tests {
 
     #[test]
     fn backend_host_is_normalized() {
-        // normalize_dns: lowercase, default ports collapse.
-        let s: BackendSpec = "web@API.Example.COM:443/127.0.0.1:8003".parse().unwrap();
+        // normalize_dns: lowercase.
+        let s: BackendSpec = "web@API.Example.COM/127.0.0.1:8003".parse().unwrap();
         assert_eq!(s.host.as_deref(), Some("api.example.com"));
+    }
+
+    #[test]
+    fn backend_host_with_port_rejected() {
+        // Routing keys are host-only (0.10): an explicit port is rejected
+        // loudly instead of silently stripped or (pre-0.10) kept as an
+        // unmatchable key.
+        for spec in [
+            "web@api.example.com:8443/127.0.0.1:8003",
+            "web@api.example.com:443/127.0.0.1:8003",
+            "web@[::1]:8080/127.0.0.1:8003",
+        ] {
+            let err = spec.parse::<BackendSpec>().unwrap_err().to_string();
+            assert!(err.contains("carries a port"), "{spec}: {err}");
+        }
+    }
+
+    #[test]
+    fn backend_ipv6_host_accepted() {
+        // Bracketed and bare spellings produce the same key; brackets are
+        // stripped (they are not valid keyexpr characters, and the client
+        // paths strip them too).
+        let s: BackendSpec = "web@[::1]/127.0.0.1:8003".parse().unwrap();
+        assert_eq!(s.host.as_deref(), Some("::1"));
+        let s: BackendSpec = "web@2001:db8::1/127.0.0.1:8003".parse().unwrap();
+        assert_eq!(s.host.as_deref(), Some("2001:db8::1"));
     }
 
     #[test]
@@ -610,9 +650,6 @@ mod tests {
             let err = spec.parse::<BackendSpec>().unwrap_err().to_string();
             assert!(err.contains("invalid character"), "{spec}: {err}");
         }
-        // Legitimate host:port survives.
-        let s: BackendSpec = "web@api.example.com:8443/127.0.0.1:8003".parse().unwrap();
-        assert_eq!(s.host.as_deref(), Some("api.example.com:8443"));
     }
 
     #[test]
