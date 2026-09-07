@@ -21,7 +21,7 @@ jobs:
   release:
     runs-on: ubuntu-24.04
     steps:
-      - uses: https://data.forgejo.org/actions/checkout@v7
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
         with:
           ref: ${{ inputs.tag || github.ref }}
       - name: Resolve release tag
@@ -31,7 +31,7 @@ jobs:
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
           echo "RELEASE_SHA=$(git rev-parse "$tag^{commit}")" >> "$GITHUB_ENV"
       - uses: https://github.com/dtolnay/rust-toolchain@stable
-      - uses: https://github.com/Swatinem/rust-cache@v2
+      - uses: https://github.com/Swatinem/rust-cache@v2.9.2
         with:
           cache-targets: false
       - name: Build release artifacts
