@@ -17,15 +17,15 @@ name = "zenoh-bridge-tcp"
 path = "src/main.rs"
 
 [dependencies]
-zenoh = "~1.9.0"
-zenoh-ext = { version = "~1.9.0", features = ["unstable"] }
+zenoh = "~1.10.0"
+zenoh-ext = { version = "~1.10.0", features = ["unstable"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-flowscope = { version = "0.24.1", default-features = false, features = ["http", "tls", "http2"] }
+flowscope = { version = "0.26.0", default-features = false, features = ["http", "tls", "http2"] }
 bytes = "1"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
@@ -58,7 +58,7 @@ tls-termination = [
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 axum = "0.8"
-axum-server = { version = "0.8", features = ["tls-rustls"] }
+axum-server = { version = "0.9", features = ["tls-rustls"] }
 hyper = { version = "1.0", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 http-body-util = "0.1"
